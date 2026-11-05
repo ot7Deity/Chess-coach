@@ -1,0 +1,70 @@
+# Local development infrastructure: Postgres and Redis.
+#
+# The application processes (API, ingest worker, analysis worker) are
+# deliberately NOT here yet. Two of the three do not exist, and the Dockerfile's
+# one hard question - where the Stockfish binary comes from - is better answered
+# when it has consequences than now. See INTERVIEW_PREP.md.
+#
+#   docker compose up -d      start Postgres and Redis, wait until healthy
+#   docker compose ps         show health, not just "running"
+#   docker compose down       stop them, keep the data
+#   docker compose down -v    stop them and delete the data
+#
+# Credentials are the ones in .env.example. They are development-only and
+# deliberately boring; nothing here is reachable from outside the machine.
+
+name: chess-coach
+
+services:
+  postgres:
+    # Pinned to the same major version CI uses. The queue's correctness rests on
+    # version-specific locking behaviour (SELECT ... FOR UPDATE SKIP LOCKED),
+    # and "passes locally, fails in CI" is the failure mode this project can
+    # least afford to introduce on purpose.
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: chess
+      POSTGRES_PASSWORD: chess
+      # Matches DATABASE_URL in .env.example.
+      POSTGRES_DB: chess_coach
+    ports:
+      # Set POSTGRES_PORT in .env if something already owns 5432 on this machine.
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, only while initialising an empty data directory. Creates the
+      # separate test database - see the init script for why it has to be
+      # separate.
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # `docker compose up -d` returns as soon as containers start, which is
+      # several seconds before Postgres accepts connections. With a healthcheck,
+      # `docker compose ps` reports readiness honestly, and the app services
+      # added in M2 can gate on `condition: service_healthy` instead of
+      # sleeping and hoping.
+      test: ["CMD-SHELL", "pg_isready -U chess -d chess_coach"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      # Redis holds the shared rate-limiter token bucket and the hot position
+      # cache. Both are rebuildable - Postgres is the source of truth - so this
+      # volume is a convenience, not a correctness requirement. It is here so
+      # that restarting Docker does not throw away a warm cache mid-benchmark.
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

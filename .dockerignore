@@ -1,0 +1,72 @@
+# Docker does not read .gitignore, so everything heavy or host-specific has to
+# be named again here. Without this file the build context is ~211 MB, most of
+# it a Windows binary and a virtualenv that the image must not reuse.
+#
+# Written before the Dockerfile on purpose: the first `docker build` is exactly
+# when it is too late to notice.
+
+# --- virtualenv -------------------------------------------------------------
+# 102 MB, and built against a Windows interpreter. The image creates its own
+# with `uv sync`, so copying this in would be useless and an active source of
+# "works on my machine" drift.
+.venv/
+venv/
+
+# --- engine binaries --------------------------------------------------------
+# 109 MB. vendor/stockfish/stockfish.exe is a *Windows* executable and cannot
+# run in a Linux container at all. The container probes the CPU it is actually
+# running on and fetches its own build (tools/fetch_stockfish.py).
+vendor/
+*.nnue
+
+# --- git / CI ---------------------------------------------------------------
+# Not needed to run the app, and .git is the largest remaining directory.
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# --- python caches ----------------------------------------------------------
+# Stale .pyc files compiled by a different interpreter on a different platform.
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- test / lint caches -----------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# --- secrets ----------------------------------------------------------------
+# .env must never reach an image layer. Layers are extractable, so an .env
+# copied into one is an .env published to anyone who pulls the image.
+.env
+.env.local
+*.pem
+
+# --- local data / scratch ---------------------------------------------------
+data/
+*.db
+*.sqlite3
+bench/results/
+
+# --- frontend ---------------------------------------------------------------
+# Gets its own image when it exists.
+node_modules/
+web/
+
+# --- docs / editor state ----------------------------------------------------
+# README.md is kept: pyproject.toml declares it as the package readme, so the
+# build fails without it. LICENSE is referenced the same way and is not
+# excluded anywhere in this file.
+docs/
+*.md
+!README.md
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
