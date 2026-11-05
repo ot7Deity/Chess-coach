@@ -81,22 +81,31 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev --frozen
 
-      # Engine tests are opt-in via STOCKFISH_PATH. The binary is ~80 MB, so it is
-      # cached by release tag rather than downloaded on every run.
+      # Engine tests are opt-in via STOCKFISH_PATH. The binary is ~80 MB, so it
+      # is cached rather than downloaded on every run.
       #
-      # The key names the release and the lock file, not a SIMD variant: which
-      # variant a runner ends up with is decided by probing the CPU, so baking an
-      # architecture into the key would be a claim this job cannot make. Hashing
-      # the lock file means bumping the pinned engine invalidates the cache.
+      # The key hashes the installer as well as the lock file. The cached value
+      # is not just "Stockfish 18" - it is "the build this runner was able to
+      # run, as judged by that version of the probe". When the probe changed,
+      # the old entry became wrong, and a key that did not mention the probe
+      # kept serving it. That is how a run once restored a binary a previous
+      # failing run had saved, skipped the fetch, and failed with SIGILL again
+      # with the bug already fixed.
       - name: Cache Stockfish
         id: sf-cache
         uses: actions/cache@v4
         with:
           path: vendor/stockfish
-          key: stockfish-${{ runner.os }}-${{ hashFiles('tools/stockfish.lock.json') }}
+          key: >-
+            stockfish-${{ runner.os }}-${{ hashFiles('tools/stockfish.lock.json',
+            'tools/fetch_stockfish.py') }}
 
-      - name: Fetch Stockfish
-        if: steps.sf-cache.outputs.cache-hit != 'true'
+      # Deliberately not gated on a cache miss. The installer re-probes a binary
+      # that is already present and re-fetches if it cannot search, so running
+      # it unconditionally makes a poisoned cache self-healing instead of
+      # permanently broken. The probe costs under a second; trusting the cache
+      # cost two red CI runs.
+      - name: Fetch or verify Stockfish
         run: uv run python tools/fetch_stockfish.py
 
       - name: Tests
