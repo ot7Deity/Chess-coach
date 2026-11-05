@@ -1,0 +1,16 @@
+# Normalise line endings: the repo stores LF, Windows checkouts get native.
+# Without this, files authored on Windows arrive in the Linux containers and CI
+# with CRLF, which breaks shell scripts and makes diffs noisy.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.sql   text eol=lf
+*.md    text eol=lf
+
+*.png   binary
+*.jpg   binary
+*.nnue  binary
+*.exe   binary
