@@ -140,7 +140,10 @@ def test_a_month_is_tracked_once_per_player(db_session: Session):
         db_session.flush()
 
 
-@pytest.mark.parametrize("month", ["2026-1", "202611", "2026/11", "nov-2026", ""])
+# Values chosen to fit VARCHAR(7): a longer string raises DataError on length
+# before the CHECK constraint is evaluated, which would test Postgres rather
+# than this schema.
+@pytest.mark.parametrize("month", ["2026-1", "202611", "2026/11", "nov-26", ""])
 def test_malformed_months_are_rejected(db_session: Session, month: str):
     """The month string is interpolated straight into the archive URL, so a
     malformed value becomes a 404 during ingestion rather than an obvious error
@@ -158,7 +161,8 @@ def test_unknown_time_class_is_rejected(db_session: Session):
     """Every report groups by time_class. An unexpected value would silently
     create a category no report knows how to display."""
     player = _player(db_session)
-    db_session.add(_game(player, "uuid-bad-class", time_class="hyperbullet"))
+    # "hyper" fits VARCHAR(8), so the CHECK constraint is what rejects it.
+    db_session.add(_game(player, "uuid-bad-class", time_class="hyper"))
     with pytest.raises(IntegrityError):
         db_session.flush()
 
@@ -168,7 +172,9 @@ def test_unnormalised_result_is_rejected(db_session: Session):
     belong in `termination`; `result` must already be normalised, or
     'win/loss/draw' reporting silently misses rows."""
     player = _player(db_session)
-    db_session.add(_game(player, "uuid-raw-result", result="resigned"))
+    # "won" fits VARCHAR(5), so the CHECK constraint is what rejects it rather
+    # than the column width.
+    db_session.add(_game(player, "uuid-raw-result", result="won"))
     with pytest.raises(IntegrityError):
         db_session.flush()
 
