@@ -83,12 +83,17 @@ jobs:
 
       # Engine tests are opt-in via STOCKFISH_PATH. The binary is ~80 MB, so it is
       # cached by release tag rather than downloaded on every run.
+      #
+      # The key names the release and the lock file, not a SIMD variant: which
+      # variant a runner ends up with is decided by probing the CPU, so baking an
+      # architecture into the key would be a claim this job cannot make. Hashing
+      # the lock file means bumping the pinned engine invalidates the cache.
       - name: Cache Stockfish
         id: sf-cache
         uses: actions/cache@v4
         with:
           path: vendor/stockfish
-          key: stockfish-sf_18-ubuntu-avxvnni
+          key: stockfish-${{ runner.os }}-${{ hashFiles('tools/stockfish.lock.json') }}
 
       - name: Fetch Stockfish
         if: steps.sf-cache.outputs.cache-hit != 'true'

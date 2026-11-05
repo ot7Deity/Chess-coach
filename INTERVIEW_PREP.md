@@ -25,6 +25,97 @@ Numbers to fill in as they are measured: games analyzed, cache hit rate, games/m
 
 ---
 
+## 2026-11-05 - The engine service gets extracted after M3, not before `DECIDED`
+
+**What changed:** The engine stays in-process through M3. Once the 1/2/4/8-worker throughput
+numbers exist, Stockfish and the position cache get extracted into a separate **analysis
+service** behind an HTTP contract, as its own PR, and the benchmark is re-run.
+
+**Why:** The system is already service-oriented in the way that matters - three
+independently deployable processes (API, ingest worker, analysis worker) that scale
+separately, fail separately, and communicate *asynchronously through the jobs table* rather
+than by calling each other. Full textbook microservices would actively hurt it: a database
+per service would break the report queries, which are single SQL statements joining games,
+moves and positions, and replacing those with eventual consistency buys nothing. Many
+services sharing one database is the "distributed monolith" anti-pattern, which is exactly
+what an interviewer probes for when they hear the word.
+
+Extracting *the engine specifically* is the one split with real justification: it owns
+Stockfish and the cache behind a versioned contract, engine replicas scale independently of
+queue workers, an engine upgrade deploys without touching ingestion, and it enables **request
+coalescing** - four workers asking for the same position concurrently collapse into one
+engine call, which raises the effective cache hit rate rather than just moving code around.
+
+The ordering is the important part. The entire value of the split is being able to say what
+it cost, and that requires an in-process baseline to compare against. Splitting first makes
+"what did the network boundary cost you?" unanswerable.
+
+**Alternatives rejected:**
+- *Extract it now*: same architecture, no baseline, no measurement, nothing to say about it.
+- *Full microservices (DB per service + message bus)*: breaks M4's analytics and invites the
+  distributed-monolith critique.
+- *Never split*: fine engineering, but leaves a measurement worth having unmeasured.
+
+**Talking point:** "I deliberately did not start with microservices. The processes were
+already decoupled through a queue, which is the property people actually want. Then I
+extracted the engine into its own service once I had baseline throughput numbers, so I could
+measure what the boundary cost instead of assuming. It also let the service coalesce
+duplicate position requests across workers, which a shared in-process cache could not do."
+
+**Where:** planned for after M3.
+
+---
+
+## 2026-11-05 - A UCI handshake is not proof the engine works (real CI failure) `DONE`
+
+**What changed:** The installer's smoke test now runs `position startpos` + `go depth 8` and
+requires a `bestmove` reply. It previously sent only `uci` and accepted `uciok`.
+
+**Why:** This one was caught by CI, not by reasoning. The fallback chain was already designed
+to handle CPUs without AVX-VNNI - but it did not fire, and the test job failed with:
+
+```
+chess.engine.EngineTerminatedError: engine process died unexpectedly
+    (exit code: -4, binary not compatible with cpu?)
+```
+
+Exit code -4 is `SIGILL`, an illegal instruction - the AVX-VNNI build running on a CPU that
+does not have AVX-VNNI. The fallback should have caught it. It didn't, because **the UCI
+handshake never executes the vectorised NNUE evaluation code.** Answering `uci` is just
+printing strings. The illegal instruction only fires once the engine actually searches. So the
+probe said "works", the installer kept the fast build, and the crash surfaced two tests later
+as something that looked like a bug in the test rather than in the installer.
+
+Note which test caught it: `test_engine_starts_and_reports_pinned_version` **passed** while
+`test_engine_finds_a_mate_in_one` failed. The one that merely started the engine agreed with
+the broken probe, for the same reason the probe was broken.
+
+The general lesson is that a health check has to exercise the code path it claims to
+validate. "The process started" is not "the process can do its job" - which is also exactly
+why `/health` and `/ready` are separate endpoints in this project.
+
+**Alternatives rejected:**
+- *Pin the baseline `sse41-popcnt` build everywhere*: would work, and would give up real
+  nodes/sec on the machine doing the actual analysis.
+- *Read CPU flags from `/proc/cpuinfo` or `cpuid`*: platform-specific, and a probe that runs
+  the binary is the direct test rather than a proxy for it.
+- *Catch the exception at analysis time and retry with another build*: moves a setup problem
+  into the hot path, where it would be retried once per job forever.
+
+**Talking point:** "My best bug so far, and CI found it. I had a fallback chain for CPUs
+without AVX-VNNI, and it didn't trigger - because my probe only did the UCI handshake, which
+doesn't touch the vectorised evaluation code. The engine answered the handshake fine and then
+died with an illegal instruction the moment it tried to search. The fix was one line - make
+the probe actually search - but the lesson was that a health check which doesn't exercise the
+real code path will cheerfully tell you a broken thing is fine."
+
+**Where:** `tools/fetch_stockfish.py` (`smoke_test`), regression test in
+`tests/test_stockfish_binary.py::test_smoke_test_rejects_an_engine_that_cannot_search`,
+which fakes an engine that answers the handshake but never returns a move. CI run
+[42047974613](https://github.com/ot7Deity/Chess-coach/actions/runs/42047974613).
+
+---
+
 ## 2026-11-05 - Engine downloads are checksum-verified and SIMD-probed `DONE`
 
 **What changed:** `tools/fetch_stockfish.py` downloads Stockfish against SHA-256 digests

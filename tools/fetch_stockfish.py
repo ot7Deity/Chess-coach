@@ -96,18 +96,26 @@ def extract(archive: Path, into: Path) -> Path:
 
 
 def smoke_test(binary: Path) -> bool:
-    """Return True if the binary actually runs on this CPU.
+    """Return True if the binary can actually *search* on this CPU.
 
     A wrong SIMD build does not fail gracefully - it dies with an illegal
-    instruction - so the only reliable check is to start it and speak UCI.
+    instruction - so the only reliable check is to run it.
+
+    The probe must include a real search, not just the UCI handshake. The
+    handshake does not touch the vectorised NNUE evaluation code, so an
+    AVX-VNNI binary on a CPU without AVX-VNNI answers `uci` quite happily and
+    only dies on `go`. An earlier version of this script checked the handshake
+    alone, installed the wrong build, and the illegal instruction surfaced
+    later as a confusing test failure. Hence `go depth 8` and a demand for
+    `bestmove`.
     """
     try:
         proc = subprocess.run(
             [str(binary)],
-            input="uci\nquit\n",
+            input="uci\nisready\nposition startpos\ngo depth 8\nquit\n",
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -120,9 +128,12 @@ def smoke_test(binary: Path) -> bool:
     if "uciok" not in proc.stdout:
         log("  smoke test did not get 'uciok'")
         return False
+    if "bestmove" not in proc.stdout:
+        log("  engine answered the handshake but could not complete a search")
+        return False
 
     first = next((ln for ln in proc.stdout.splitlines() if ln.startswith("id name")), "")
-    log(f"  OK - {first.removeprefix('id name ').strip() or 'engine responded'}")
+    log(f"  OK - {first.removeprefix('id name ').strip() or 'engine responded'} (searched)")
     return True
 
 

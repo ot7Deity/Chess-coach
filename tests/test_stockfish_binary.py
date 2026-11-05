@@ -7,6 +7,8 @@ marked `engine` and skip when no binary is present.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -44,6 +46,58 @@ def test_fallback_chain_is_ordered_fastest_first():
         order = ["avxvnni", "avx2", "sse41-popcnt"]
         found = [next(o for o in order if o in a) for a in assets]
         assert found == order
+
+
+def test_smoke_test_rejects_an_engine_that_cannot_search(tmp_path, monkeypatch):
+    """Regression test for a real CI failure.
+
+    The installer originally probed a candidate build with the UCI handshake
+    alone. The handshake does not exercise the vectorised NNUE evaluation, so an
+    AVX-VNNI binary on a CPU without AVX-VNNI answers `uci` normally and only
+    dies with an illegal instruction on `go`. The installer therefore accepted a
+    build that could not search, and CI failed later with
+    "engine process died unexpectedly (exit code: -4)".
+
+    A fake engine that answers the handshake but never prints `bestmove` must be
+    rejected.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+    import fetch_stockfish
+
+    fake = tmp_path / "fake_engine.py"
+    fake.write_text(
+        "import sys\n"
+        "for line in sys.stdin:\n"
+        "    line = line.strip()\n"
+        "    if line == 'uci':\n"
+        "        print('id name Stockfish 18'); print('uciok', flush=True)\n"
+        "    elif line == 'isready':\n"
+        "        print('readyok', flush=True)\n"
+        "    elif line == 'quit':\n"
+        "        break\n"
+        "    # never answers 'go' - mimics a SIGILL during search\n",
+        encoding="utf-8",
+    )
+
+    # Bind the real implementation first: `fetch_stockfish.subprocess` is the
+    # same module object this test imported, so a replacement that called
+    # `subprocess.run` would recurse into itself.
+    real_run = subprocess.run
+
+    monkeypatch.setattr(
+        fetch_stockfish.subprocess,
+        "run",
+        lambda *a, **kw: real_run(
+            [sys.executable, str(fake)],
+            input=kw.get("input", ""),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        ),
+    )
+
+    assert fetch_stockfish.smoke_test(Path("ignored")) is False
 
 
 @pytest.mark.engine
