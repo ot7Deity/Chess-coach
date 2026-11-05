@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Secrets / local config
+.env
+.env.local
+*.pem
+
+# Engine binaries (large, downloaded by tools/fetch_stockfish.py)
+vendor/
+*.nnue
+
+# Data / benchmark scratch
+data/
+*.db
+*.sqlite3
+bench/results/*.json
+
+# Node / Next.js
+node_modules/
+web/.next/
+web/out/
+web/.env*.local
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
