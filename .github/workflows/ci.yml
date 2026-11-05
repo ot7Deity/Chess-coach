@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to a PR makes the previous run irrelevant; cancel it rather than
+# queueing behind it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep this in step with .python-version and pyproject's requires-python.
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev --frozen
+
+      - name: Ruff lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+
+    # The queue is the riskiest part of this system and its behaviour (FOR UPDATE
+    # SKIP LOCKED, advisory locks, transaction visibility) cannot be reproduced by
+    # SQLite or a mock. CI therefore runs against a real Postgres.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: chess
+          POSTGRES_PASSWORD: chess
+          POSTGRES_DB: chess_coach_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U chess"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+psycopg://chess:chess@localhost:5432/chess_coach_test
+      REDIS_URL: redis://localhost:6379/0
+      CHESSCOM_CONTACT: ci@example.invalid
+      ENV: ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev --frozen
+
+      # Engine tests are opt-in via STOCKFISH_PATH. The binary is ~80 MB, so it is
+      # cached by release tag rather than downloaded on every run.
+      #
+      # The key names the release and the lock file, not a SIMD variant: which
+      # variant a runner ends up with is decided by probing the CPU, so baking an
+      # architecture into the key would be a claim this job cannot make. Hashing
+      # the lock file means bumping the pinned engine invalidates the cache.
+      - name: Cache Stockfish
+        id: sf-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/stockfish
+          key: stockfish-${{ runner.os }}-${{ hashFiles('tools/stockfish.lock.json') }}
+
+      - name: Fetch Stockfish
+        if: steps.sf-cache.outputs.cache-hit != 'true'
+        run: uv run python tools/fetch_stockfish.py
+
+      - name: Tests
+        env:
+          STOCKFISH_PATH: vendor/stockfish/stockfish
+        run: uv run pytest --cov=chess_coach --cov-report=term-missing

@@ -25,6 +25,195 @@ Numbers to fill in as they are measured: games analyzed, cache hit rate, games/m
 
 ---
 
+## 2026-11-05 - The engine service gets extracted after M3, not before `DECIDED`
+
+**What changed:** The engine stays in-process through M3. Once the 1/2/4/8-worker throughput
+numbers exist, Stockfish and the position cache get extracted into a separate **analysis
+service** behind an HTTP contract, as its own PR, and the benchmark is re-run.
+
+**Why:** The system is already service-oriented in the way that matters - three
+independently deployable processes (API, ingest worker, analysis worker) that scale
+separately, fail separately, and communicate *asynchronously through the jobs table* rather
+than by calling each other. Full textbook microservices would actively hurt it: a database
+per service would break the report queries, which are single SQL statements joining games,
+moves and positions, and replacing those with eventual consistency buys nothing. Many
+services sharing one database is the "distributed monolith" anti-pattern, which is exactly
+what an interviewer probes for when they hear the word.
+
+Extracting *the engine specifically* is the one split with real justification: it owns
+Stockfish and the cache behind a versioned contract, engine replicas scale independently of
+queue workers, an engine upgrade deploys without touching ingestion, and it enables **request
+coalescing** - four workers asking for the same position concurrently collapse into one
+engine call, which raises the effective cache hit rate rather than just moving code around.
+
+The ordering is the important part. The entire value of the split is being able to say what
+it cost, and that requires an in-process baseline to compare against. Splitting first makes
+"what did the network boundary cost you?" unanswerable.
+
+**Alternatives rejected:**
+- *Extract it now*: same architecture, no baseline, no measurement, nothing to say about it.
+- *Full microservices (DB per service + message bus)*: breaks M4's analytics and invites the
+  distributed-monolith critique.
+- *Never split*: fine engineering, but leaves a measurement worth having unmeasured.
+
+**Talking point:** "I deliberately did not start with microservices. The processes were
+already decoupled through a queue, which is the property people actually want. Then I
+extracted the engine into its own service once I had baseline throughput numbers, so I could
+measure what the boundary cost instead of assuming. It also let the service coalesce
+duplicate position requests across workers, which a shared in-process cache could not do."
+
+**Where:** planned for after M3.
+
+---
+
+## 2026-11-05 - A health check that doesn't exercise the real path lies to you `DONE`
+
+**This is the best bug in the project so far. CI found it, twice, and the second time proved
+my first fix wrong.** Learn this one properly - it is the "tell me about a bug you hit"
+answer.
+
+**What changed:** The installer's SIMD probe now runs **two** searches - a dense position and
+a sparse one - and requires both to return a move. It originally sent only `uci`.
+
+**The failure:** The fallback chain for CPUs without AVX-VNNI was designed in from the start.
+It did not fire. CI failed with:
+
+```
+chess.engine.EngineTerminatedError: engine process died unexpectedly
+    (exit code: -4, binary not compatible with cpu?)
+```
+
+Exit code -4 is `SIGILL`: an illegal instruction. The AVX-VNNI binary was running on a runner
+whose CPU has no AVX-VNNI, exactly the case the fallback existed to handle.
+
+**Root cause, attempt 1 (wrong fix):** the probe only performed the UCI handshake. Answering
+`uci` prints strings and never reaches the vectorised evaluation code, so a binary that cannot
+evaluate anything passes it. Note which test agreed with the broken probe:
+`test_engine_starts_and_reports_pinned_version` **passed** while
+`test_engine_finds_a_mate_in_one` failed - the test that merely started the engine was wrong
+in precisely the same way the probe was wrong. I made the probe search `startpos` at depth 8
+and pushed.
+
+**It failed again, identically.** The probe reported "searched" and the same two tests died.
+
+**Root cause, attempt 2 (the real one):** Stockfish 18 has **two NNUE networks** - `EvalFile`
+and `EvalFileSmall` (visible as separate UCI options) - and it selects the small one for
+sparse positions and large material imbalances. The two have **separate vectorised code
+paths**. Searching `startpos` is a dense position, so it exercises the big net only. The
+illegal instruction lived in the small net's code. Both failing tests touch sparse positions:
+a six-piece mate-in-one directly, and a depth-14 search that simplifies into endgames deep in
+its tree. So the probe tested the half of the engine that worked.
+
+The fix is to probe a dense position *and* a sparse one - the minimum that touches both nets.
+
+**The transferable lesson:** a health check is only worth the code paths it executes. "The
+process started" is not "the process can do its job", and "it handled one request" is not "it
+can handle every kind of request". The same reasoning is why `/health` and `/ready` are
+separate endpoints here, and why the queue tests kill a worker mid-job rather than asserting
+that the worker starts.
+
+**Alternatives rejected:**
+- *Pin the baseline `sse41-popcnt` build everywhere*: guaranteed to run, and throws away real
+  nodes/sec on the machine doing hours of analysis.
+- *Read CPU flags from `/proc/cpuinfo` or `cpuid`*: platform-specific, and - as this bug
+  shows - a proxy for "does it work" rather than the thing itself. Running the binary is the
+  direct test. Had I done this, I would have had to know in advance that the small net
+  needed AVX-VNNI too.
+- *Catch the crash at analysis time and retry with another build*: moves a setup failure into
+  the hot path, to be re-discovered once per job forever.
+
+**Talking point:** "I had a fallback for CPUs that lacked the instruction set, and it didn't
+fire - my probe only did the UCI handshake, which doesn't touch the vectorised evaluation
+code. I fixed it to actually search a position, and CI failed again in exactly the same way.
+It turned out Stockfish 18 has two neural networks, a big one and a small one for sparse
+positions, with separate SIMD code paths - and my probe only ever searched the opening
+position, so it tested the half that worked. The second fix searches a dense position and an
+endgame. What I took from it is that a health check is worth exactly the code paths it
+executes - the first fix felt like a real fix and was still testing the wrong half."
+
+**Where:** `tools/fetch_stockfish.py` (`smoke_test`), regression test
+`tests/test_stockfish_binary.py::test_smoke_test_rejects_an_engine_that_cannot_search`, which
+fakes both failure modes: an engine that answers the handshake but never moves, and one that
+serves the first search then dies. CI runs
+[42047974613](https://github.com/ot7Deity/Chess-coach/actions/runs/42047974613) and
+[42048894115](https://github.com/ot7Deity/Chess-coach/actions/runs/42048894115).
+
+---
+
+## 2026-11-05 - Engine downloads are checksum-verified and SIMD-probed `DONE`
+
+**What changed:** `tools/fetch_stockfish.py` downloads Stockfish against SHA-256 digests
+pinned in `tools/stockfish.lock.json`, then picks the right build for the CPU by trying
+`avxvnni` then `avx2` then `sse41-popcnt` and running a UCI smoke test on each.
+
+**Why:** Two separate problems.
+
+*Supply chain:* the build pipeline downloads an 80 MB binary from the internet and then
+executes it on every worker. Verifying it against a digest pinned in the repo costs three
+lines and means a compromised or truncated download fails loudly instead of running. The
+digests come straight from the GitHub release API, so no manual hash copying was involved.
+
+*Portability:* picking a SIMD build is not a preference, it is a hard constraint - a binary
+compiled for AVX-VNNI does not degrade on a CPU that lacks it, it dies with an illegal
+instruction. This laptop is Meteor Lake and has AVX-VNNI; GitHub Actions runners are older
+Ice Lake server parts that do not. One hardcoded choice breaks either local dev or CI. So the
+script tries the fastest first and falls back, and "does it work" is answered by actually
+starting the engine and speaking UCI to it, because an illegal instruction cannot be detected
+any other way.
+
+Note that the *architecture* may differ between machines while the *version* may not: all
+SIMD variants of the same release return identical evaluations, just at different speeds. The
+version is what cached evaluations depend on.
+
+**Alternatives rejected:**
+- *`curl | tar` in the Dockerfile*: no verification, no fallback, and it would have silently
+  picked a build that crashes in CI.
+- *`apt-get install stockfish`*: version floats with the base image, which would invalidate
+  the position cache on an unrelated image rebuild.
+- *Detect CPU flags from `/proc/cpuinfo` or `cpuid`*: platform-specific, and still needs the
+  smoke test as a backstop. Running the binary is the direct test.
+
+**Talking point:** "The engine binary is downloaded and executed by every worker, so it is
+verified against a checksum pinned in the repo. The more interesting part is SIMD: the fast
+AVX-VNNI build raises an illegal instruction on the older CPUs GitHub Actions uses, and you
+cannot catch that with a try/except - so the installer tries builds fastest-first and smoke
+tests each one by speaking UCI to it. Local dev gets the fast binary, CI gets a working one,
+and both are the same Stockfish version, which is what my cache keys depend on."
+
+**Where:** `tools/fetch_stockfish.py`, `tools/stockfish.lock.json`,
+`tests/test_stockfish_binary.py`.
+
+---
+
+## 2026-11-05 - CI tests against real Postgres and Redis, not mocks `DONE`
+
+**What changed:** GitHub Actions runs two jobs - lint, and tests against `postgres:17` and
+`redis:7` service containers.
+
+**Why:** The riskiest code in this project is the job queue, and its correctness lives
+entirely in behaviour SQLite and mocks cannot reproduce: `SELECT ... FOR UPDATE SKIP LOCKED`,
+transaction visibility between concurrent workers, and row-level locking. A test suite that
+mocked the database would pass while the queue handed the same job to two workers. The same
+argument applies to the Redis token bucket, whose whole purpose is coordination between
+processes - a faked Redis tests nothing.
+
+Engine tests are opt-in via `STOCKFISH_PATH` and the binary is cached by release tag, so a
+fresh clone can run the unit suite immediately without an 80 MB download.
+
+**Alternatives rejected:**
+- *SQLite for tests*: fast, and would make the one part of the system worth testing untestable.
+- *A mocked Redis*: tests the mock, not the coordination.
+- *Testcontainers*: works, but Actions service containers are already there and need no
+  Docker-in-Docker setup.
+
+**Talking point:** "CI runs against a real Postgres because the queue's correctness is
+`SKIP LOCKED` and row-level locking - behaviour you cannot mock. If I had tested against
+SQLite, the suite would have been green while two workers analysed the same game."
+
+**Where:** `.github/workflows/ci.yml`, `tests/conftest.py`.
+
+---
+
 ## 2026-11-05 - Classify blunders on capped evaluation, not raw centipawn loss `DECIDED`
 
 **What changed:** The design doc's rule was "blunder = lost >= 300 centipawns". The
