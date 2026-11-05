@@ -25,6 +25,69 @@ Numbers to fill in as they are measured: games analyzed, cache hit rate, games/m
 
 ---
 
+## 2026-11-05 - I made the exact cache mistake I had designed out of the app `DONE`
+
+**Keep this one next to the position-cache entry. Together they are the best answer you have
+to "tell me about a time you made a mistake" - because it is the same mistake twice, once
+avoided by design and once committed for real.**
+
+**What changed:** The CI cache key for the engine binary now hashes the installer script as
+well as the lock file, and the installer runs on every build instead of only on a cache miss.
+
+**What happened:** After the dual-net probe fix went green, the very next PR failed with the
+same `SIGILL` - on a branch that already contained the fix. The probe was correct. The cause
+was the cache:
+
+```
+Cache Stockfish: Cache hit for: stockfish-Linux-c2ff5d61...
+Fetch Stockfish: skipped (if: cache-hit != 'true')
+Tests:           engine process died unexpectedly (exit code: -4)
+```
+
+An *earlier failing run* had saved `vendor/stockfish` containing the bad AVX-VNNI binary. The
+key was `stockfish-<os>-<hash of stockfish.lock.json>`. The lock file had not changed, so the
+key had not changed, so the broken entry was restored - and because the fetch step was gated
+on a cache miss, the fixed probe never ran. The fix was in the repository and had no way to
+take effect.
+
+**Why the key was wrong:** the cached value is not "Stockfish 18". It is *"the build this
+runner was able to actually run, as judged by that version of the probe"*. It therefore
+depends on the probe. When the probe changed, every existing entry became untrustworthy, but
+the key never mentioned the probe, so nothing expired.
+
+That is **precisely** the error the `positions` primary key was changed to avoid: a cache key
+that omits something the value depends on. There I reasoned it through in advance and keyed on
+(position, engine version, depth). Here I wrote the same bug into a YAML file a few hours
+later and let CI catch it.
+
+**The second fix matters as much as the key:** the installer now runs unconditionally. It
+already re-probes a binary that is present and re-fetches if it cannot search, so running it
+always makes a poisoned cache **self-healing** rather than permanently broken. Gating it on a
+cache miss was an optimisation worth under a second that cost two red CI runs. A cache you
+cannot validate on read is a cache that can only be fixed by hand.
+
+**Alternatives rejected:**
+- *Manually purge the cache*: fixes this instance and leaves the mechanism able to do it again.
+- *Stop caching the binary*: 80 MB per run, and it would hide the lesson rather than fix it.
+- *Only save the cache on success*: narrows the window - a correct-but-stale entry can still
+  be served after the probe changes - and does not make reads verifiable.
+
+**Talking point:** "I corrected my design so the position cache key included the engine
+version and search depth, because an evaluation depends on both. Then I wrote the identical
+bug into my CI config: I keyed the cached engine binary on the release version, when what was
+actually cached was 'the build this machine could run, according to my probe'. A failing run
+poisoned the cache, the key didn't change, and my fetch step was gated on a cache miss - so a
+fix sitting in the repository could never run. Two things came out of it. One: a cache key has
+to name everything the value depends on, including the code that produced it. Two: validate on
+read if you can afford to. Re-probing the binary cost under a second and turned a permanently
+broken cache into a self-healing one."
+
+**Where:** `.github/workflows/ci.yml` (`Fetch or verify Stockfish`). Poisoned run
+[42051183768](https://github.com/ot7Deity/Chess-coach/actions/runs/42051183768); green after
+the fix. Related: the `positions` cache-key entry and the dual-net probe entry.
+
+---
+
 ## 2026-11-05 - The engine service gets extracted after M3, not before `DECIDED`
 
 **What changed:** The engine stays in-process through M3. Once the 1/2/4/8-worker throughput
