@@ -7,7 +7,14 @@ This exists because a project is only worth putting on a resume if you can defen
 the "Talking point" lines before an interview; read the "Why" lines when you need to actually
 understand the system.
 
-**Entry format:** What changed / Why / Alternatives rejected / Talking point / Where.
+**Entry format:** two layers. Every entry opens with **In plain English** - a jargon-free
+summary that a non-technical reader (a recruiter, a hiring manager outside engineering) can
+follow on its own. Everything below that is the detail for the engineer on the panel:
+What changed / Why / Alternatives rejected / Talking point / Where.
+
+Read just the plain-English lines to re-load the whole project in two minutes. Read the rest
+when you need to defend a specific decision.
+
 **Status tags:** `DONE` = in the code. `DECIDED` = agreed, not built yet.
 
 ---
@@ -25,7 +32,124 @@ Numbers to fill in as they are measured: games analyzed, cache hit rate, games/m
 
 ---
 
+## 2026-11-05 - Compose starts the infrastructure, not the app `DONE`
+
+> **In plain English:** Running this project needs a database and a cache server. Rather than
+> install those onto my laptop, one command now starts them in containers - the same versions
+> the automated tests use, isolated from everything else, and deletable without a trace. I
+> deliberately left the application itself out of it, because two of its three parts have not
+> been written yet. The immediate payoff is that the tests covering my database design now
+> actually run on my own machine; until today they quietly skipped themselves and had only ever
+> run on GitHub's servers.
+
+**What changed:** `docker-compose.yml` starts `postgres:17-alpine` and `redis:7-alpine` with
+healthchecks, named volumes and a first-boot script that creates a second database,
+`chess_coach_test`. A `.dockerignore` landed with it. The API and workers are not in the file.
+
+**Why:**
+
+*The test database is the actual point.* `tests/conftest.py` proves the Alembic migrations can
+build the schema from nothing by running `DROP SCHEMA public CASCADE` before every upgrade to
+head - a schema that is only ever created from the models is a schema whose migrations have
+never been tested. A fixture that destructive refuses to run unless the database name contains
+`test`. With no local Postgres at all, that refusal was moot: **every** Postgres-backed test
+skipped, so `test_models.py` and `test_migrations.py` had never once executed outside CI. The
+schema was being designed with its tests running somewhere I couldn't see.
+
+*Versions are pinned to match CI* because the queue's correctness lives in version-specific
+locking behaviour. Deliberately introducing a "passes locally, fails in CI" axis in the one
+component where correctness is hardest would be self-sabotage.
+
+*The app is excluded because two thirds of it does not exist.* A compose entry for the ingest
+and analysis workers would start containers that idle with nothing to do, and the Dockerfile
+would have to answer where the engine binary comes from - a question with real consequences
+that deserves to be answered when it bites, not pre-emptively.
+
+*`.dockerignore` was written before the Dockerfile* because the first `docker build` is exactly
+when it is too late to discover the build context is 211 MB, 114 MB of which is a Windows
+executable that cannot run in a Linux image.
+
+**Alternatives rejected:**
+- *Install Postgres natively on Windows*: a second thing to keep version-matched with CI, no
+  clean reset, and an uninstall that leaves data directories behind.
+- *Point the tests at the development database*: `conftest.py` refuses on purpose, and it is
+  right to - it drops the schema.
+- *Put the app in compose now with placeholder worker services*: containers that start and do
+  nothing, plus a Dockerfile written against code that has not been designed yet.
+- *SQLite for local tests*: rejected earlier for the queue, and the same argument applies.
+
+**Talking point:** "My schema and migration tests had never run on my own machine. They skip
+cleanly when no database is reachable - which is the right default, so a fresh clone can run
+the suite - but it meant I was designing a schema while its tests only ever ran in CI. One
+compose file fixed that. The detail I would point at is that it creates a *second*, separate
+test database: my fixtures prove the migrations work by dropping the schema and rebuilding it,
+and they refuse to run unless the database name contains 'test'. That guard is there because
+the cost of that fixture pointing at real data once is unrecoverable."
+
+**Where:** `docker-compose.yml`, `docker/postgres/init/01-create-test-database.sql`,
+`.dockerignore`, README quick start. `docs/DESIGN.md` still lists M0 as Compose starting "API,
+workers, Postgres, Redis" - the original plan, left unedited on purpose so the gap stays
+visible.
+
+---
+
+## 2026-11-05 - The engine is probed at container start, never baked into the image `DECIDED`
+
+> **In plain English:** The chess engine ships in several builds aimed at different processor
+> generations, and the fastest one does not politely slow down on an older chip - it crashes
+> outright. My laptop is new enough to run the fastest build. If the engine were chosen while
+> *building* the shipping package, it would pick the fast build based on my laptop and then
+> crash on the older servers it gets deployed to. So the choice happens when the container
+> starts, on the machine that will actually run it.
+
+**What changed:** The M2 Dockerfile will **not** run `tools/fetch_stockfish.py` as a build
+step. The installer runs in the container entrypoint instead, with `vendor/` mounted as a named
+volume so the 109 MB download happens once per machine rather than once per container start.
+
+**Why:** An image is portable; the probe's answer is not. "Which SIMD build runs here" is a
+property of the host CPU, so baking it into an image is a cache key that omits something the
+value depends on - **the third instance of that same error in this project**, after the
+`positions` primary key (caught by reasoning) and the CI engine cache (caught by two red
+builds). The pattern is now unmistakable: every time I store a computed answer, I have to ask
+what inputs it actually depended on, and a probe's input is the machine.
+
+The fix costs no new code. `fetch_stockfish.py` already re-probes a binary that is present and
+re-fetches only if it cannot search, which is the self-healing behaviour added in `c360e9b`.
+Calling it from the entrypoint is that same validate-on-read property, applied to images.
+
+**Alternatives rejected:**
+- *Fetch at build time*: fastest container start, and the image is silently valid only on CPUs
+  resembling the build machine's. Breaks the first time it is deployed or handed to someone
+  else - and breaks with `SIGILL`, which tells the next person nothing.
+- *Bake the conservative `sse41-popcnt` build*: always runs, and throws away measurable
+  nodes/sec on the machine doing hours of analysis. Nodes/sec is the input to every throughput
+  number this project is meant to produce.
+- *Build one image per SIMD variant*: correct for a product, and triples the build matrix for a
+  one-person project with one deployment target.
+- *Fetch per container start with no volume*: 109 MB per worker per start. At eight workers
+  that is most of a gigabyte to start a benchmark.
+
+**Talking point:** "Same bug, third appearance - and by the third time I recognised it before
+it fired. I cache engine evaluations keyed on the engine version and depth because the value
+depends on both. My CI cache broke because its key named the release but not the probe that
+picked the binary. So when it came to the container image, the question was already familiar:
+the build picks the engine by testing the CPU, and an image gets copied to machines with
+different CPUs. The probe's answer belongs to the host, so it has to be computed on the host -
+at container start, not at build time."
+
+**Where:** planned for the M2 `Dockerfile` entrypoint. `tools/fetch_stockfish.py` already has
+the re-probe behaviour this depends on.
+
+---
+
 ## 2026-11-05 - I made the exact cache mistake I had designed out of the app `DONE`
+
+> **In plain English:** To save time, the test system keeps a copy of the chess engine instead
+> of re-downloading it every run. The copy it kept was one that only works on *some* of the
+> machines that run the tests - and nothing ever checked, it just handed the copy over and the
+> tests died. Worse, the step that would have replaced the bad copy was skipped precisely
+> *because* a copy already existed. The lesson: when you store something to reuse later, check
+> that it still works when you pick it up. Don't trust the label on the box.
 
 **Keep this one next to the position-cache entry. Together they are the best answer you have
 to "tell me about a time you made a mistake" - because it is the same mistake twice, once
@@ -90,6 +214,12 @@ the fix. Related: the `positions` cache-key entry and the dual-net probe entry.
 
 ## 2026-11-05 - The engine service gets extracted after M3, not before `DECIDED`
 
+> **In plain English:** Splitting a big application into smaller independent pieces
+> ("microservices") is fashionable, and splitting off the chess-engine part is the one split
+> here that genuinely pays for itself. But I'm doing it *after* I've measured how fast the
+> current version runs, not before. If I split first I could never answer "what did that cost
+> you?" - and being able to answer that is the entire point of doing it.
+
 **What changed:** The engine stays in-process through M3. Once the 1/2/4/8-worker throughput
 numbers exist, Stockfish and the position cache get extracted into a separate **analysis
 service** behind an HTTP contract, as its own PR, and the benchmark is re-run.
@@ -130,6 +260,15 @@ duplicate position requests across workers, which a shared in-process cache coul
 ---
 
 ## 2026-11-05 - A health check that doesn't exercise the real path lies to you `DONE`
+
+> **In plain English:** Before using the downloaded chess engine, the installer tests that it
+> works. My test was far too shallow - it asked the engine to introduce itself, which it could
+> do, and then the engine crashed the instant it was asked to actually think about a chess
+> position. I made the test ask it to think, pushed the fix, and it failed again in exactly
+> the same way: the engine turns out to have two separate "brains", one for crowded boards and
+> one for nearly-empty ones, and my test only ever used the one that worked. The takeaway is
+> that a self-test proves only what it actually does. "It started up" is not "it can do its
+> job".
 
 **This is the best bug in the project so far. CI found it, twice, and the second time proved
 my first fix wrong.** Learn this one properly - it is the "tell me about a bug you hit"
@@ -205,6 +344,14 @@ serves the first search then dies. CI runs
 
 ## 2026-11-05 - Engine downloads are checksum-verified and SIMD-probed `DONE`
 
+> **In plain English:** The project downloads Stockfish - the chess engine that does the actual
+> judging - off the internet and then runs it. Two things had to be handled. First, a download
+> that has been tampered with or truncated should fail loudly rather than run, so every
+> download is checked against a fingerprint recorded in the project. Second, the engine comes
+> in several builds aimed at different generations of processor, and the fastest build doesn't
+> politely slow down on an older chip - it crashes outright. So the installer tries the fastest
+> build, actually runs it, and steps down a level if it fails.
+
 **What changed:** `tools/fetch_stockfish.py` downloads Stockfish against SHA-256 digests
 pinned in `tools/stockfish.lock.json`, then picks the right build for the CPU by trying
 `avxvnni` then `avx2` then `sse41-popcnt` and running a UCI smoke test on each.
@@ -250,6 +397,12 @@ and both are the same Stockfish version, which is what my cache keys depend on."
 
 ## 2026-11-05 - CI tests against real Postgres and Redis, not mocks `DONE`
 
+> **In plain English:** The automated tests run against a real database, not a simplified
+> stand-in. The hardest problem in this project is making sure that when several background
+> workers are chewing through a pile of games, no two ever grab the same game - and that
+> depends on specific guarantees only the real database makes. A stand-in would have given me
+> a reassuring green tick while hiding the one bug I actually care about.
+
 **What changed:** GitHub Actions runs two jobs - lint, and tests against `postgres:17` and
 `redis:7` service containers.
 
@@ -278,6 +431,14 @@ SQLite, the suite would have been green while two workers analysed the same game
 ---
 
 ## 2026-11-05 - Classify blunders on capped evaluation, not raw centipawn loss `DECIDED`
+
+> **In plain English:** The report labels your bad moves as blunders, mistakes or
+> inaccuracies, based on how much each one cost you. My first rule just measured the raw drop,
+> which gets things backwards in real games: a sloppy move in an already-hopeless position
+> looked like a catastrophe, while the single move that threw away a drawn game barely
+> registered. The fix treats "already winning by a mile" and "already losing by a mile" as
+> single states, so only swings that genuinely change the result count. This matters because
+> it's the headline number of the whole report.
 
 **What changed:** The design doc's rule was "blunder = lost >= 300 centipawns". The
 implementation will clamp both evaluations to +/-1000 cp *before* subtracting, and store the
@@ -310,6 +471,12 @@ the database precisely so I could change the rule without burning hours of engin
 
 ## 2026-11-05 - Pin Stockfish 18, not the latest release `DECIDED`
 
+> **In plain English:** I deliberately use an older release of the chess engine rather than the
+> newest one. The newest is published for Windows only, and I write the code on Windows but run
+> the real workload on Linux servers - so I'd have ended up with two different engines giving
+> two different opinions on the same position. Since the project saves engine opinions and
+> reuses them later, mixing two versions would quietly poison the saved results.
+
 **What changed:** The engine is pinned to Stockfish `sf_18`, using the `avxvnni` build.
 
 **Why:** Two reasons. First, `sf_19` (the latest) ships **Windows binaries only** - no Linux
@@ -341,6 +508,14 @@ cache on position alone, silently mixing evaluations from two engines."
 
 ## 2026-11-05 - Position cache is keyed on (position, engine version, depth) `DECIDED`
 
+> **In plain English:** The same chess position turns up in thousands of different games, so
+> the engine's verdict on it is worked out once and reused - that's what makes analysing
+> thousands of games affordable. The subtlety is that a "verdict" isn't a fact about the
+> position; it's what *this* engine concluded after thinking *this* hard. So each saved verdict
+> is filed under all three. Without that, turning the thinking time down for a quick
+> experiment would have permanently replaced good results with rushed ones, and nothing
+> anywhere would have warned me.
+
 **What changed:** The design doc made `positions.fen_hash` the primary key. The primary key
 will instead be `(fen_hash, engine_version, depth)`.
 
@@ -370,6 +545,13 @@ evaluations, with no error message anywhere."
 
 ## 2026-11-05 - Fixed search depth, never movetime `DECIDED`
 
+> **In plain English:** When you ask the engine about a position you can either say "think for
+> one second" or "think this many moves ahead". I always use the second. "Think for one second"
+> gives a different answer depending on how busy the computer happens to be, which makes the
+> answer impossible to save and reuse, and makes my speed measurements meaningless - adding
+> more workers wouldn't make the system faster, it would just make every answer sloppier while
+> the numbers looked unchanged.
+
 **What changed:** Stockfish is always asked for a fixed `depth`, never a time budget.
 
 **Why:** A movetime search returns whatever it managed to compute in N milliseconds, so the
@@ -392,6 +574,13 @@ scaling numbers measure throughput instead of silently measuring search quality.
 ---
 
 ## 2026-11-05 - Sync Python throughout, not async `DONE`
+
+> **In plain English:** There's a popular programming style ("async") that pays off when a
+> program spends most of its time waiting for other computers to reply. This program barely
+> waits - it spends its time on heavy calculation. Using that style here would have added real
+> complexity to the most delicate part of the system and bought no speed at all. To go faster
+> I run more copies of the program instead, which is what actually uses the rest of the
+> processor.
 
 **What changed:** SQLAlchemy sync sessions and `def` (not `async def`) FastAPI handlers.
 
@@ -421,6 +610,12 @@ coroutines, because that is what actually uses the other 15 cores."
 
 ## 2026-11-05 - Chess.com contact email lives only in gitignored `.env` `DONE`
 
+> **In plain English:** Chess.com asks any program using their data to say who to contact if it
+> misbehaves, and a program that doesn't risks being blocked. But this project's code is public
+> on GitHub, and an email address sitting in public code gets harvested by spam bots within
+> days. So the address lives in a private settings file that is never published: Chess.com gets
+> it with every request, the open internet doesn't.
+
 **What changed:** The `User-Agent` is built at runtime as
 `ChessCoach/0.1 (<CHESSCOM_CONTACT>)`, with the real address read from `.env`.
 `.env.example` ships a placeholder and `.env` is gitignored.
@@ -443,6 +638,13 @@ the repo is public. Same reason the database URL isn't committed."
 ---
 
 ## 2026-11-05 - Seven corrections to the design doc, found by calling the API first `DONE`
+
+> **In plain English:** Before writing any of the code that pulls games off Chess.com, I spent
+> ten minutes simply asking their service for a few real games and reading what came back.
+> Seven things in my design document turned out to be wrong - including that the field I had
+> planned to use for naming chess openings contains a web link rather than the opening's name,
+> which would have broken one of the four features the report is built around. These were the
+> cheapest fixes in the project, because none of that code had been written yet.
 
 **What changed:** Before writing any ingestion code, the Chess.com API was called directly to
 check what it actually returns. Five assumptions in the design doc were wrong.
@@ -482,6 +684,13 @@ code. Cheapest bug fixes in the project, because none of them had been written y
 
 ## 2026-11-05 - Python pinned to 3.12, though 3.14 is installed `DONE`
 
+> **In plain English:** The project runs on an older version of Python than the one installed
+> on my laptop. The libraries it depends on ship ready-made installers for each Python
+> version, and the newest version often has gaps - when one is missing, your computer tries to
+> build the library from scratch, which on Windows means losing an afternoon. On top of that,
+> my laptop, the test system and the server all have to be on the same version, or "it works
+> on my machine" becomes the normal state of affairs.
+
 **What changed:** `.python-version` pins 3.12; `requires-python = ">=3.12,<3.13"`; uv manages
 the interpreter.
 
@@ -505,6 +714,12 @@ the same interpreter or 'works on my machine' becomes the default failure mode."
 
 ## 2026-11-05 - Repo moved out of OneDrive to `C:\dev\chess-coach` `DONE`
 
+> **In plain English:** I moved the project folder off OneDrive. A project like this generates
+> tens of thousands of small working files, and OneDrive tries to back up every one of them as
+> it changes. While it's doing that it holds files open, which makes installs and test runs
+> fail with "permission denied" and "file in use" - errors that look exactly like bugs in your
+> own code and send you hunting in the wrong place. GitHub is already the backup.
+
 **What changed:** The repository was moved from `OneDrive\Desktop\Chess coach\` to
 `C:\dev\chess-coach` while it was still empty.
 
@@ -526,6 +741,11 @@ Git plus GitHub is already the backup; OneDrive on top of it just adds file lock
 
 ## 2026-11-05 - Line endings normalized to LF via `.gitattributes` `DONE`
 
+> **In plain English:** Windows and Linux disagree about the invisible character that marks the
+> end of a line in a text file. I write the code on Windows; it runs on Linux. Without a rule
+> forcing one convention, startup scripts fail with error messages that tell you nothing useful,
+> and the project history shows whole files as rewritten when only one line actually moved.
+
 **What changed:** `* text=auto eol=lf` plus explicit rules for `.py`, `.sh`, `.yml`, `.sql`.
 
 **Why:** Development is on Windows (CRLF), while CI and the containers are Linux (LF). Without
@@ -542,6 +762,12 @@ carriage return breaks an entrypoint script and the error tells you nothing usef
 ---
 
 ## 2026-11-05 - One PR per feature, merged with a merge commit `DONE`
+
+> **In plain English:** Every change goes through the same formal review-and-test step a team
+> would use, even though I'm the only person on the project. Two things come out of that: the
+> main copy of the code is always in a working state I can go back to, and every decision has
+> a written explanation attached to it. That written trail is why I can still explain choices
+> I made months earlier - and it's where the entries in this file come from.
 
 **What changed:** Every feature gets a `feat/*` or `chore/*` branch, a PR with a written
 description, CI, and a merge (not a squash).
