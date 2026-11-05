@@ -1,0 +1,56 @@
+{
+  "_comment": [
+    "Pinned Stockfish release and the SHA-256 of every asset we may download.",
+    "Digests come from the GitHub release API, so the binary is verified before",
+    "it is ever executed. sf_18 is pinned on purpose: it is the last release with",
+    "prebuilt binaries for both Windows (local dev) and Linux (containers), and a",
+    "cached evaluation is only valid for the engine version that produced it.",
+    "See INTERVIEW_PREP.md for the full reasoning.",
+    "",
+    "preference: tried in order; the first binary that passes a UCI smoke test",
+    "wins. AVX-VNNI is fastest on Alder Lake and newer Intel, but is absent on",
+    "older server CPUs such as the Ice Lake parts GitHub Actions runs, so a",
+    "fallback chain is required. Keys must be platform names only - the fetch",
+    "script and tests iterate them."
+  ],
+  "tag": "sf_18",
+  "repo": "official-stockfish/Stockfish",
+  "preference": {
+    "linux": [
+      "stockfish-ubuntu-x86-64-avxvnni.tar",
+      "stockfish-ubuntu-x86-64-avx2.tar",
+      "stockfish-ubuntu-x86-64-sse41-popcnt.tar"
+    ],
+    "windows": [
+      "stockfish-windows-x86-64-avxvnni.zip",
+      "stockfish-windows-x86-64-avx2.zip",
+      "stockfish-windows-x86-64-sse41-popcnt.zip"
+    ]
+  },
+  "assets": {
+    "stockfish-ubuntu-x86-64-avxvnni.tar": {
+      "sha256": "57fb4139ea786c5cb606099cd901bf363d57e0e00c5a3dc7cd98269a6baf041a",
+      "size": 114391040
+    },
+    "stockfish-ubuntu-x86-64-avx2.tar": {
+      "sha256": "536c0c2c0cf06450df0bfb5e876ef0d3119950703a8f143627f990c7b5417964",
+      "size": 114401280
+    },
+    "stockfish-ubuntu-x86-64-sse41-popcnt.tar": {
+      "sha256": "dea5016a6d9ab705e5697b093d882fca4677d84d8828f470ee33e76de33cf962",
+      "size": 114401280
+    },
+    "stockfish-windows-x86-64-avxvnni.zip": {
+      "sha256": "7d8147336cc750c29ebcc1192ace91ba9c8a6adb2e20876f365a024836332042",
+      "size": 76950536
+    },
+    "stockfish-windows-x86-64-avx2.zip": {
+      "sha256": "6f6c272ebd6ea594377715235c8a7326f75940ef4f4f856f45106028fe6ae900",
+      "size": 76955020
+    },
+    "stockfish-windows-x86-64-sse41-popcnt.zip": {
+      "sha256": "f25830a4567e2bac843d029d3113e6e34ba0cd2f95b9c0bb49afc871fe722a10",
+      "size": 76955228
+    }
+  }
+}

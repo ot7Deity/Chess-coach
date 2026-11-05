@@ -25,6 +25,80 @@ Numbers to fill in as they are measured: games analyzed, cache hit rate, games/m
 
 ---
 
+## 2026-11-05 - Engine downloads are checksum-verified and SIMD-probed `DONE`
+
+**What changed:** `tools/fetch_stockfish.py` downloads Stockfish against SHA-256 digests
+pinned in `tools/stockfish.lock.json`, then picks the right build for the CPU by trying
+`avxvnni` then `avx2` then `sse41-popcnt` and running a UCI smoke test on each.
+
+**Why:** Two separate problems.
+
+*Supply chain:* the build pipeline downloads an 80 MB binary from the internet and then
+executes it on every worker. Verifying it against a digest pinned in the repo costs three
+lines and means a compromised or truncated download fails loudly instead of running. The
+digests come straight from the GitHub release API, so no manual hash copying was involved.
+
+*Portability:* picking a SIMD build is not a preference, it is a hard constraint - a binary
+compiled for AVX-VNNI does not degrade on a CPU that lacks it, it dies with an illegal
+instruction. This laptop is Meteor Lake and has AVX-VNNI; GitHub Actions runners are older
+Ice Lake server parts that do not. One hardcoded choice breaks either local dev or CI. So the
+script tries the fastest first and falls back, and "does it work" is answered by actually
+starting the engine and speaking UCI to it, because an illegal instruction cannot be detected
+any other way.
+
+Note that the *architecture* may differ between machines while the *version* may not: all
+SIMD variants of the same release return identical evaluations, just at different speeds. The
+version is what cached evaluations depend on.
+
+**Alternatives rejected:**
+- *`curl | tar` in the Dockerfile*: no verification, no fallback, and it would have silently
+  picked a build that crashes in CI.
+- *`apt-get install stockfish`*: version floats with the base image, which would invalidate
+  the position cache on an unrelated image rebuild.
+- *Detect CPU flags from `/proc/cpuinfo` or `cpuid`*: platform-specific, and still needs the
+  smoke test as a backstop. Running the binary is the direct test.
+
+**Talking point:** "The engine binary is downloaded and executed by every worker, so it is
+verified against a checksum pinned in the repo. The more interesting part is SIMD: the fast
+AVX-VNNI build raises an illegal instruction on the older CPUs GitHub Actions uses, and you
+cannot catch that with a try/except - so the installer tries builds fastest-first and smoke
+tests each one by speaking UCI to it. Local dev gets the fast binary, CI gets a working one,
+and both are the same Stockfish version, which is what my cache keys depend on."
+
+**Where:** `tools/fetch_stockfish.py`, `tools/stockfish.lock.json`,
+`tests/test_stockfish_binary.py`.
+
+---
+
+## 2026-11-05 - CI tests against real Postgres and Redis, not mocks `DONE`
+
+**What changed:** GitHub Actions runs two jobs - lint, and tests against `postgres:17` and
+`redis:7` service containers.
+
+**Why:** The riskiest code in this project is the job queue, and its correctness lives
+entirely in behaviour SQLite and mocks cannot reproduce: `SELECT ... FOR UPDATE SKIP LOCKED`,
+transaction visibility between concurrent workers, and row-level locking. A test suite that
+mocked the database would pass while the queue handed the same job to two workers. The same
+argument applies to the Redis token bucket, whose whole purpose is coordination between
+processes - a faked Redis tests nothing.
+
+Engine tests are opt-in via `STOCKFISH_PATH` and the binary is cached by release tag, so a
+fresh clone can run the unit suite immediately without an 80 MB download.
+
+**Alternatives rejected:**
+- *SQLite for tests*: fast, and would make the one part of the system worth testing untestable.
+- *A mocked Redis*: tests the mock, not the coordination.
+- *Testcontainers*: works, but Actions service containers are already there and need no
+  Docker-in-Docker setup.
+
+**Talking point:** "CI runs against a real Postgres because the queue's correctness is
+`SKIP LOCKED` and row-level locking - behaviour you cannot mock. If I had tested against
+SQLite, the suite would have been green while two workers analysed the same game."
+
+**Where:** `.github/workflows/ci.yml`, `tests/conftest.py`.
+
+---
+
 ## 2026-11-05 - Classify blunders on capped evaluation, not raw centipawn loss `DECIDED`
 
 **What changed:** The design doc's rule was "blunder = lost >= 300 centipawns". The
