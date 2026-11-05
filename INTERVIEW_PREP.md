@@ -66,53 +66,77 @@ duplicate position requests across workers, which a shared in-process cache coul
 
 ---
 
-## 2026-11-05 - A UCI handshake is not proof the engine works (real CI failure) `DONE`
+## 2026-11-05 - A health check that doesn't exercise the real path lies to you `DONE`
 
-**What changed:** The installer's smoke test now runs `position startpos` + `go depth 8` and
-requires a `bestmove` reply. It previously sent only `uci` and accepted `uciok`.
+**This is the best bug in the project so far. CI found it, twice, and the second time proved
+my first fix wrong.** Learn this one properly - it is the "tell me about a bug you hit"
+answer.
 
-**Why:** This one was caught by CI, not by reasoning. The fallback chain was already designed
-to handle CPUs without AVX-VNNI - but it did not fire, and the test job failed with:
+**What changed:** The installer's SIMD probe now runs **two** searches - a dense position and
+a sparse one - and requires both to return a move. It originally sent only `uci`.
+
+**The failure:** The fallback chain for CPUs without AVX-VNNI was designed in from the start.
+It did not fire. CI failed with:
 
 ```
 chess.engine.EngineTerminatedError: engine process died unexpectedly
     (exit code: -4, binary not compatible with cpu?)
 ```
 
-Exit code -4 is `SIGILL`, an illegal instruction - the AVX-VNNI build running on a CPU that
-does not have AVX-VNNI. The fallback should have caught it. It didn't, because **the UCI
-handshake never executes the vectorised NNUE evaluation code.** Answering `uci` is just
-printing strings. The illegal instruction only fires once the engine actually searches. So the
-probe said "works", the installer kept the fast build, and the crash surfaced two tests later
-as something that looked like a bug in the test rather than in the installer.
+Exit code -4 is `SIGILL`: an illegal instruction. The AVX-VNNI binary was running on a runner
+whose CPU has no AVX-VNNI, exactly the case the fallback existed to handle.
 
-Note which test caught it: `test_engine_starts_and_reports_pinned_version` **passed** while
-`test_engine_finds_a_mate_in_one` failed. The one that merely started the engine agreed with
-the broken probe, for the same reason the probe was broken.
+**Root cause, attempt 1 (wrong fix):** the probe only performed the UCI handshake. Answering
+`uci` prints strings and never reaches the vectorised evaluation code, so a binary that cannot
+evaluate anything passes it. Note which test agreed with the broken probe:
+`test_engine_starts_and_reports_pinned_version` **passed** while
+`test_engine_finds_a_mate_in_one` failed - the test that merely started the engine was wrong
+in precisely the same way the probe was wrong. I made the probe search `startpos` at depth 8
+and pushed.
 
-The general lesson is that a health check has to exercise the code path it claims to
-validate. "The process started" is not "the process can do its job" - which is also exactly
-why `/health` and `/ready` are separate endpoints in this project.
+**It failed again, identically.** The probe reported "searched" and the same two tests died.
+
+**Root cause, attempt 2 (the real one):** Stockfish 18 has **two NNUE networks** - `EvalFile`
+and `EvalFileSmall` (visible as separate UCI options) - and it selects the small one for
+sparse positions and large material imbalances. The two have **separate vectorised code
+paths**. Searching `startpos` is a dense position, so it exercises the big net only. The
+illegal instruction lived in the small net's code. Both failing tests touch sparse positions:
+a six-piece mate-in-one directly, and a depth-14 search that simplifies into endgames deep in
+its tree. So the probe tested the half of the engine that worked.
+
+The fix is to probe a dense position *and* a sparse one - the minimum that touches both nets.
+
+**The transferable lesson:** a health check is only worth the code paths it executes. "The
+process started" is not "the process can do its job", and "it handled one request" is not "it
+can handle every kind of request". The same reasoning is why `/health` and `/ready` are
+separate endpoints here, and why the queue tests kill a worker mid-job rather than asserting
+that the worker starts.
 
 **Alternatives rejected:**
-- *Pin the baseline `sse41-popcnt` build everywhere*: would work, and would give up real
-  nodes/sec on the machine doing the actual analysis.
-- *Read CPU flags from `/proc/cpuinfo` or `cpuid`*: platform-specific, and a probe that runs
-  the binary is the direct test rather than a proxy for it.
-- *Catch the exception at analysis time and retry with another build*: moves a setup problem
-  into the hot path, where it would be retried once per job forever.
+- *Pin the baseline `sse41-popcnt` build everywhere*: guaranteed to run, and throws away real
+  nodes/sec on the machine doing hours of analysis.
+- *Read CPU flags from `/proc/cpuinfo` or `cpuid`*: platform-specific, and - as this bug
+  shows - a proxy for "does it work" rather than the thing itself. Running the binary is the
+  direct test. Had I done this, I would have had to know in advance that the small net
+  needed AVX-VNNI too.
+- *Catch the crash at analysis time and retry with another build*: moves a setup failure into
+  the hot path, to be re-discovered once per job forever.
 
-**Talking point:** "My best bug so far, and CI found it. I had a fallback chain for CPUs
-without AVX-VNNI, and it didn't trigger - because my probe only did the UCI handshake, which
-doesn't touch the vectorised evaluation code. The engine answered the handshake fine and then
-died with an illegal instruction the moment it tried to search. The fix was one line - make
-the probe actually search - but the lesson was that a health check which doesn't exercise the
-real code path will cheerfully tell you a broken thing is fine."
+**Talking point:** "I had a fallback for CPUs that lacked the instruction set, and it didn't
+fire - my probe only did the UCI handshake, which doesn't touch the vectorised evaluation
+code. I fixed it to actually search a position, and CI failed again in exactly the same way.
+It turned out Stockfish 18 has two neural networks, a big one and a small one for sparse
+positions, with separate SIMD code paths - and my probe only ever searched the opening
+position, so it tested the half that worked. The second fix searches a dense position and an
+endgame. What I took from it is that a health check is worth exactly the code paths it
+executes - the first fix felt like a real fix and was still testing the wrong half."
 
-**Where:** `tools/fetch_stockfish.py` (`smoke_test`), regression test in
-`tests/test_stockfish_binary.py::test_smoke_test_rejects_an_engine_that_cannot_search`,
-which fakes an engine that answers the handshake but never returns a move. CI run
-[42047974613](https://github.com/ot7Deity/Chess-coach/actions/runs/42047974613).
+**Where:** `tools/fetch_stockfish.py` (`smoke_test`), regression test
+`tests/test_stockfish_binary.py::test_smoke_test_rejects_an_engine_that_cannot_search`, which
+fakes both failure modes: an engine that answers the handshake but never moves, and one that
+serves the first search then dies. CI runs
+[42047974613](https://github.com/ot7Deity/Chess-coach/actions/runs/42047974613) and
+[42048894115](https://github.com/ot7Deity/Chess-coach/actions/runs/42048894115).
 
 ---
 

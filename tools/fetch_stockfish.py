@@ -101,21 +101,41 @@ def smoke_test(binary: Path) -> bool:
     A wrong SIMD build does not fail gracefully - it dies with an illegal
     instruction - so the only reliable check is to run it.
 
-    The probe must include a real search, not just the UCI handshake. The
-    handshake does not touch the vectorised NNUE evaluation code, so an
-    AVX-VNNI binary on a CPU without AVX-VNNI answers `uci` quite happily and
-    only dies on `go`. An earlier version of this script checked the handshake
-    alone, installed the wrong build, and the illegal instruction surfaced
-    later as a confusing test failure. Hence `go depth 8` and a demand for
-    `bestmove`.
+    Getting this probe right took two attempts, and both failures were
+    instructive:
+
+    1. Checking only the UCI handshake. Answering `uci` just prints strings and
+       never reaches the vectorised evaluation code, so a binary built for an
+       unsupported instruction set passes and then dies on the first search.
+    2. Searching only `startpos`. Stockfish 18 carries *two* NNUE networks -
+       `EvalFile` and `EvalFileSmall` - and picks the small one for sparse
+       positions and large material imbalances. The two have separate
+       vectorised code paths, so a dense-position search exercises only one of
+       them. CI passed this probe and then took an illegal instruction while
+       analysing a six-piece endgame.
+
+    So the probe searches a dense position *and* a sparse one, which is the
+    minimum needed to touch both evaluation networks.
     """
+    probe = (
+        "uci\n"
+        "isready\n"
+        # Dense position: the big net.
+        "position startpos\n"
+        "go depth 10\n"
+        # Sparse position: forces the small net, a different vectorised path.
+        "position fen 6k1/5ppp/8/8/8/8/8/R6K w - - 0 1\n"
+        "go depth 12\n"
+        "quit\n"
+    )
+
     try:
         proc = subprocess.run(
             [str(binary)],
-            input="uci\nisready\nposition startpos\ngo depth 8\nquit\n",
+            input=probe,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=120,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -128,12 +148,18 @@ def smoke_test(binary: Path) -> bool:
     if "uciok" not in proc.stdout:
         log("  smoke test did not get 'uciok'")
         return False
-    if "bestmove" not in proc.stdout:
-        log("  engine answered the handshake but could not complete a search")
+
+    searches = proc.stdout.count("bestmove")
+    if searches < 2:
+        log(
+            f"  engine completed {searches} of 2 searches - it answers the handshake "
+            "but cannot evaluate every position type on this CPU"
+        )
         return False
 
     first = next((ln for ln in proc.stdout.splitlines() if ln.startswith("id name")), "")
-    log(f"  OK - {first.removeprefix('id name ').strip() or 'engine responded'} (searched)")
+    name = first.removeprefix("id name ").strip() or "engine responded"
+    log(f"  OK - {name} (searched both evaluation networks)")
     return True
 
 

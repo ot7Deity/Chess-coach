@@ -49,55 +49,79 @@ def test_fallback_chain_is_ordered_fastest_first():
 
 
 def test_smoke_test_rejects_an_engine_that_cannot_search(tmp_path, monkeypatch):
-    """Regression test for a real CI failure.
+    """Regression tests for two real CI failures, both the same shape.
 
-    The installer originally probed a candidate build with the UCI handshake
-    alone. The handshake does not exercise the vectorised NNUE evaluation, so an
-    AVX-VNNI binary on a CPU without AVX-VNNI answers `uci` normally and only
-    dies with an illegal instruction on `go`. The installer therefore accepted a
-    build that could not search, and CI failed later with
-    "engine process died unexpectedly (exit code: -4)".
+    An AVX-VNNI binary on a CPU without AVX-VNNI does not fail gracefully: it
+    takes an illegal instruction (SIGILL, exit -4) the moment it reaches the
+    vectorised evaluation code. The installer's job is to detect that and fall
+    back. It got it wrong twice:
 
-    A fake engine that answers the handshake but never prints `bestmove` must be
-    rejected.
+    `handshake_only` - the first probe sent `uci` and accepted `uciok`. The
+    handshake only prints strings, so a build that cannot evaluate anything
+    passes it.
+
+    `dense_only` - the second probe also searched `startpos`. But Stockfish 18
+    has two NNUE networks, `EvalFile` and `EvalFileSmall`, and selects the small
+    one for sparse positions. They have separate vectorised code paths, so a
+    dense-position search leaves one untested. CI passed this probe and then
+    died analysing a six-piece endgame.
+
+    Both fakes must be rejected.
     """
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
     import fetch_stockfish
 
-    fake = tmp_path / "fake_engine.py"
-    fake.write_text(
-        "import sys\n"
-        "for line in sys.stdin:\n"
-        "    line = line.strip()\n"
-        "    if line == 'uci':\n"
-        "        print('id name Stockfish 18'); print('uciok', flush=True)\n"
-        "    elif line == 'isready':\n"
-        "        print('readyok', flush=True)\n"
-        "    elif line == 'quit':\n"
-        "        break\n"
-        "    # never answers 'go' - mimics a SIGILL during search\n",
-        encoding="utf-8",
-    )
+    fakes = {
+        # Answers the handshake, never returns a move.
+        "handshake_only": "0",
+        # Returns a move for the first (dense) search then dies, as a build that
+        # can run the big net but not the small one does.
+        "dense_only": "1",
+    }
 
     # Bind the real implementation first: `fetch_stockfish.subprocess` is the
     # same module object this test imported, so a replacement that called
     # `subprocess.run` would recurse into itself.
     real_run = subprocess.run
 
-    monkeypatch.setattr(
-        fetch_stockfish.subprocess,
-        "run",
-        lambda *a, **kw: real_run(
-            [sys.executable, str(fake)],
-            input=kw.get("input", ""),
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        ),
-    )
+    for name, searches_served in fakes.items():
+        fake = tmp_path / f"fake_{name}.py"
+        fake.write_text(
+            "import sys\n"
+            f"budget = {searches_served}\n"
+            "for line in sys.stdin:\n"
+            "    line = line.strip()\n"
+            "    if line == 'uci':\n"
+            "        print('id name Stockfish 18')\n"
+            "        print('uciok', flush=True)\n"
+            "    elif line == 'isready':\n"
+            "        print('readyok', flush=True)\n"
+            "    elif line.startswith('go'):\n"
+            "        if budget <= 0:\n"
+            "            break\n"
+            "        budget -= 1\n"
+            "        print('bestmove e2e4', flush=True)\n"
+            "    elif line == 'quit':\n"
+            "        break\n",
+            encoding="utf-8",
+        )
 
-    assert fetch_stockfish.smoke_test(Path("ignored")) is False
+        monkeypatch.setattr(
+            fetch_stockfish.subprocess,
+            "run",
+            lambda *a, _fake=fake, **kw: real_run(
+                [sys.executable, str(_fake)],
+                input=kw.get("input", ""),
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            ),
+        )
+
+        assert fetch_stockfish.smoke_test(Path("ignored")) is False, (
+            f"{name} engine should have been rejected"
+        )
 
 
 @pytest.mark.engine
