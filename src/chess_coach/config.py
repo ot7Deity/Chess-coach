@@ -44,6 +44,17 @@ class Settings(BaseSettings):
     engine_hash_mb: int = Field(default=128, ge=1)
     engine_timeout_sec: float = 30.0
 
+    # --- Position cache / metrics -------------------------------------------
+    # Which layers the analysis worker's EvalCache uses: 'full' is Redis in
+    # front of Postgres, 'postgres' skips Redis, 'off' is NullCache (the
+    # "without cache" side of the engine-seconds-saved benchmark).
+    position_cache: str = Field(default="full", pattern="^(full|postgres|off)$")
+    # Bump the version segment to orphan every Redis entry at once (Postgres is
+    # unaffected; Redis refills from it).
+    position_cache_key_prefix: str = "chess_coach:pos:v1:"
+    # Sliding expiry, refreshed on every hit. 0 disables expiry.
+    position_cache_ttl_sec: int = Field(default=7 * 24 * 3600, ge=0)
+
     # --- Workers ------------------------------------------------------------
     worker_poll_interval_sec: float = 1.0
     job_max_attempts: int = Field(default=5, ge=1)
