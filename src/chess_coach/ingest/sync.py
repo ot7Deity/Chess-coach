@@ -36,9 +36,12 @@ from chess_coach.models import Archive, Game, Player
 
 log = get_logger(__name__)
 
-# How long after a month ends before it is treated as final. Games are archived
-# by end time, and a game that ends at 23:59 UTC on the 31st is not necessarily
-# in the archive at 00:00. A day of slack costs one extra 304 at most.
+# How long after a month ends (in UTC) before it is treated as final. Chess.com
+# files a game under its end month in US Pacific time, not UTC - measured on
+# deitythemenace: 71 of 4,550 games ended up to 7h26m into the next UTC month
+# and were filed under the earlier one; 0 were filed outside their Pacific
+# month. So a UTC month keeps changing for up to 8 hours after it ends. A day
+# covers that with margin and costs one extra 304 at most.
 ARCHIVE_GRACE = dt.timedelta(hours=24)
 
 # First key of pg_try_advisory_lock(int, int). Namespaces ingest's locks so they

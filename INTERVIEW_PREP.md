@@ -61,6 +61,47 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M1 ENTRIES BELOW (ingestion). Newest first. -->
 
+## 2026-11-05 - Chess.com's months run on California time, not world time `DONE`
+
+> **In plain English:** Chess.com groups your games into months. I assumed those months
+> follow world standard time (UTC), the clock most computer systems use. My reviewer agent
+> checked every one of my 4,550 games against the month it was filed under, and found 71 that
+> didn't fit: games that finished just after midnight on the 1st were filed under the
+> *previous* month. Every single one of the 4,550 fit perfectly once you use California time
+> instead. My code happened to work anyway - it already waits a full day after a month ends
+> before treating it as finished, and the difference is at most eight hours - but my written
+> explanation of *why* it waits was wrong, and the monthly reports would have quietly
+> disagreed with Chess.com's numbers.
+
+**A bit deeper:** The archive endpoint for a month returns games whose end time falls in
+that month in `America/Los_Angeles`. A UTC month therefore keeps receiving games for 7-8
+hours after it ends. Correctness here came from margin rather than understanding: the 24-hour
+grace was chosen for a different reason ("a game finishing at 23:59 might not be indexed by
+00:00") and happens to cover the real one.
+
+**How it was found:** the reviewer's live acceptance test on `deitythemenace` recorded, for
+every game, which month's archive it came from, and compared that with its `end_time` in UTC
+and in Pacific time: 71 of 4,550 (1.6%) mismatched in UTC, 0 in Pacific. The largest gap
+was 7 h 26 min past UTC midnight.
+
+**What changed:** the `ARCHIVE_GRACE` comment and the M1 entry's explanation now give the
+measured mechanism. The 24-hour value stays.
+
+**Consequence for M4:** a report that groups games by UTC month will not match Chess.com's
+monthly archive counts - about 1.6% of games land in a different month. Reports should state
+which they use; grouping by the player's own time zone is probably what a person expects.
+
+**Talking point:** "My code was right for the wrong reason. I'd guessed why Chess.com's
+monthly archives lag at midnight; the reviewer agent tested it against all 4,550 of my games
+and found the archives are bucketed in Pacific time - 71 games filed under the previous month
+in UTC, zero in Pacific. The safety margin I'd picked happened to cover an eight-hour skew.
+I'd rather know that than be lucky, because the next report I write groups by month."
+
+**Where:** `src/chess_coach/ingest/sync.py` (`ARCHIVE_GRACE`), the reviewer's
+`tests/review/test_live_deitythemenace.py` on `review/adversarial`.
+
+---
+
 ## 2026-11-05 - The comment said "give up", the code said "wait 25 minutes" `DONE`
 
 > **In plain English:** When Chess.com is overloaded it can reply "try again in N seconds".
@@ -278,17 +319,21 @@ CLI), migration `0002`, and tests for each against real Postgres and Redis.
 
 **Why the details are the way they are:**
 
-- *A month is final a day after it ends, not at midnight.* Games are filed by end time, and a
-  game that finishes at 23:59 UTC on the 31st is not guaranteed to be in the archive at
-  00:00. Freezing on the stroke of midnight would lose it forever. The grace day costs at
-  most one extra 304.
+- *A month is final a day after it ends, not at midnight.* Chess.com files games by their
+  end date in **US Pacific time**, so a UTC month keeps gaining games for up to eight hours
+  after it ends (see the "Pacific time" entry above - my first explanation here was wrong).
+  Freezing at UTC midnight would lose them forever. The grace day costs at most one extra
+  304.
 - *One commit per month.* A crash mid-sync leaves the finished months marked done, so a
   resumed sync re-requests only what it had not finished - and nothing is half-written,
   because a month's games and its archive row commit together.
 - *The upsert never touches analysis state.* A re-ingested game keeps its
   `analysis_status`; otherwise every re-sync would send finished games back to the queue. The
-  only field allowed to change is Chess.com's accuracy score, which appears later if someone
-  requests a review. A `WHERE` on the `ON CONFLICT DO UPDATE` means re-downloading an
+  only field allowed to change is Chess.com's accuracy score, which appears if someone
+  requests a review. (Only while the month is still being re-fetched - the current month plus
+  the grace day. A review requested after a month is frozen is not picked up; that is fine,
+  because these numbers are a cross-check, not a report input.) A `WHERE` on the
+  `ON CONFLICT DO UPDATE` means re-downloading an
   unchanged month writes zero rows, and `RETURNING (xmax = 0)` counts which rows were
   genuinely new without a second query.
 - *Wins and losses are decided by where `win` appears.* Chess.com marks the winner `win` and
@@ -1106,7 +1151,7 @@ the repo is public. Same reason the database URL isn't committed."
 > cheapest fixes in the project, because none of that code had been written yet.
 
 **What changed:** Before writing any ingestion code, the Chess.com API was called directly to
-check what it actually returns. Five assumptions in the design doc were wrong.
+check what it actually returns. Seven assumptions in the design doc were wrong.
 
 **Why / what was found:**
 
@@ -1132,7 +1177,7 @@ check what it actually returns. Five assumptions in the design doc were wrong.
    the raw termination kept for the "how do I lose" breakdown.
 
 **Talking point:** "Before I wrote the ingestion layer I spent ten minutes just calling the
-API and reading the response, and found five things my design document had wrong - including
+API and reading the response, and found seven things my design document had wrong - including
 that the field I planned to use for opening classification contains a URL, not an opening
 code. Cheapest bug fixes in the project, because none of them had been written yet."
 
@@ -1171,13 +1216,23 @@ the same interpreter or 'works on my machine' becomes the default failure mode."
 
 ---
 
-## 2026-11-05 - Repo moved out of OneDrive to `C:\dev\chess-coach` `DONE`
+## 2026-11-05 - Repo moved out of OneDrive to `C:\dev\chess-coach` `DECIDED`
 
 > **In plain English:** I moved the project folder off OneDrive. A project like this generates
 > tens of thousands of small working files, and OneDrive tries to back up every one of them as
 > it changes. While it's doing that it holds files open, which makes installs and test runs
 > fail with "permission denied" and "file in use" - errors that look exactly like bugs in your
 > own code and send you hunting in the wrong place. GitHub is already the backup.
+
+**Status update (M1):** this had quietly regressed. The working checkout ended up back under
+`OneDrive\Desktop\chess\Chess-coach`, so this entry said `DONE` for something that was no
+longer true - which the reviewer agent caught, and then tripped over exactly as predicted:
+deleting a temporary worktree failed with "Access denied" on a locked `.pyd` file. With four
+agents' worktrees (each with its own virtualenv) inside the folder, the exposure was far
+larger than when this entry was written. OneDrive is stopped for now and the move to
+`C:\dev\chess-coach` happens once the parallel agents finish their current round. The lesson
+worth telling: a decision log needs re-checking against reality, or it turns into a list of
+things that used to be true.
 
 **What changed:** The repository was moved from `OneDrive\Desktop\Chess coach\` to
 `C:\dev\chess-coach` while it was still empty.
