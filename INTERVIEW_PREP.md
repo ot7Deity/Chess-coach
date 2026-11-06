@@ -7,13 +7,24 @@ This exists because a project is only worth putting on a resume if you can defen
 the "Talking point" lines before an interview; read the "Why" lines when you need to actually
 understand the system.
 
-**Entry format:** two layers. Every entry opens with **In plain English** - a jargon-free
-summary that a non-technical reader (a recruiter, a hiring manager outside engineering) can
-follow on its own. Everything below that is the detail for the engineer on the panel:
-What changed / Why / Alternatives rejected / Talking point / Where.
+**Entry format:** layers that get more technical as you read down, so you can stop at the
+depth the conversation needs.
+
+1. **In plain English** - written for a 10th grader. No jargon, no acronyms, short
+   sentences, an everyday comparison where one helps. This is the recruiter-call and
+   behavioural-interview version, and it must make sense on its own.
+2. **A bit deeper** - for a hiring manager or an engineer outside this specialty. Names the
+   real concepts (cache, queue, lock) and explains each in a sentence, still without code.
+3. **The engineering detail** - for the engineer on the panel: What changed / Why /
+   Alternatives rejected / Talking point / Where.
 
 Read just the plain-English lines to re-load the whole project in two minutes. Read the rest
-when you need to defend a specific decision.
+when you need to defend a specific decision. (Entries written before M1 have layers 1 and 3
+only.)
+
+**Where new entries go:** each milestone has its own block below, marked with HTML comments.
+Add an entry at the top of your milestone's block. Separate blocks mean work on different
+milestones, done in parallel on different branches, merges without conflicts.
 
 **Status tags:** `DONE` = in the code. `DECIDED` = agreed, not built yet.
 
@@ -30,7 +41,223 @@ when you need to defend a specific decision.
 Numbers to fill in as they are measured: games analyzed, cache hit rate, games/minute at
 1/2/4/8 workers, engine seconds saved by the cache.
 
+Measured so far: **4,550 games** ingested for `deitythemenace` across 53 months in 55 seconds
+at one request per second; win/loss/draw per time control matches Chess.com's own totals
+exactly; a re-sync costs **2 requests**.
+
 ---
+
+<!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
+
+<!-- end of M3 entries -->
+
+---
+
+<!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
+
+<!-- end of M2 entries -->
+
+---
+
+<!-- M1 ENTRIES BELOW (ingestion). Newest first. -->
+
+## 2026-11-05 - M1: the whole history loads once, and every re-sync costs two requests `DONE`
+
+> **In plain English:** The first big piece works. You type in a Chess.com username and the
+> program downloads every game that person has ever played - for my account, 4,550 games in
+> under a minute. Run it again and it doesn't download everything twice: it asks Chess.com
+> "has anything changed since last time?" and usually gets back "no", which costs almost
+> nothing. To check it was right, I compared my counts of wins, losses and draws with the
+> numbers Chess.com shows on my profile. They matched exactly, for every type of game.
+
+**A bit deeper:** Chess.com stores a player's games in monthly bundles. A month that has
+ended can never change, so once it has been downloaded it is marked finished and never asked
+for again. Only the current month is re-checked, and that uses a *conditional request*: we
+send back a fingerprint (an *ETag*) of the version we already have, and if nothing changed
+the server answers "304 Not Modified" with an empty body. Each month is saved on its own, so
+if the program crashes halfway through it picks up where it stopped instead of starting over.
+And saving a game is an *upsert* - "insert it, or if it is already there, leave it alone" -
+which is why running it twice can never create duplicates.
+
+**What changed:** `src/chess_coach/chesscom/` (HTTP client and game parser),
+`src/chess_coach/ratelimit.py`, `src/chess_coach/ingest/` (sync and the `chess-coach-sync`
+CLI), migration `0002`, and tests for each against real Postgres and Redis.
+
+**Why the details are the way they are:**
+
+- *A month is final a day after it ends, not at midnight.* Games are filed by end time, and a
+  game that finishes at 23:59 UTC on the 31st is not guaranteed to be in the archive at
+  00:00. Freezing on the stroke of midnight would lose it forever. The grace day costs at
+  most one extra 304.
+- *One commit per month.* A crash mid-sync leaves the finished months marked done, so a
+  resumed sync re-requests only what it had not finished - and nothing is half-written,
+  because a month's games and its archive row commit together.
+- *The upsert never touches analysis state.* A re-ingested game keeps its
+  `analysis_status`; otherwise every re-sync would send finished games back to the queue. The
+  only field allowed to change is Chess.com's accuracy score, which appears later if someone
+  requests a review. A `WHERE` on the `ON CONFLICT DO UPDATE` means re-downloading an
+  unchanged month writes zero rows, and `RETURNING (xmax = 0)` counts which rows were
+  genuinely new without a second query.
+- *Wins and losses are decided by where `win` appears.* Chess.com marks the winner `win` and
+  the loser with the reason (`resigned`, `timeout`, `abandoned`...). Keying on `win` keeps
+  working when Chess.com invents a new way to lose; only draws need a list of names. The
+  loser's reason is stored as `termination`, so "win + timeout" reads as "my opponent
+  flagged".
+- *A per-player advisory lock stops two syncs of one player at once.* Not for correctness -
+  the upsert already guarantees that - but so two workers do not spend the shared rate
+  budget downloading the same months.
+- *The username is validated before it goes into a URL.* `../x` or `a?b` cannot reach a
+  different endpoint than intended.
+
+**Verified against the real API:** the parser was written after reading a real 505-game
+archive, and it found two more things the docs do not say. Chess960 games have Shredder-FEN
+castling rights in the PGN header (`HBhb`) but `KQkq` in the JSON `initial_setup`; only the
+header is right, so the parser uses it. And Chess.com puts an ECO code on chess960 games,
+which means nothing for a shuffled back rank, so openings are only recorded for normal
+starts. The first real sync also turned up a variant I had never seen, `oddschess`, which was
+stored and skipped exactly as designed.
+
+**Alternatives rejected:**
+- *Re-download everything every night*: 53 requests and ~20 MB per player per night, against
+  2 requests and 0 bytes.
+- *Track "last synced month" on the player* (the design doc's `last_synced_month`): one
+  number cannot express "October has gained a late game but August is final", and it cannot
+  resume a crashed sync mid-history. Per-month rows with ETags can.
+- *One transaction for the whole sync*: a crash in month 50 would throw away 49 months of
+  work, and the transaction would hold locks for a minute.
+
+**Talking point:** "The acceptance test wasn't a unit test, it was my own account: 4,550
+games, and the per-time-control win/loss/draw totals matched Chess.com's profile numbers
+exactly. Then I ran it again and it made two requests - the archive list and the current
+month, which came back 304 with zero bytes. Every ended month is frozen and never fetched
+again, a crash resumes from the last finished month, and the upsert can't reset analysis
+state, so running it nightly is free."
+
+**Where:** `src/chess_coach/ingest/sync.py`, `src/chess_coach/chesscom/`, `tests/test_sync.py`,
+`tests/test_chesscom_parse.py`, `tests/test_chesscom_client.py`.
+
+---
+
+## 2026-11-05 - The "no duplicate games" rule would have deleted games instead `DONE`
+
+> **In plain English:** I had a rule in the database that said "each Chess.com game can only
+> be stored once", to stop duplicates. It sounds obviously right, but it is wrong. The
+> program stores each game *from one player's side* - who had white, who won. If two people
+> who both use the app play each other, that one game has to be saved twice: once as a win
+> for one, once as a loss for the other. My rule would have quietly thrown the second copy
+> away, so one of them would be missing a game and nothing would ever say so. I caught it
+> while reading the database design before writing the code that fills it.
+
+**A bit deeper:** The rule is a *unique constraint* - the database refuses to store a second
+row with the same value. Uniqueness is how the program stays safe to re-run: it tries to save
+every game, and the database ignores the ones it already has. But the constraint was on the
+Chess.com game ID alone, while what a row actually represents is "this game, for this
+player". The fix makes the pair unique: game ID *plus* player.
+
+**What changed:** Migration `0002` drops the unique constraint on `games.chesscom_uuid` and
+adds `uq_games_player_uuid` on `(player_id, chesscom_uuid)`. The ingest upsert targets the
+new constraint.
+
+**Why:** Every column that makes a row distinct has to be in its key. `color`, `result`,
+`player_rating` and `opponent_rating` are all relative to the tracked player, so the row is
+keyed on the player as well as the game. With the old constraint, the second player's
+`INSERT ... ON CONFLICT` would hit the first player's row: `DO NOTHING` drops the game
+silently; `DO UPDATE` would be worse, overwriting the first player's perspective with the
+second's.
+
+This is the **fourth** time this project has turned on the same question - *what does this
+value actually depend on?* - after the `positions` cache key, the CI engine cache, and the
+engine image. The other three were cache keys; this one is an idempotency key, which is the
+same idea from the write side.
+
+**Alternatives rejected:**
+- *Store each game once and derive the perspective at read time*: correct, but it turns every
+  report query into a "which side was I" `CASE` expression, and the analysis worker's
+  `is_player_move` would no longer be a column.
+- *Leave it until a second user exists*: it would surface as a missing game in one user's
+  report, the hardest kind of bug to trace back to a constraint.
+
+**Talking point:** "My idempotency key was one column short. I'd made the Chess.com game ID
+unique, but a row is 'a game from one player's perspective', so when two tracked players
+meet, that's two rows - and the second would have silently disappeared. It's the same bug as
+a cache key that's missing an input, seen from the write side instead of the read side. I
+found it reading the schema before writing the ingestion code, and there's a test where two
+tracked players play each other and both see the game."
+
+**Where:** `migrations/versions/0002_games_unique_per_player.py`, `src/chess_coach/models.py`,
+`tests/test_sync.py::test_a_game_between_two_tracked_players_belongs_to_both`.
+
+---
+
+## 2026-11-05 - One speed limit shared by every worker, kept in Redis `DONE`
+
+> **In plain English:** Chess.com asks programs not to ask it for data too fast, and if you
+> do, it starts saying "slow down" or blocks you. My program can run several downloaders at
+> once, so the speed limit has to be shared between them - otherwise four downloaders would
+> each think they were allowed the full speed, and together go four times too fast. Think of
+> one jar of tickets that every downloader has to take a ticket from before it asks
+> Chess.com for anything, with new tickets dropping into the jar at a steady rate. And if
+> Chess.com ever does say "slow down" to one of them, they *all* slow down, because they are
+> all spending from the same jar.
+
+**A bit deeper:** That jar is a standard design called a *token bucket*: tokens refill at a
+fixed rate (one a second here), the bucket holds a few spare so short bursts are allowed, and
+each request spends one. It lives in Redis, a fast shared store every process can reach. The
+"take a token" step runs as a single small script inside Redis, so two downloaders can never
+both grab the last token at the same moment. Retries back off exponentially (wait 1 s, then
+2, then 4...) with some randomness, so a group of workers that all failed together do not all
+retry together.
+
+**What changed:** `RedisTokenBucket` in `src/chess_coach/ratelimit.py` (a Lua script for
+take, another for penalize); `ChessComClient._get` acquires a token before every attempt,
+retries 429 / 5xx / network errors with backoff, and honours `Retry-After`.
+
+**Why the details are the way they are:**
+
+- *Redis's clock, not the worker's.* The script reads `TIME` inside Redis. If callers passed
+  their own timestamps, a worker whose clock ran ahead would refill the bucket early for
+  everyone.
+- *Reservation, not polling.* Taking a token may push the balance negative; the script returns
+  how long the caller must wait. One round trip and one sleep per request, and waiters are
+  served roughly in order instead of hammering Redis in a retry loop.
+- *A 429 penalises the shared bucket.* A 429 means the budget everyone shares is spent, so
+  `penalize()` drives the shared balance into debt and every worker waits - not only the one
+  that got the 429.
+- *The wait comes back as a string.* Redis converts Lua numbers to integers on the way out,
+  so a 0.2 s wait would arrive as 0 - "go now". There is a test for exactly that.
+- *Equal jitter, not full jitter.* Full jitter can pick a near-zero delay, which is the wrong
+  response to being told to slow down. Half the window is fixed, half random.
+- *Every retry spends a token.* A retry is a request as far as Chess.com is concerned.
+- *Other 4xx responses are not retried.* A 400 is our bug; retrying it only burns budget.
+
+**Alternatives rejected:**
+- *A limiter per process*: N workers get N times the budget, which is the failure this exists
+  to prevent.
+- *`INCR` with a one-second key expiry (fixed window)*: allows double the rate across a window
+  boundary, and gives no "how long should I wait".
+- *Postgres as the limiter*: a row lock taken once a second by every worker is contention on
+  the database the queue also depends on.
+
+**Known limitation:** a worker already sleeping on a reservation when a 429 arrives will
+still fire when it wakes. Its request may 429 too, which re-penalises the bucket, so the
+system converges. Cancelling outstanding reservations would need a coordination channel
+that is not worth it at one request per second.
+
+**Talking point:** "The rate limit belongs to the client, not to a process, so the token
+bucket lives in Redis and is one atomic Lua script that uses Redis's own clock - otherwise
+one worker with a fast clock refills the bucket for everybody. And a 429 isn't a private
+message to the worker that got it, it means the shared budget is gone, so it penalises the
+shared bucket and every worker backs off together."
+
+**Where:** `src/chess_coach/ratelimit.py`, `src/chess_coach/chesscom/client.py`,
+`tests/test_ratelimit.py` (real Redis, including two connections sharing one budget),
+`tests/test_chesscom_client.py`.
+
+<!-- end of M1 entries -->
+
+---
+
+<!-- Entries before M1 (setup, CI, schema). -->
 
 ## 2026-11-05 - Compose starts the infrastructure, not the app `DONE`
 

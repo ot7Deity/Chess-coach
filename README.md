@@ -47,8 +47,15 @@ cp .env.example .env            # then edit CHESSCOM_CONTACT
 docker compose up -d            # postgres + redis
 uv sync --extra dev
 uv run alembic upgrade head     # create the schema
+uv run chess-coach-sync <chess.com username>   # load a player's full history
 uv run uvicorn chess_coach.api.main:app --reload
 ```
+
+`chess-coach-sync` is safe to re-run: every month that has ended is fetched once and then
+never again, and the current month is revalidated with its ETag, so an up-to-date player
+costs two requests. For `deitythemenace` the first sync loads 4,550 games in about a minute
+(at the polite default of one request per second); the second makes two requests and
+downloads nothing.
 
 Compose starts the infrastructure only. The API and workers run on the host for now -
 they join the compose file in M2, once there is a worker to run and the engine binary
