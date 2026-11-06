@@ -28,10 +28,11 @@ from chess_coach.cache import PositionCache
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-DEFAULT_JOB_TYPE = "analyze_game"
+# M2's job format, as M2 confirmed it: type 'analyze-game' (hyphen), payload
+# {"game_id": <games.id>}, dedupe key 'analyze-game:<games.id>'. M2 owns it;
+# every one of these is overridable from the command line.
+DEFAULT_JOB_TYPE = "analyze-game"
 DEFAULT_JOB_PAYLOAD = '{{"game_id": {game_id}}}'
-# models.Job documents the key as 'analyze-game:<games.id>'. M2 owns the job
-# format; every one of these is overridable from the command line.
 DEFAULT_DEDUPE_KEY = "analyze-game:{game_id}"
 
 

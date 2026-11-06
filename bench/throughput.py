@@ -1,12 +1,15 @@
 """Worker-scaling benchmark: the same workload at 1, 2, 4 and 8 workers.
 
     uv run python -m bench.throughput --games 200 --workers 1 2 4 8 \\
-        -- chess-coach-worker --worker-id {worker_id} --exit-when-empty
+        -- chess-coach-worker --worker-id {worker_id} --until-empty
 
 Everything after `--` is the worker command, one process per worker, with
 these placeholders filled in per process: {worker_id} (bench-<n>-<i>), {index}
 (0-based), {n} (workers in this round) and {metrics_port} (`--metrics-port`
-plus index, or 0).
+plus index, or 0). It defaults to M2's `chess-coach-worker --worker-id
+{worker_id} --until-empty`. Do not add `--enqueue-pending`: the harness
+enqueues exactly the workload, and a worker enqueueing every pending game
+would grow the workload mid-round.
 
 Each round:
 
@@ -76,7 +79,7 @@ from bench.harness import (
 )
 
 RESULTS_DIR = REPO_ROOT / "bench" / "results"
-DEFAULT_WORKER_CMD = ["chess-coach-worker", "--worker-id", "{worker_id}"]
+DEFAULT_WORKER_CMD = ["chess-coach-worker", "--worker-id", "{worker_id}", "--until-empty"]
 
 __all__ = [
     "RESULTS_DIR",
