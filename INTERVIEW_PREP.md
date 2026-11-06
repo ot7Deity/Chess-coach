@@ -55,6 +55,134 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
 
+## 2026-11-06 - Bug: my timeout fix made the test run hang forever, one run in four `DONE`
+
+> **In plain English:** If the chess engine freezes, my program is supposed to give up on it
+> after a set time, shut it down and start a fresh one. The test for that passed. But
+> roughly one time in four, the whole test run then never finished - it just sat there after
+> printing that every test had passed. The cause was how I shut the frozen engine down. I
+> first told the program "forget about the question you asked", then pulled the plug. Doing
+> it in that order confused the library that talks to the engine, so it never noticed the
+> engine had actually gone, and kept a helper waiting for it - forever. The program refuses
+> to exit while a helper is still waiting. The fix was to just pull the plug, and let the
+> unanswered question fail on its own.
+
+**A bit deeper:** python-chess runs each engine on a background *thread* with its own *event
+loop* (the machinery that waits on the engine's output). Python will not exit while a
+*non-daemon* thread is still running. Cancelling the pending request and then killing the
+process put the library's internal state machine into a state where the "process exited"
+notification itself crashed (`InvalidStateError`), so the background thread waited for an
+exit it would never be told about.
+
+**Symptom:** `pytest tests/test_engine.py` sometimes printed every test passing and then hung.
+Run alone, every test passed. The first full run sat for over three minutes before I killed it.
+
+**How I found it:** pytest showed nothing - the tests had finished. A loop that ran the hang,
+crash and normal scenarios eight times, with `faulthandler.dump_traceback_later`, reproduced
+it on every iteration rather than one in four: each "hang" case took 6.2 s instead of ~1.2 s,
+logged my own `engine.kill_unconfirmed` warning (the 5 s wait for the process's exit code ran
+out), printed `InvalidStateError` from python-chess's `connection_lost`, and the traceback
+dump at the end showed one leaked engine event-loop thread per timeout, plus the main thread
+parked in `threading._shutdown`. The "one in four" in pytest was just how often the leaked
+thread was still alive when the interpreter tried to exit.
+
+**Root cause:** `future.cancel()` before killing the process. Cancelling the analysis coroutine
+left python-chess's command half-torn-down; when the kill then arrived, its termination
+handler tried to set a result on a future that was already cancelled.
+
+**Fix:** don't cancel; kill the process, and let the in-flight command fail with the ordinary
+"engine terminated" error, which python-chess handles cleanly. The same eight-iteration loop
+now runs each hang case in 1.2 s with no warnings and exits. The hang test now also asserts
+that the thread count returns to where it started after the engine is closed.
+
+**Lesson:** "the test passed" and "the test run finished" are different claims - a resource
+leak shows up as the process not ending, not as a red test. And when a library gives you two
+ways to stop something, the more forceful one can be the cleaner one: killing the process
+goes through the library's well-tested crash path, while cancelling went through an
+interleaving it had never been tested for.
+
+**Talking point:** "My hung-engine timeout leaked a thread. The test was green; the test *run*
+hung one time in four. The cause was cancelling the request before killing the engine,
+which left the library unable to process the exit. I found it by looping the scenario with a
+traceback dump on a timer, which showed a leaked event-loop thread per timeout. Killing
+without cancelling fixed it, and the test now checks the thread count goes back down."
+
+**Where:** `src/chess_coach/engine.py` (`StockfishEngine.evaluate`, the comment on the
+timeout branch), `tests/test_engine.py::test_a_hung_search_is_killed_restarted_and_reported`.
+
+---
+
+## 2026-11-06 - The same position, the same depth, three different answers `DONE`
+
+> **In plain English:** The project saves the engine's opinion of each chess position so it
+> never has to work it out twice. That only makes sense if asking twice would give the same
+> answer. It didn't. The engine keeps notes from the positions it looked at before, and those
+> notes nudge its next answer - so the same position came back as +264, +266 or +269
+> depending on what it had been asked just before. The reviewer on the project also found a
+> second leak: the engine's answer depends on how many moves have passed without a capture,
+> which my saved-answer label ignores. The fix is to wipe the engine's notes before every
+> position and to show it only what the label describes. It costs about 7% in speed, and
+> now asking twice gives exactly the same answer, down to the amount of work done.
+
+**A bit deeper:** Stockfish has a *transposition table* (its "hash"): a memory of positions
+it has already searched, kept between searches to speed them up. That memory is an input to
+the result that the cache key (position, engine version, depth) does not name. So is the
+*halfmove clock* - the count towards the fifty-move draw rule - which the position
+identifier deliberately drops. And so is the number of search *threads*, because
+multi-threaded search depends on timing. A cache is only correct if the value it stores is a
+*pure function* of its key; this was the fifth time the project hit "the value depends on
+something the key doesn't name".
+
+**How it was found:** two ways, independently. While writing the engine wrapper I searched one
+position at depth 16 three times, each after a different preceding search, without clearing
+the hash: +264, +266, +269, with node counts of 596k to 1.1M. With the hash cleared first:
++273 and 45,986 nodes, three times out of three. Separately, the reviewer agent showed with
+real Stockfish that 31 of 34 positions in one game differ warm vs cold, by up to 42 cp with
+some best moves changing, and that one king-and-rook endgame scores +529 / +359 / +11 / 0 at
+halfmove clocks 0 / 50 / 90 / 98.
+
+**What changed:** `StockfishEngine.evaluate` sends `chess.Board(normalize_fen(board) + " 0 1")`
+- no move history, halfmove clock zero - with a fresh `game` object so python-chess sends
+`ucinewgame`, which clears the hash. `ENGINE_THREADS` is documented as "keep at 1" and the
+wrapper logs a warning if it is not. The engine version is read from the binary's own UCI name
+("Stockfish 18" -> `sf_18`), so it cannot disagree with the binary that actually ran.
+
+**Measured cost** (sf_18 avxvnni, one 91-position game, Threads=1, Hash=128 MB):
+
+| Depth | Hash kept between positions | Hash cleared per position | Cost |
+| --- | --- | --- | --- |
+| 16 | 25.6 s (3.56 positions/s) | 27.3 s (3.34 positions/s) | +6.6% |
+| 12 | 2.5 s (36.5 positions/s) | 5.3 s (17.1 positions/s) | +114% |
+
+The fixed cost is the clear itself: 29 ms per position at 128 MB, 10.5 ms at 16 MB. At the
+production depth of 16 it is noise; at shallow test depths it dominates.
+
+**Other measurements:** Threads=2 gave different scores on two runs of the same position at
+depth 16 (-186 vs -213, -125 vs -133). Hash size is a much weaker input: 16 MB vs 64/128/256 MB
+changed one score in six, by 2 cp.
+
+**Known cost of the fix:** with the clock zeroed, a position that is genuinely one move from a
+fifty-move draw is graded as if the clock had just reset. That is rare in real games and is
+the price of a value that can be shared between every game that reaches the position.
+
+**Alternatives rejected:**
+- *Put the halfmove clock in the key*: correct, and splits one cache entry into up to a
+  hundred for a property that changes the answer only near the end of a fifty-move run.
+- *Keep the warm hash for speed*: 6.6% faster at depth 16 and the cached numbers stop meaning
+  anything - a cache hit and a miss would return different values for the same key.
+- *Multi-threaded search per worker*: not reproducible; scale with worker processes instead.
+
+**Talking point:** "I asked Stockfish about the same position three times and got three
+answers, because its hash table carries information from earlier searches into later ones.
+For a cache keyed on position, engine and depth, that means storing one sample of a
+distribution. So the engine only ever sees what the key contains - no history, clock zeroed -
+with the hash cleared before every position and one search thread. At depth 16 that costs
+6.6%, and now the same position gives the same score and the same node count every time."
+
+**Where:** `src/chess_coach/engine.py`, `src/chess_coach/config.py` (Engine section),
+`tests/test_engine.py` (same position after different searches; same position reached by two
+move orders with different halfmove clocks).
+
 ## 2026-11-05 - Retries back off, crashes count, and hopeless jobs stop retrying `DONE`
 
 > **In plain English:** Sometimes analysing a game fails. If it failed for a passing reason

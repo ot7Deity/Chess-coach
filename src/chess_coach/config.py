@@ -40,9 +40,15 @@ class Settings(BaseSettings):
     # --- Engine -------------------------------------------------------------
     stockfish_path: Path = Path("vendor/stockfish/stockfish.exe")
     engine_depth: int = Field(default=16, ge=1, le=30)
+    # 1 is not just a default. With more than one search thread Stockfish is
+    # non-deterministic - measured: the same position at depth 16 came back
+    # -186 and -213 on two runs with Threads=2 - and a non-deterministic value
+    # cannot be cached under (position, engine, depth). Scale with workers.
     engine_threads: int = Field(default=1, ge=1)
     engine_hash_mb: int = Field(default=128, ge=1)
-    engine_timeout_sec: float = 30.0
+    # Per position. A search that runs past this is treated as a hung engine:
+    # the process is killed and restarted, and the job is retried.
+    engine_timeout_sec: float = Field(default=30.0, gt=0)
 
     # --- Workers ------------------------------------------------------------
     worker_poll_interval_sec: float = Field(default=1.0, gt=0)
