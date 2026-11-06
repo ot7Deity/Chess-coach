@@ -49,6 +49,60 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-06 - Metrics: one scoreboard per worker, added up by Prometheus `DONE`
+
+> **In plain English:** To say "eight workers are this much faster than one" I need numbers,
+> not impressions. So every worker keeps a scoreboard - games finished, positions the engine
+> worked out, how often the saved answers were used, how much engine time that saved - and
+> shows it on a small web page. A separate tool, Prometheus, visits every worker's page every
+> few seconds and adds them up. It is like each cashier in a shop keeping their own tally, and
+> the manager collecting all the tallies at closing.
+
+**A bit deeper:** Prometheus is a *pull*-based monitoring system: each process exposes
+`/metrics` over HTTP and Prometheus *scrapes* it. *Counters* only go up (games analyzed),
+*gauges* go up and down (is Redis in use right now), and *histograms* sort measurements into
+buckets so you can ask for percentiles (how long a job takes). *Labels* split one metric into
+series, e.g. cache lookups by `result` and `layer`.
+
+**What changed:** `src/chess_coach/metrics.py` defines every metric for M2/M3: games analyzed
+(by outcome), positions evaluated, engine seconds, cache lookups by result/layer, engine
+seconds saved, cache writes, Redis errors, corrupt values, eval conflicts, a Redis-up gauge,
+job claim latency and job duration histograms, jobs retried and dead-lettered. The cache
+records its own; the rest are defined now and wired into M2's worker after it merges.
+`start_metrics_server()` serves `/metrics` on `METRICS_PORT + worker_index`.
+
+**Why the details are the way they are:**
+- *One endpoint per process, not prometheus-client's multiprocess mode.* That mode exists
+  for forking web servers that share one port. These workers are independent processes, so
+  each is its own scrape target and PromQL sums them:
+  `sum(rate(chess_coach_games_analyzed_total[5m]))`.
+- *`METRICS_PORT=0` (off) by default.* With a fixed default port, the second worker on one
+  machine would crash on startup with "address in use".
+- *Every label value starts at zero.* A series only appears after its first event, so "zero
+  jobs dead" would otherwise look the same as "no data". All known label combinations are
+  created at import.
+- *Hit rate as two labels, not one.* `result=hit|miss` and `layer=redis|postgres|none` give
+  the overall hit rate *and* Redis's share of the hits from one metric.
+- *Engine seconds saved is a counter of the hits' `compute_ms`.* It is what those hits would
+  have cost on the machine that originally computed them, which is the honest definition.
+- *`127.0.0.1` by default.* Metrics are not secret, but nothing should listen on every
+  interface of a laptop by default; containers set `METRICS_ADDR=0.0.0.0`.
+
+**Alternatives rejected:**
+- *StatsD / push gateway*: push-based, one more service, and a crashed worker's last numbers
+  linger as if it were alive.
+- *Logging counters and parsing logs*: works for a benchmark, useless for a live dashboard.
+
+**Talking point:** "Every worker is its own Prometheus target, and the interesting numbers are
+sums across them - games per minute, cache hit rate by layer, engine seconds saved. I
+pre-initialise every label so a dashboard shows a real zero instead of a gap, and metrics are
+off by default so eight workers on one box can't fight over a port."
+
+**Where:** `src/chess_coach/metrics.py`, `src/chess_coach/cache/position_cache.py`,
+`tests/test_metrics.py`, `tests/test_position_cache.py` (Prometheus section).
+
+---
+
 ## 2026-11-06 - The contract said two answers would always match. They didn't `DONE`
 
 > **In plain English:** The shared rulebook between the worker and the cache said: "ask the
