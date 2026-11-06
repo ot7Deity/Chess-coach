@@ -17,7 +17,8 @@ across time controls").
 | Usernames | Case-insensitive. The API lowercases and trims before lookup, and always returns the lowercased form. Valid: `^[a-z0-9_-]{1,50}$` after lowercasing (the same rule as `chesscom/client.py`). |
 | `time_class` | One of `bullet`, `blitz`, `rapid`, `daily` (`models.TIME_CLASSES`). |
 | Timestamps | UTC, ISO 8601, with a `Z` suffix: `2026-11-06T02:14:05Z`. |
-| Calendar dates | `YYYY-MM-DD`, the **UTC** day. |
+| Calendar dates | `YYYY-MM-DD`, the **UTC** day, computed as `(played_at AT TIME ZONE 'UTC')::date`. Never the server's local zone. |
+| Months | **No field in this contract is per month**, deliberately. Chess.com files its monthly archives by the game's end date in **US Pacific time**, not UTC (measured by the reviewer: about 1.6% of games land in a different month depending on the zone used). A per-month field would therefore disagree with either Chess.com's archive months or our UTC days. If one is ever added, its name and description must state its zone (`month_utc` or `month_pacific`), and `archives.month` (Pacific, Chess.com's filing) must never be used as a reporting month. |
 | Ratings | Integers, Chess.com rating points. |
 | Rating changes | Signed integers, rating points. Negative = rating lost. |
 | Percentages | Floats on a **0-100** scale (`52.3`, never `0.523`), not rounded. The UI rounds for display. |

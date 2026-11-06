@@ -5,6 +5,7 @@
  * Units, once, so no field needs a comment repeating them:
  *   - timestamps: UTC ISO 8601 with "Z"      (Timestamp)
  *   - dates: the UTC day, "YYYY-MM-DD"       (IsoDate)
+ *   - months: none, on purpose (Chess.com files archives by Pacific date)
  *   - percentages: 0-100 floats, unrounded   (Percent)
  *   - ratings and rating changes: integer rating points
  *   - nothing in this API is in centipawns
@@ -22,7 +23,7 @@ export type SyncStatus = "pending" | "syncing" | "complete" | "error";
 
 /** UTC ISO 8601, e.g. "2026-11-06T02:14:05Z". */
 export type Timestamp = string;
-/** UTC calendar day, "YYYY-MM-DD". */
+/** UTC calendar day, "YYYY-MM-DD". Not a Chess.com archive day: those are filed in US Pacific time. */
 export type IsoDate = string;
 /** 0-100, not rounded. */
 export type Percent = number;

@@ -94,6 +94,11 @@ fixtures), and `web/src/lib/fixtures/` (real ingested numbers plus a clearly mar
   and each rate has one definition, in one place.
 - *Every unit is stated once:* percentages 0-100, timestamps UTC with `Z`, dates are UTC
   days, ratings are integers, and no field is in centipawns at all.
+- *No field is per month, on purpose.* The reviewer measured that Chess.com files its monthly
+  archives by the game's end date in US Pacific time, so about 1.6% of games sit in a
+  different month depending on the zone. A "games per month" field would quietly disagree
+  with either Chess.com or our own UTC days, so the contract has none, and says that any
+  future month field must name its zone.
 - *`null` means "not applicable or not known yet", never zero.* Time pressure is `null` for
   daily games, where clocks run in days; a section with no analyzed games is `null` rather
   than a misleading 0 blunders.
