@@ -49,6 +49,123 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-05 - My decoder was stricter than my encoder `DONE`
+
+> **In plain English:** Saved answers go into the fast store in a compact written form, and a
+> reader checks each one carefully before trusting it. My checker was *too* picky: it insisted
+> the "best move" was 4 to 6 letters long, but the program is allowed to save other values. An
+> answer like that would have been saved fine and then rejected every single time it was
+> read - like a library that accepts a book donation and then refuses to ever lend it out.
+> Nothing would have crashed. That one answer would just never come from the fast store, and
+> the only clue would be a slightly worse speed number.
+
+**A bit deeper:** The *encoder* turns an evaluation into bytes for Redis and the *decoder*
+turns bytes back into an evaluation. The decoder rejects anything suspicious and reports it
+as a cache miss, which is the safe failure. But a decoder must accept *everything the encoder
+can produce from valid data*, or valid data becomes a permanent miss. The rule in one line:
+`decode(encode(x)) == x` for every legal `x`.
+
+**Symptom:** None yet - it was caught before any test or real data hit it.
+
+**How I found it:** Reviewing my own diff before pushing, asking "what valid input does this
+check refuse?" of every validation line. `Evaluation` does not restrict `best_move` at all;
+the `positions` column allows up to 6 characters; my decoder demanded 4 to 6.
+
+**Root cause:** I wrote the check from what a UCI move *usually* looks like ("e2e4", "e7e8q"),
+not from what the system actually permits. The two disagreed at the edges - an empty string,
+or anything shorter than four characters.
+
+**Fix:** The decoder is now exactly as strict as the database column and no stricter: a string
+of at most 6 characters, or null. A round-trip test includes the UCI null move `0000`.
+
+**Lesson:** A validator on the read side of a cache has to match the write side's real
+domain, not my mental picture of the data. Too loose serves garbage; too strict silently
+turns good entries into permanent misses - and a cache that quietly misses looks exactly like
+"caching doesn't help much", which is the failure `positions.py` warns about.
+
+**Where:** `src/chess_coach/cache/codec.py` (`decode`), `tests/test_cache_codec.py`.
+
+---
+
+## 2026-11-05 - I "knew" a Redis hash costs more memory. I measured: it doesn't `DONE`
+
+> **In plain English:** I wrote down a reason for a choice - "this way of storing things in
+> Redis uses several times less memory" - without checking it, because it is the kind of thing
+> everyone says. Before publishing it I measured. The difference was under 10%. My choice was
+> still right, but for a different reason, and an interviewer who knew Redis well would have
+> caught the wrong one immediately.
+
+**A bit deeper:** Redis can store a value as one *string*, or as a *hash* (a small dictionary
+of named fields). Old advice says hashes cost far more memory. Modern Redis stores small hashes
+in a compact packed format (*listpack*), so that advice is out of date for a seven-field hash.
+
+**Symptom:** A claim in a docstring with no number behind it.
+
+**How I found it:** The project's rule is "measured numbers only", so I ran `MEMORY USAGE` on
+one real-shaped entry stored both ways (Redis 7.4, seven-day TTL on both).
+
+**Root cause:** Repeating received wisdom instead of measuring. Result: **184 bytes as a
+string, 200 as a hash.**
+
+**Fix:** The docstring and the codec entry now give the real reason for a string: one `GETEX`
+both reads it and refreshes its expiry, and one `SET` replaces it whole. The 184 bytes is also
+the number that sizes Redis later: about 40 MB if all ~220,000 of my positions were resident at
+once.
+
+**Lesson:** "It's well known that..." is a sentence to measure, not to write.
+
+**Where:** `src/chess_coach/cache/codec.py` (module docstring).
+
+---
+
+## 2026-11-05 - Each cached answer says which question it answers `DONE`
+
+> **In plain English:** The fast store (Redis) keeps copies of the engine's answers, each
+> filed under a label that names the position, the engine version and how deeply it thought.
+> I also write the engine version and depth *inside* each saved answer, and check them when I
+> read it back. It is like writing the question at the top of your answer sheet as well as on
+> the folder: if the sheet ever ends up in the wrong folder, you notice instead of handing in
+> the wrong answer.
+
+**A bit deeper:** Redis stores *key -> value* pairs. The key already includes engine version
+and depth. Repeating them in the value is *defence in depth*: if a bug ever built the wrong
+key, the mismatch would be caught on read and treated as a miss, rather than serving an
+evaluation from a different search as if it were right. The format is a short JSON list with
+a *version number* first, so a future format change cannot be misread as the old one.
+
+**What changed:** `src/chess_coach/cache/codec.py`: `encode` and a strict `decode` that raises
+`CorruptValue` for anything that is not exactly the expected shape.
+
+**The format:** `[1,"sf_18",16,23,null,"e2e4",1234567,412]` - format version, engine version,
+depth, centipawns, mate distance, best move, nodes, engine milliseconds.
+
+**Why:**
+- *The value names its own search.* Serving a depth-12 answer to a depth-16 question is the
+  one failure this project's cache design exists to rule out, and it fails silently. Costs
+  about 12 bytes per entry.
+- *Strict, and a bad value is a miss, never an error.* Redis is a cache; Postgres has the real
+  answer. A corrupt entry must not fail a game's analysis.
+- *Booleans are rejected as integers.* In Python `True` is an `int`, so a value with `true`
+  in it would otherwise decode as a score of 1.
+
+**Alternatives rejected:**
+- *A Redis hash per position* (`HSET` fields): about the same memory (measured: 200 bytes
+  against the string's 184), but reading it and refreshing its expiry is two commands
+  (`HGETALL` + `EXPIRE`) where a string needs one `GETEX`, and a string is replaced whole by
+  one `SET`. See the entry above for how I first got the memory part wrong.
+- *A packed binary struct*: a few bytes smaller, unreadable in `redis-cli` when debugging.
+- *msgpack*: a new dependency for a few bytes.
+- *Pickle*: unpickling data from a shared store executes code; never for a cache.
+
+**Talking point:** "My cache key already has the engine version and depth in it, but the
+cached value repeats them, and the reader refuses a value that answers a different question.
+It costs twelve bytes and turns a whole class of key-building bugs from 'wrong answer served
+silently' into 'cache miss, counted and logged'."
+
+**Where:** `src/chess_coach/cache/codec.py`, `tests/test_cache_codec.py`.
+
+---
+
 ## 2026-11-05 - My test asked the database for the wrong shape of answer `DONE`
 
 > **In plain English:** I wrote a test that saves a chess position and then reads it back to
