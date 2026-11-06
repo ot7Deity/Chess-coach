@@ -49,6 +49,47 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-06 - I quoted a measurement from a script nobody else could run, and overstated it `DONE`
+
+> **In plain English:** Earlier I wrote that when the chess engine "remembers" its last
+> question, its scores shift slightly but its recommended move stays the same. When I turned my
+> quick throwaway test into a proper tool that lives in the project, so anyone can rerun it,
+> the scores still shifted, but **half the recommended moves changed too**. My first claim
+> was based on looking at only five examples. Like saying "everyone in the class passed"
+> after checking half the papers.
+
+**A bit deeper:** The original number came from a one-off script in a scratch folder, which
+printed only the first five positions whose scores differed. All five kept the same best
+move, so I wrote "with the same best move" for all ten - a *generalisation from a truncated
+sample*. The reproducible version, `bench/engine_determinism.py`, compares every position
+and reports scores and best moves separately.
+
+**Symptom:** The repo script disagreed with the number already written in four places.
+
+**How I found it:** Rerunning the measurement from the committed script before quoting it in
+a later entry, as the project's "measured numbers only" rule requires.
+
+**Root cause:** Two things. The claim was wider than the evidence (5 rows seen, 10 claimed).
+And the evidence lived in a scratch file, so nobody - including me - could check it later.
+
+**Fix:** Every place that quoted it now says what the committed script measures at depth 14
+on this machine: two cold runs identical; warm vs cold, **10/10 scores differ (by 1 to 54
+centipawns) and 5/10 best moves differ**. The original PR's text was not rewritten (it was
+already pushed); the correction lands in this later change and says so.
+
+**Lesson:** A number in an interview-prep doc should come with the command that reproduces
+it. And when a result is summarised from a printout, check the printout showed every row.
+
+**Why it matters more than it looks:** "same best move" made the non-determinism sound
+cosmetic. A changed best move means a cached "you should have played X" can depend on which
+worker happened to evaluate the position first - which is exactly why the producer now
+evaluates from a cleared hash.
+
+**Where:** `bench/engine_determinism.py`; the corrected lines in the Postgres-store, Redis-layer
+and contract entries; `src/chess_coach/cache/position_cache.py` (module docstring).
+
+---
+
 ## 2026-11-06 - The benchmark said "no cache" had a 100% cache hit rate `DONE`
 
 > **In plain English:** One way to show the cache is worth having is to run the same work with
@@ -293,9 +334,10 @@ key. The cache keeps *first write wins*; what is new is *detection*.
 something that does not fully determine the value.
 
 **How I found it:** I measured it while writing the Postgres store: ten positions at depth 14
-were identical across two cold runs, but with a warm hash table **all ten scores moved, by 2 to
-27 centipawns**. The reviewer agent then confirmed it independently with real Stockfish and
-found the second cause, the halfmove clock.
+were identical across two cold runs, but with a warm hash table **all ten scores moved, by 1 to
+54 centipawns, and five of the ten best moves changed** (reproducible with
+`uv run python -m bench.engine_determinism`). The reviewer agent then confirmed it
+independently with real Stockfish and found the second cause, the halfmove clock.
 
 **Root cause:** The key leaves out two inputs that the value depends on: the engine's leftover
 state, and the move counters that `normalize_fen` deliberately drops. It's the project's
@@ -321,7 +363,7 @@ fix it where it's made, then make any future breach loud where it lands.
 
 **Talking point:** "My cache relied on a contract saying the same position, engine and depth
 always produce the same score. I measured it: with a warm hash table, ten out of ten scores
-moved by a few centipawns. The fix was on the producer - evaluate from a cleared hash with the
+moved and half the best moves changed. The fix was on the producer - evaluate from a cleared hash with the
 move counters reset, so the value really is a function of the key. On the cache side I kept
 first-write-wins and added a tripwire: a losing write that disagrees with the stored answer is
 logged and counted. Silent disagreement was the problem, so I made it loud instead of trying
@@ -497,7 +539,7 @@ Redis reads, sends what Redis lacked to Postgres in one query, and pipelines the
 
 **Why the details are the way they are:**
 - *Postgres first, and only the winner writes Redis.* Two workers can compute different scores
-  for one position (measured: warm-hash Stockfish moved 10/10 scores by a few centipawns). If
+  for one position (measured: a warm hash table moved 10/10 scores and 5/10 best moves). If
   both wrote Redis, Redis could end up with the loser's value while Postgres kept the winner's.
   Writing Redis first has the same flaw. With this order, every value Redis has ever held is
   one Postgres committed, so the two can disagree only by Redis *missing* an entry - and a
@@ -717,9 +759,10 @@ contract from `positions.py`: `get`, `put`, and a batch `get_many`.
 - *First write wins, rather than last.* Stockfish at a fixed depth is reproducible only from
   the same starting state. I measured it: 10 positions at depth 14 gave identical results on
   two runs with the hash table cleared before each search, but when the engine had searched
-  other positions first (as a worker always has), **all 10 scores differed** - by 2 to 27
-  centipawns, with the same best move. So two workers can disagree about one position. Either
-  answer is fine; two answers for one key are not.
+  other positions first (as a worker always has), **all 10 scores differed**, by 1 to 54
+  centipawns, and **5 of the 10 best moves changed** (`bench/engine_determinism.py`; this line
+  first said "2 to 27, same best move" - see the correction entry). So two workers can disagree
+  about one position. Either answer is fine; two answers for one key are not.
 - *Its own transaction, not the job's.* An evaluation is a pure function of (position,
   engine, depth). If the game's job fails on ply 70, the 69 evaluations before it are still
   correct, and other workers should be able to use them now, not when the job finishes.
@@ -743,7 +786,7 @@ contract from `positions.py`: `get`, `put`, and a batch `get_many`.
 
 **Talking point:** "Two workers can evaluate the same position at the same time, and I
 measured that Stockfish at a fixed depth gives a slightly different score once its hash table
-is warm - ten out of ten positions moved by a few centipawns. So the cache needs exactly one
+is warm - ten out of ten scores moved, and half the best moves. So the cache needs exactly one
 winner. I let the primary key decide: `INSERT ... ON CONFLICT DO NOTHING RETURNING` tells each
 writer whether it won, in one statement. That one bit matters later, because only the winner
 is allowed to copy its value into Redis."
