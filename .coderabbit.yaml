@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# Work lands as small stacked PRs: only the bottom PR of a stack targets main,
+# and each one above it targets the branch below it. CodeRabbit auto-reviews
+# only PRs into the default branch unless told otherwise, so without this every
+# PR above the bottom of a stack would be skipped without a review.
+reviews:
+  auto_review:
+    enabled: true
+    base_branches:
+      - ".*"
