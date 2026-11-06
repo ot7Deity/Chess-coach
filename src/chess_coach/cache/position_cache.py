@@ -55,6 +55,7 @@ import redis
 from sqlalchemy import Engine, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from chess_coach import metrics
 from chess_coach.cache.codec import CorruptValue, decode, encode
 from chess_coach.logging import get_logger
 from chess_coach.models import Position
@@ -114,7 +115,11 @@ def _check_fen_matches_key(key: bytes, fen: str) -> None:
 
 @dataclass
 class CacheStats:
-    """Per-process counters, for tests, logs and the benchmark."""
+    """Per-process counters, for tests, logs and the benchmark.
+
+    The same events also go to Prometheus (`chess_coach.metrics`); these exist
+    so one cache instance can be inspected without scraping anything.
+    """
 
     redis_hits: int = 0
     postgres_hits: int = 0
@@ -176,6 +181,7 @@ class PositionCache:
         self._redis_healthy = redis_client is not None
         self._lock = threading.Lock()
         self._stats = CacheStats()
+        metrics.CACHE_REDIS_UP.set(1 if self._redis_healthy else 0)
 
     # --- EvalCache ------------------------------------------------------------
 
@@ -219,6 +225,7 @@ class PositionCache:
                     )
                 ).one_or_none()
 
+        metrics.CACHE_WRITES.labels(outcome="inserted" if inserted else "existing").inc()
         with self._lock:
             if inserted:
                 self._stats.writes_inserted += 1
@@ -245,6 +252,7 @@ class PositionCache:
         ours = (offered.eval_cp, offered.mate_in, offered.best_move)
         if theirs == ours:
             return
+        metrics.CACHE_EVAL_CONFLICTS.inc()
         with self._lock:
             self._stats.eval_conflicts += 1
         log.warning(
@@ -398,6 +406,7 @@ class PositionCache:
             except CorruptValue as exc:
                 bad.append(f"{name}: {exc}")
         if bad:
+            metrics.CACHE_CORRUPT_VALUES.inc(len(bad))
             with self._lock:
                 self._stats.corrupt_values += len(bad)
             log.warning("cache.corrupt_values", count=len(bad), first=bad[0])
@@ -426,6 +435,7 @@ class PositionCache:
         # rather than tripping the breaker; Postgres already has the value.
         errors = [r for r in results if isinstance(r, Exception)]
         if errors:
+            metrics.CACHE_REDIS_ERRORS.labels(op="set").inc(len(errors))
             with self._lock:
                 self._stats.redis_errors += len(errors)
             log.warning("cache.redis_write_rejected", count=len(errors), error=str(errors[0]))
@@ -436,11 +446,13 @@ class PositionCache:
         return self._redis is not None and self._clock() >= self._redis_down_until
 
     def _redis_failed(self, op: str, exc: BaseException) -> None:
+        metrics.CACHE_REDIS_ERRORS.labels(op=op).inc()
         with self._lock:
             self._stats.redis_errors += 1
         self._redis_down_until = self._clock() + self._retry_sec
         if self._redis_healthy:
             self._redis_healthy = False
+            metrics.CACHE_REDIS_UP.set(0)
             log.warning(
                 "cache.redis_unavailable",
                 op=op,
@@ -451,6 +463,7 @@ class PositionCache:
     def _redis_succeeded(self) -> None:
         if not self._redis_healthy:
             self._redis_healthy = True
+            metrics.CACHE_REDIS_UP.set(1)
             log.info("cache.redis_recovered")
 
     # --- accounting ---------------------------------------------------------------
@@ -460,11 +473,14 @@ class PositionCache:
     ) -> None:
         saved = 0
         unknown = 0
-        for evaluation in from_redis + from_postgres:
-            if evaluation.compute_ms is None:
-                unknown += 1
-            else:
-                saved += evaluation.compute_ms
+        for layer, hits in (("redis", from_redis), ("postgres", from_postgres)):
+            for evaluation in hits:
+                metrics.record_cache_hit(layer, evaluation.compute_ms)
+                if evaluation.compute_ms is None:
+                    unknown += 1
+                else:
+                    saved += evaluation.compute_ms
+        metrics.record_cache_miss(misses)
         with self._lock:
             self._stats.redis_hits += len(from_redis)
             self._stats.postgres_hits += len(from_postgres)
