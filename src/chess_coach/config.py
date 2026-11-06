@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     position_cache_redis_timeout_sec: float = Field(default=0.25, gt=0)
     # After a Redis failure, go Postgres-only for this long before retrying.
     position_cache_redis_retry_sec: float = Field(default=30.0, ge=0)
+    # Prometheus endpoint. 0 disables it. Several workers on one host each take
+    # metrics_port + their worker index.
+    metrics_port: int = Field(default=0, ge=0, le=65535)
+    metrics_addr: str = "127.0.0.1"
 
     # --- Workers ------------------------------------------------------------
     worker_poll_interval_sec: float = 1.0
