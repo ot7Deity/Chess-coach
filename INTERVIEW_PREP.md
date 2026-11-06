@@ -49,6 +49,62 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-06 - The scaling benchmark measures from the database, not from the workers `DONE`
+
+> **In plain English:** To find out how much faster eight workers are than one, I built a
+> test rig. It gives the same pile of games to 1, then 2, 4 and 8 workers, with the saved
+> answers wiped before each round so every round starts equal, and times how long each round
+> takes. The timing comes from the database's own record of when each game was finished, not
+> from the workers' claims - like timing a race with the finish-line camera instead of asking
+> the runners. The real numbers wait for the real worker.
+
+**A bit deeper:** The harness is a *closed workload* benchmark: a fixed set of games, the same
+every round. Each round resets those games, empties the position cache (in Postgres and
+Redis), enqueues one job per game, launches N worker processes and waits until the games all
+have `analyzed_at`. Throughput, plies per second, cache hit rate and engine seconds saved are
+all computed with SQL afterwards. It refuses to run against a database whose name lacks
+"bench" or "test", because it deliberately wipes state.
+
+**What changed:** `bench/harness.py` (reset, enqueue, launch, measure - the previous change)
+and `bench/throughput.py`, the driver: rounds, JSON in `bench/results/` (gitignored, with
+per-worker logs), the markdown table and the CLI, run as `uv run python -m bench.throughput
+--games 200 --workers 1 2 4 8 -- <worker command>`. A stand-in worker for end-to-end tests is
+the next change.
+
+**Why the details are the way they are:**
+- *Measured from the database.* A worker's own counters can be wrong or lost with the
+  process. `analyzed_at` and the `positions` rows are the ground truth.
+- *Cold cache every round.* Otherwise round 2 is served from round 1's cache and "2 workers"
+  looks impossibly fast. The hit rate that remains is real reuse *within* the workload -
+  shared openings - which is what a new user's first sync looks like.
+- *The worker command is an argument with placeholders* (`{worker_id}`, `{index}`, `{n}`,
+  `{metrics_port}`), passed after `--` so Windows paths need no quoting. It defaults to
+  `chess-coach-worker`; M2's exact flags plug in without changing the harness.
+- *Job format is configurable* (`--job-type`, `--job-payload`, `--dedupe-key`) because M2
+  owns it; the defaults are `analyze_game`, `{"game_id": N}` and `analyze-game:N` (the key
+  format `models.Job` documents), and the harness assumes nothing beyond them.
+- *A known bias, written down:* if two workers evaluate one position simultaneously only the
+  winner's row exists, so the loser's engine time is invisible to SQL and the hit rate reads
+  slightly high at large N. The workers' Prometheus counters count both and will be the
+  cross-check once wired.
+
+**Alternatives rejected:**
+- *Trust worker logs for throughput*: lost with a crash, and easy to double-count.
+- *Warm cache between rounds*: measures the cache, not the workers.
+- *Wait for M2 before writing the harness*: the harness's arithmetic would then be debugged on
+  the first real run, which is the run whose numbers go in the README.
+
+**Talking point:** "The benchmark is a fixed workload run at 1, 2, 4 and 8 workers with the
+cache wiped between rounds, and every number comes from SQL over the database afterwards -
+completion timestamps, rows written - not from what the workers say about themselves. I built
+it before the real worker existed, so when real numbers arrive the only unknown is the
+system."
+
+**Where:** `bench/harness.py`, `bench/throughput.py`, `tests/test_bench_harness.py`,
+`tests/test_bench.py`.
+
+---
+
 ## 2026-11-06 - A default that only exists in Python is not a default `DONE`
 
 > **In plain English:** The benchmark puts jobs into the queue table directly. I assumed the
