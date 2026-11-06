@@ -12,7 +12,7 @@
 import { ApiError, isAbort } from "./api-errors";
 import type { ErrorBody, PlayerProgress, Report, TimeClass } from "./api-types";
 
-export { ApiError, isAbort } from "./api-errors";
+export { ApiError, describeError, isAbort } from "./api-errors";
 
 const BASE_URL = (process.env.NEXT_PUBLIC_API_URL ?? "").trim().replace(/\/+$/, "");
 

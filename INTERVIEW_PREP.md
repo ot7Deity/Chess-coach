@@ -49,6 +49,130 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
 
+## 2026-11-06 - Bug: the page said 1,210 games analyzed, and the tile under it said 1,211 `DONE`
+
+> **In plain English:** On the bullet page, a note at the top said "1,210 games analyzed" and
+> the number right underneath said 1,211. Both were true - the computer analyzing games
+> finished one more in the half-second between the two questions the page asked. But two
+> numbers that disagree on one screen make people trust neither. Now the note quotes the
+> same answer as the numbers below it.
+
+**A bit deeper:** The overview makes two requests: progress (how many games are analyzed)
+and the report (the numbers themselves). While the backlog drains, those two are snapshots
+taken at slightly different moments. This is not a bug in either endpoint - it is a *read
+skew* between two reads that are not in one transaction - so the fix is in what the page
+chooses to show.
+
+**Symptom:** banner "1,210 of 3,690", tile "1,211 games analyzed", on the same screen.
+
+**How found:** reading a screenshot of the bullet view, where the mock simulates the queue
+draining at 1.5 games a second.
+
+**Root cause:** the banner used the progress response and the tile used the report
+response; the report was fetched about half a second later.
+
+**Fix:** once the report for the selected time control has loaded, the banner quotes
+`report.analyzed_games`, so everything below the switcher describes one snapshot. The
+progress page still polls the live number, where moving is the point.
+
+**Lesson:** when one screen combines two reads of changing data, decide which one is the
+source of truth for any number shown twice. Mocking the drain - not just a static
+"partially analyzed" fixture - is what surfaced it before a user did.
+
+**Where:** `web/src/app/players/[username]/Overview.tsx` (`tcAnalyzed`).
+
+---
+
+## 2026-11-06 - Bug: two screenshots lied, and one of them hid a real flaw `DONE`
+
+> **In plain English:** I check the website by having a program take pictures of it. Two
+> pictures looked broken: one had a blank space where the rating chart should be, and the
+> phone-sized one looked cut off on the right. The phone one turned out to be the camera's
+> fault - that browser refuses to make a window narrower than a real phone. The blank chart
+> was mostly the camera's fault too, but it pointed at something real: my chart waited one
+> beat too long before drawing itself. I fixed the camera *and* the chart.
+
+**A bit deeper:** The screenshots came from *headless* Chrome (a browser with no window,
+driven from the command line). The chart sizes itself to its container with a
+`ResizeObserver`, a browser feature that reports an element's size - but only on the next
+frame. Headless Chrome's `--virtual-time-budget` fast-forwards a fake clock and does not
+always paint frames, so the report never came.
+
+**Symptom:** bullet and daily charts blank (rapid fine); every 390 px screenshot cut off.
+
+**How found:** looking at every screenshot rather than trusting a green build. To tell "my
+bug" from "my tool's bug", I loaded a one-line page that prints `innerWidth`: asked for
+390, it said **500** - Chrome on Windows has a minimum window width, and the screenshot
+was being cropped from a 500 px layout.
+
+**Root cause:** (1) tooling: a window cannot be made narrower than 500 px, so phone width
+was never actually tested. (2) a real, minor flaw: the chart rendered nothing until the
+observer's first callback, so even in a real browser it painted one empty frame.
+
+**Fix:** screenshots now go through the DevTools protocol with device emulation
+(`Emulation.setDeviceMetricsOverride`, `setEmulatedMedia` for dark mode), and the script
+prints `scrollWidth` vs `innerWidth`, so horizontal overflow fails loudly instead of being
+eyeballed. The chart measures itself synchronously in `useLayoutEffect` before the first
+paint and lets the observer handle later resizes.
+
+**Lesson:** verify the instrument before trusting the measurement - the same lesson as the
+CI cache entry above, in a different tool. And a tooling artefact is still worth a second
+look: this one was exaggerating a real one-frame flash.
+
+**Where:** `web/src/components/charts/LineChart.tsx` (`useWidth`).
+
+---
+
+## 2026-11-06 - The overview shows partial results instead of a spinner `DONE`
+
+> **In plain English:** Grading thousands of games takes hours. Rather than making you wait
+> for all of it, the page shows everything it already knows - your record, your rating
+> graph, your openings, which only need the downloaded games - and fills in the engine's
+> numbers as it goes, with a calm note saying how far along it is. It is like a photo
+> developing in front of you rather than a blank sheet until it is done.
+
+**A bit deeper:** The report has two kinds of section. Results, rating trend and openings
+come from the games table and are complete the moment the download finishes. Blunders and
+time pressure need the engine, and cover only analyzed games - so every one of them says
+how many games it is based on, and shows "waiting for the engine" rather than a misleading
+zero when there are none.
+
+**What changed:** `web/src/app/players/[username]/` - the overview page: a time-control
+switcher driving everything below it (kept in the URL as `?tc=`, so a view can be shared
+and survives a reload), four headline numbers, and one section per question, each with an
+insight sentence, a chart, a footnote with its sample size, and a table twin.
+
+**Why the details are the way they are:**
+
+- *Default time control = the one with the most games.* For this account that is bullet
+  (3,690 games); a fixed default would open daily, which has two.
+- *Empty classes are disabled, not hidden,* so the four segments never move.
+- *Switching dims the old report instead of showing a skeleton,* and a request for an old
+  selection is cancelled (`AbortController`) so a slow answer can never overwrite a newer
+  one.
+- *Every state is designed:* not tracked yet (offer to add them), still downloading, sync
+  failed (Chess.com's reason, verbatim), no games, server down (retry), invalid username,
+  daily games (time pressure "not measured", not "0").
+- *Errors from our own server are not shown raw.* A 500 says "the server had a problem,
+  try again"; a 404's detail is ours and is shown.
+
+**Alternatives rejected:**
+- *Hide the report until analysis finishes*: hours of nothing for a new user, against the
+  design's whole point that the API serves partial results while the backlog drains.
+- *Server-rendering the report*: the API URL is public and the switcher needs a client
+  fetch anyway; server rendering would add a second data path to keep in step.
+
+**Talking point:** "The report is honest about what it knows. Results and openings are
+complete as soon as the download is; the engine-based sections show their sample size,
+grow while you watch, and say 'waiting for the engine' instead of showing a zero. The
+backend made that possible by never mixing the two - the frontend's job was not to hide
+it."
+
+**Where:** `web/src/app/players/[username]/Overview.tsx`, `ReportView.tsx`,
+`web/src/lib/use-async.ts`.
+
+---
+
 ## 2026-11-06 - Four charts, drawn by hand, each answering one question `DONE`
 
 > **In plain English:** The dashboard has exactly four pictures, and each one answers one

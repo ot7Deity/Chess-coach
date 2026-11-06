@@ -30,7 +30,7 @@ export function BarList({ rows, max, label }: { rows: BarRow[]; max?: number; la
             <span
               className={styles.bar}
               data-tone={r.tone ?? "accent"}
-              style={{ width: `${top > 0 ? (r.value / top) * 80 : 0}%` }}
+              style={{ width: `${top > 0 ? (r.value / top) * 70 : 0}%` }}
             />
             <span className={styles.barValue}>{r.display}</span>
           </div>
