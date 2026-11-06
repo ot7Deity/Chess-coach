@@ -49,6 +49,68 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
 
+## 2026-11-06 - Bug: a percent sign in the address crashed the player page `DONE`
+
+> **In plain English:** Web addresses use the % sign as a code for special characters. If
+> someone typed a stray % into the player's address, the page tried to decode it, choked,
+> and showed an error page instead of the friendly "that isn't a Chess.com username"
+> message. Now a broken code is simply treated as a bad username.
+
+**A bit deeper:** `decodeURIComponent` *throws* on a `%` that is not followed by two hex
+digits. The page decoded the username from the URL before validating it, so the exception
+escaped before the validation that would have handled the input politely.
+
+**Symptom:** `/players/a%25` returned a page containing `URIError: URI malformed`.
+
+**How found:** deliberately feeding the routes hostile URLs during the polish pass. `%E0%A4%A`
+was already rejected by Next.js with a 400; `%25` (an encoded percent sign) got through,
+because the framework decodes it once to `a%`, and my second decode then failed.
+
+**Root cause:** decoding a value that was already decoded, with a function that throws.
+
+**Fix:** `decodeParam()` falls back to the raw text when decoding fails; the result then
+goes through the same username check as everything else and gets the friendly message.
+
+**Lesson:** validation only protects you if nothing upstream of it can throw. Parse
+defensively, then validate, then use.
+
+**Where:** `web/src/lib/api.ts` (`decodeParam`), `web/src/app/players/[username]/page.tsx`.
+
+---
+
+## 2026-11-06 - Polish: every page checked at 320 px, in both colour schemes `DONE`
+
+> **In plain English:** The last pass was about the edges: the smallest phones, dark
+> mode, keyboard users and broken links. Every page was photographed at the width of the
+> smallest common phone, in light and dark, by a script that also measures whether
+> anything sticks out sideways - so "it fits on a phone" is checked, not hoped.
+
+**A bit deeper:** Dark mode is not an automatic colour flip: each colour has its own dark
+value, chosen and contrast-checked against the dark background. The screenshot script uses
+the browser's device emulation and reports `scrollWidth` against the viewport width, so
+horizontal scrolling shows up as a number.
+
+**What changed:** a site-wide 404 page and render-error boundary (`not-found.tsx`,
+`error.tsx`); a visible focus ring on the chart so keyboard users know the arrow keys will
+move the crosshair; player pages keyed by username, so state from one player can never be
+shown under another's name; the dev-tools badge turned off so it stops covering
+screenshots; safe decoding of usernames from the URL (previous entry).
+
+**Why:** the states are where a dashboard looks unfinished: an unknown URL, a thrown render
+error and a keyboard focus that disappears are each one visit away.
+
+**Alternatives rejected:** a manual theme toggle (the brief is `prefers-color-scheme`, and
+a toggle needs storage and a flash-of-wrong-theme fix for one setting the OS already has).
+
+**Talking point:** "Phone width and dark mode are tested by a script, not by eye: it
+emulates a 320-pixel phone in both schemes and prints the page's scroll width, so
+horizontal overflow is a failing number rather than something I might notice."
+
+**Where:** `web/src/app/not-found.tsx`, `web/src/app/error.tsx`,
+`web/src/components/charts/charts.module.css`, `web/next.config.ts`.
+
+---
+
 ## 2026-11-06 - The front page is one box and one button `DONE`
 
 > **In plain English:** The first page asks for one thing - your Chess.com username - and
