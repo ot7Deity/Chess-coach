@@ -61,6 +61,37 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M1 ENTRIES BELOW (ingestion). Newest first. -->
 
+## 2026-11-05 - The comment said "give up", the code said "wait 25 minutes" `DONE`
+
+> **In plain English:** When Chess.com is overloaded it can reply "try again in N seconds".
+> I wrote a rule: if it asks us to wait more than five minutes, something is badly wrong,
+> so stop and report a failure. The note above the code said exactly that. The code did
+> something else: it shortened the wait to five minutes and tried again - five times. So a
+> server asking for an hour would have kept the program asleep for 25 minutes, holding up
+> every other download, before finally giving up. My reviewer agent caught it by reading
+> the note and the code side by side.
+
+**A bit deeper:** `Retry-After` is an HTTP header a server sends with "too many requests"
+or "temporarily unavailable" responses. The intent was a *ceiling*: honour short waits,
+refuse long ones. The code implemented a *clamp*, which turns "refuse" into "wait the
+maximum, repeatedly". The bug was invisible to the existing tests because they only used
+short waits.
+
+**What changed:** A server-requested wait above 300 s now raises `ChessComUnavailable`
+immediately. The shared rate-limit bucket is still penalised, by 300 s rather than the full
+value, so the other workers back off without stalling for an hour. The ceiling applies only to
+waits the server asks for, not to our own configured backoff (there is a test for that too).
+
+**Talking point:** "A small one, but a good example of why the reviewer reads comments
+against code: my comment said 'above five minutes, give up', and the code clamped to five
+minutes and retried five times. One `min()` was the difference between failing in a
+millisecond and stalling every worker for 25 minutes."
+
+**Where:** `src/chess_coach/chesscom/client.py` (`_get`, `_retry_after`),
+`tests/test_chesscom_client.py::test_an_absurd_retry_after_fails_fast_instead_of_sleeping`.
+
+---
+
 ## 2026-11-05 - Four ways the sync could get stuck forever or lose a game quietly `DONE`
 
 > **In plain English:** After the download feature worked on my real account, my reviewer

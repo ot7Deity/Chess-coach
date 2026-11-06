@@ -30,8 +30,10 @@ _USERNAME = re.compile(r"^[a-z0-9_-]{1,50}$")
 _ARCHIVE_URL = re.compile(r"/games/(\d{4})/(\d{2})/?$")
 _MONTH = re.compile(r"^\d{4}-\d{2}$")
 
-# A server-supplied Retry-After is honoured, up to this. Beyond it, something is
-# wrong enough that failing the sync is more useful than sleeping for an hour.
+# A server-supplied Retry-After is honoured up to this. Beyond it, something is
+# wrong enough that failing the sync now is more useful than sleeping for an
+# hour: the request fails immediately, and the shared bucket is penalised by
+# this much (not by the full value) so other workers back off without stalling.
 _MAX_RETRY_AFTER_SEC = 300.0
 
 
@@ -184,7 +186,7 @@ class ChessComClient:
             seconds = float(value)
         except ValueError:
             return None  # HTTP-date form; fall back to our own backoff
-        return min(max(seconds, 0.0), _MAX_RETRY_AFTER_SEC)
+        return max(seconds, 0.0)
 
     def _get(
         self,
@@ -210,17 +212,21 @@ class ChessComClient:
                     return resp
                 if status == 404:
                     raise not_found(f"404 for {path}")
-                if status == 429:
-                    delay = self._retry_after(resp) or self._backoff(attempt)
-                    self._limiter.penalize(delay)
-                    last_problem = "429 Too Many Requests"
-                elif status >= 500:
-                    delay = self._retry_after(resp) or self._backoff(attempt)
-                    last_problem = f"{status} from server"
-                else:
+                if status != 429 and status < 500:
                     # Any other 4xx is our bug, not a transient condition, and
                     # retrying it would just spend rate budget.
                     raise ChessComError(f"{status} for {path}: {resp.text[:200]}")
+                asked = self._retry_after(resp)
+                delay = asked or self._backoff(attempt)
+                if status == 429:
+                    self._limiter.penalize(min(delay, _MAX_RETRY_AFTER_SEC))
+                    last_problem = "429 Too Many Requests"
+                else:
+                    last_problem = f"{status} from server"
+                if asked is not None and asked > _MAX_RETRY_AFTER_SEC:
+                    raise ChessComUnavailable(
+                        f"{path}: server asked us to wait {asked:.0f}s ({last_problem})"
+                    )
 
             if attempt == self._max_retries:
                 break
