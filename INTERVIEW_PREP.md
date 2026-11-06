@@ -49,6 +49,105 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-05 - One failed Redis call cost ten seconds, and two "identical" clients disagreed `DONE`
+
+> **In plain English:** I wanted to know exactly what happens when the fast store (Redis) is
+> switched off, so I timed it instead of guessing. One question to a missing Redis took almost
+> **ten seconds** to give up - even though I had told it to wait only a quarter of a second.
+> The library was quietly trying ten more times before admitting failure, like a phone that
+> automatically redials a dead number ten times before telling you nobody is there. Stranger
+> still, the library's two ways of creating a connection behave differently: one redials ten
+> times, the other never redials. My code used the safe one by luck. Now it says so on
+> purpose.
+
+**A bit deeper:** A *timeout* is how long to wait for a reply; a *retry policy* is how many
+times to try again, with what pauses (*backoff*) in between. In redis-py 8.1,
+`redis.Redis(host=...)` comes with 10 retries and exponential backoff by default, while
+`redis.Redis.from_url(...)` comes with none. Separately, on Windows, connecting to a local port
+that nothing is listening on does not fail instantly the way it does on Linux - it waits for
+the full timeout - and `localhost` is tried twice (once as the IPv6 address, once as IPv4).
+
+**Symptom:** A measurement script against a closed port ran for minutes instead of seconds.
+
+**How I found it:** I measured one `GET` against a closed port in every combination (median of
+5, Windows 10, redis-py 8.1.0):
+
+| Client | 0.25 s timeout | 2 s timeout |
+| --- | ---: | ---: |
+| `Redis(host="localhost")`, library default | 9,639 ms | 48,455 ms |
+| `Redis(host="127.0.0.1")`, library default | 6,687 ms | 26,384 ms |
+| `localhost`, retries off | 527 ms | 4,020 ms |
+| `127.0.0.1`, retries off | 261 ms | 2,008 ms |
+
+Then I printed each client's retry object: 10 retries for the constructor, 0 for `from_url`.
+
+**Root cause:** Three things stacking up: a library default of ten retries that only one
+constructor applies; Windows timing out instead of refusing; and `localhost` resolving to two
+addresses. The timeout I set was a per-attempt number, not a total.
+
+**Fix:** `cache_redis_client()` pins the policy explicitly - `Retry(NoBackoff(), 0)`, 0.25 s
+timeout - instead of inheriting whichever default the constructor happens to have. A real
+"unreachable Redis" test builds its client through the same function.
+
+**Lesson:** The timeout you configure is per attempt; the time a failure actually costs is
+attempts x timeout x addresses, plus backoff. Measure the failure path. And never rely on a
+library default for something that matters - here two constructors in one library disagreed.
+
+**Where:** `src/chess_coach/cache/__init__.py::cache_redis_client`,
+`tests/test_position_cache.py::test_an_unreachable_redis_server_is_survivable`.
+
+---
+
+## 2026-11-05 - When Redis is down, analysis carries on from Postgres `DONE`
+
+> **In plain English:** Redis is only a shortcut, so if it breaks, the program should simply
+> stop using the shortcut and keep working. But "try the shortcut, notice it's broken, take the
+> long way" costs time on every single question. So after the first failure the program stops
+> trying Redis at all for 30 seconds, then checks once whether it is back. It is like a road
+> closure: once you hit it, you take the detour for a while rather than driving up to the
+> barrier every time.
+
+**A bit deeper:** This is a *circuit breaker*. A Redis connection error or timeout *opens* it:
+for 30 seconds the cache goes straight to Postgres. After that the next call tries Redis once;
+success *closes* the breaker again. Writes made in the meantime go to Postgres only and are
+copied back into Redis the next time they are read. Postgres errors are not caught - without
+Postgres there is no queue and no work, so failing the job is correct.
+
+**What changed:** `PositionCache` catches Redis errors around both pipelines and trips the
+breaker; `cache_redis_client()` builds a fail-fast client; two settings,
+`POSITION_CACHE_REDIS_TIMEOUT_SEC` (0.25) and `POSITION_CACHE_REDIS_RETRY_SEC` (30).
+
+**Why, with the measured cost:** one failed command costs 261 ms against `127.0.0.1` and
+527 ms against `localhost` on this machine, even with retries off (entry above). A game is one
+batched read plus one write per new position - about 80 Redis calls. Without the breaker that
+is roughly 20-40 extra seconds per game while Redis is down. With it, the outage costs one
+timeout per 30 seconds per worker.
+
+- *A write rejected by a live Redis is different.* Out of memory under `noeviction` returns an
+  error for that one command while reads still work, so it is counted and logged but does not
+  open the breaker.
+- *One log line per state change*, not one per failed call: `cache.redis_unavailable` when the
+  breaker opens, `cache.redis_recovered` when it closes.
+
+**Alternatives rejected:**
+- *Let the error fail the job*: the queue retries it, Redis is still down, and every game
+  dead-letters - a cache outage turns into a total outage.
+- *Catch and retry inside every call*: correct, and costs a timeout per call (above).
+- *Health-check Redis in a background thread*: more moving parts in a sync worker for the same
+  result; the next real call is the health check.
+
+**Talking point:** "Redis is a cache, so losing it should cost speed, not correctness. I timed
+a dead Redis first - 260 to 530 milliseconds per call even with retries off, and almost ten
+seconds with the library's default retries. At eighty calls a game that's a big slowdown, so
+there's a small circuit breaker: the first failure sends the cache to Postgres for thirty
+seconds, then it tries Redis once. There's a test with a real client pointed at a closed port,
+so the exceptions are the ones redis-py really raises."
+
+**Where:** `src/chess_coach/cache/position_cache.py` (`_redis_failed`, `_redis_usable`),
+`src/chess_coach/cache/__init__.py`, `tests/test_position_cache.py` ("Redis unavailable").
+
+---
+
 ## 2026-11-05 - The test clean-up deleted nothing, because of square brackets `DONE`
 
 > **In plain English:** Every test that uses Redis gets its own private label for the data it
