@@ -199,6 +199,9 @@ class Game(Base, TimestampMixin):
     analysis_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     analysis_skip_reason: Mapped[str | None] = mapped_column(Text)
     analyzed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    # Milliseconds of engine search spent analysing this game - cache misses
+    # only, so a fully cached game is 0. NULL until analysed (migration 0004).
+    engine_ms: Mapped[int | None] = mapped_column(BigInteger)
 
     player: Mapped[Player] = relationship(back_populates="games")
     moves: Mapped[list[Move]] = relationship(back_populates="game", cascade="all, delete-orphan")

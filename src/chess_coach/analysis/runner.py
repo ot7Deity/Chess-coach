@@ -44,11 +44,17 @@ class CachedEvaluator:
 
     `cache` is any `positions.EvalCache`; `NullCache` (always miss) until M3's
     cache is wired in.
+
+    `engine_ms` counts engine time spent by *this* evaluator - misses only. A
+    hit's `compute_ms` is what the engine spent when the position was first
+    evaluated, possibly in another game, so counting it would make every
+    cached game look as expensive as an uncached one.
     """
 
     def __init__(self, engine: StockfishEngine, cache: EvalCache | None = None) -> None:
         self.engine = engine
         self.cache: EvalCache = cache if cache is not None else NullCache()
+        self.engine_ms = 0
 
     def __call__(self, board: chess.Board) -> Evaluation:
         key = fen_hash(board)
@@ -56,6 +62,7 @@ class CachedEvaluator:
         if hit is not None:
             return hit
         evaluation = self.engine.evaluate(board)
+        self.engine_ms += evaluation.compute_ms or 0
         self.cache.put(
             key, normalize_fen(board), self.engine.version, self.engine.depth, evaluation
         )
@@ -104,6 +111,7 @@ class Worker(JobRunner):
         if game is None:
             bound.info("job.already_analysed")
             return
+        engine_ms_before = getattr(self.evaluate, "engine_ms", None)
         rows = analyze_game(
             game.pgn,
             start_fen=game.start_fen,
@@ -112,8 +120,18 @@ class Worker(JobRunner):
             evaluate=self.evaluate,
             on_position=self.heartbeat(lease),
         )
-        self._finish(lease, game_id, rows)
-        bound.info("job.done", plies=len(rows), seconds=round(time.monotonic() - started, 2))
+        engine_ms = (
+            None
+            if engine_ms_before is None
+            else getattr(self.evaluate, "engine_ms", 0) - engine_ms_before
+        )
+        self._finish(lease, game_id, rows, engine_ms)
+        bound.info(
+            "job.done",
+            plies=len(rows),
+            seconds=round(time.monotonic() - started, 2),
+            engine_ms=engine_ms,
+        )
 
     def on_failed(self, session: Session, lease: Lease, status: str) -> None:
         game_id = _game_id(lease.payload)
@@ -142,7 +160,9 @@ class Worker(JobRunner):
             _set_game_status(session, game_id, "running")
             return game
 
-    def _finish(self, lease: Lease, game_id: int, rows: list[MoveRow]) -> None:
+    def _finish(
+        self, lease: Lease, game_id: int, rows: list[MoveRow], engine_ms: int | None
+    ) -> None:
         with Session(self.db) as session, session.begin():
             # First, so a lost lease writes nothing at all.
             queue.complete(session, lease)
@@ -156,7 +176,16 @@ class Worker(JobRunner):
             session.execute(
                 update(Game)
                 .where(Game.id == game_id)
-                .values(analysis_status="complete", analyzed_at=func.now(), ply_count=len(rows))
+                .values(
+                    analysis_status="complete",
+                    analyzed_at=func.now(),
+                    ply_count=len(rows),
+                    # Engine time spent analysing this game, independent of any
+                    # cache: with every position a hit it is 0, with no cache
+                    # it is the full cost. "Engine seconds with cache vs
+                    # without" is a SUM over this column.
+                    engine_ms=engine_ms,
+                )
             )
 
 

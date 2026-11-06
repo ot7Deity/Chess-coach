@@ -302,3 +302,27 @@ def test_the_evaluator_asks_the_cache_first_and_fills_it_on_a_miss(stockfish):
     cache.store[key] = sentinel
     assert evaluate(board) is sentinel, "a hit must not reach the engine"
     assert first.eval_cp != 12345
+
+
+def test_engine_time_is_recorded_per_game_whether_or_not_there_is_a_cache(
+    clean_engine: Engine, stockfish
+):
+    """games.engine_ms counts misses only, so with no cache it is the full cost
+    and with every position cached it is 0. Without it, "engine seconds with
+    cache vs without" has no "without" side in the database."""
+    game_id = insert_game(clean_engine, LONG_GAME)
+    assert _one(clean_engine, "SELECT engine_ms FROM games").engine_ms is None
+    _enqueue(clean_engine)
+    cache = RecordingCache()
+    worker = Worker(clean_engine, stockfish, worker_id="w1", settings=_settings(), cache=cache)
+    worker.run(until_empty=True)
+    cold = _one(clean_engine, "SELECT engine_ms FROM games WHERE id = :id", id=game_id)
+    assert cold.engine_ms > 0
+    assert cold.engine_ms == sum(e.compute_ms for e in cache.store.values())
+
+    with clean_engine.begin() as c:
+        c.execute(text("UPDATE games SET analysis_status = 'pending'"))
+        c.execute(text("UPDATE jobs SET status = 'pending'"))
+    worker.run(until_empty=True)
+    warm = _one(clean_engine, "SELECT engine_ms FROM games WHERE id = :id", id=game_id)
+    assert warm.engine_ms == 0

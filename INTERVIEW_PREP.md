@@ -122,12 +122,54 @@ fencing token for leases - resetting it would let a stale worker's old lease mat
 
 <!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
 
+## 2026-11-06 - Bug: with the cache switched off, engine time was recorded nowhere `DONE`
+
+> **In plain English:** One of the numbers this project exists to produce is "how much
+> engine time does the cache save?" That needs two measurements: the time with the cache,
+> and the time without. The only place engine time was being saved was the cache itself -
+> so when the cache was switched off to measure the "without" side, the time had nowhere to
+> go. It's like measuring how much a coupon saves you, when the only receipt is printed by
+> the coupon. Now each game records how long the engine worked on it, regardless of whether
+> a cache is in use.
+
+**A bit deeper:** `positions.compute_ms` is written when a position is stored in the
+position cache. With `NullCache` (the cache disabled, the baseline of the benchmark) nothing
+is stored, so the engine's work left no trace in the database. The fix records it on the
+unit the benchmark measures - the game - in the worker, which sees every engine call.
+
+**Symptom / how it was found:** the M3 builder, wiring the cache into my worker, could not
+compute DESIGN.md's "engine seconds with cache vs without" from the database: the "without"
+run had no engine time anywhere.
+
+**Root cause:** a measurement owned by an optional component. I had treated
+`positions.compute_ms` as "where engine time lives", but it is really "the cost of a cached
+entry", which only exists if there is a cache.
+
+**Fix:** migration `0004` adds `games.engine_ms` (NULL until analysed). `CachedEvaluator`
+counts engine time on **misses only** and the worker writes the game's total in the same
+transaction that completes it. Counting misses only is the important detail: a cache hit's
+`compute_ms` is what the engine spent when the position was *first* evaluated, maybe in
+another game, so adding it would make a fully cached game look as expensive as an uncached
+one. A test analyses the 90-ply game with an empty cache (engine_ms > 0, and equal to the
+sum over the positions stored) and again with every position cached (engine_ms = 0).
+
+**Talking point:** "The cache-savings number needs a baseline with the cache off, and my only
+record of engine time was written by the cache - so the baseline was invisible. Now each game
+records its own engine time, counting cache misses only, and the saving is a SUM over one
+column with and without the cache."
+
+**Where:** `migrations/versions/0004_games_engine_ms.py`, `src/chess_coach/analysis/runner.py`
+(`CachedEvaluator.engine_ms`, `Worker._finish`), `src/chess_coach/models.py`,
+`tests/test_runner.py::test_engine_time_is_recorded_per_game_whether_or_not_there_is_a_cache`.
+
 ## 2026-11-06 - The sixth time: the engine's memory size was a hidden input to the cache `DONE`
 
 > **In plain English:** The chess engine has a setting for how much scratch memory it may
 > use while thinking. I had assumed that only changes how *fast* it thinks, not *what* it
-> concludes. I measured it anyway, and it does change the answer - rarely and slightly (one
-> position in six, by a fiftieth of a pawn), but it does. The saved answers were filed under
+> concludes. I measured it anyway, and it does change the answer. My quick check found one
+> small difference in six positions. The project's tester then checked 34 positions and found
+> 14 that differed - and in one of them the engine even picked a different best move. The
+> saved answers were filed under
 > a label that named the engine and how deep it thinks, not the memory size. So changing the
 > setting would have mixed two slightly different sets of answers under one label. The label
 > now includes the memory size. And a second setting I had only *warned* about - letting the
@@ -140,10 +182,22 @@ is the *hash size*: a smaller table evicts entries during the search and can tak
 different path. The fix extends the *engine version* part of the key, rather than adding a
 column, so the positions table, the cache protocol and every caller stay as they are.
 
-**Symptom / how it was found:** not a production failure - a measurement taken while building
-the engine wrapper. At depth 16 on six positions from one game, Hash = 16 MB gave `-45` where
-64, 128 and 256 MB all gave `-43`; the other five positions agreed. I logged it as an open
-question rather than acting on it; the decision was to fold it into the key.
+**Symptom / how it was found:** not a production failure - measurements, two of them.
+
+- *Mine, while building the engine wrapper:* depth 16, six positions from one game, hash
+  cleared per position, one thread. Hash = 16 MB gave `-45` where 64, 128 and 256 MB all gave
+  `-43`; the other five agreed. I logged it as an open question; the decision was to fold it
+  into the key.
+- *The tester's, afterwards, on a bigger sample:* the same settings (cleared hash, Threads=1,
+  depth 16) on 34 positions. 16 MB vs 128 MB disagreed on **14 of 34**, by up to **9 cp**, and
+  in one position **the best move changed** (`h2h3` vs `c1e3`). Threads=2 was not reproducible
+  from one run to the next.
+
+My six-position sample understated it badly: "one in six by 2 cp" became "four in ten, up to
+9 cp, and a different best move". The changed best move is the part that matters most. A move
+that matches the engine's best move is always graded `best`, so a player who played `c1e3`
+would get `best` under one hash size and be graded on arithmetic under the other - the same
+move, in the same position, at the same depth, with a different label.
 
 **Root cause:** the same one as five times before in this project - a stored value depending
 on an input its key does not name. (The others: engine version and depth in `positions`; the
@@ -164,17 +218,19 @@ instead of silently reusing the old ones - which is the point.
   benchmark, and then fails silently.
 - *Add a `hash_mb` column to the key*: correct, but a schema and protocol change across M2 and
   M3 for what the version string already expresses.
-- *Ignore a 2 cp difference*: it would never change a classification today, but "never
-  matters" is a claim about every future position, and the fix is one string.
+- *Ignore it as noise*: that was tempting at 2 cp. At up to 9 cp, and with a best move
+  changing, it can change a classification - and the fix is one string.
 
 **Lesson:** the third time it was caught by reasoning, this time by a measurement taken just
 to check an assumption ("hash size only affects speed"). Measuring the boring assumption is
-cheap; finding a mixed cache later is not.
+cheap; finding a mixed cache later is not. And a second lesson from the tester's re-run: a
+six-sample measurement is enough to show an effect exists, not to say how big it is.
 
 **Talking point:** "Six times now the bug has been the same: a stored value depends on an
 input its key doesn't name. The latest one I found by checking an assumption I was fairly
-sure of - that the engine's hash size only changes speed. It changed one score in six by 2
-centipawns. Tiny, but it means two hash sizes would share cache entries that disagree, so the
+sure of - that the engine's hash size only changes speed. My quick check found a 2 centipawn
+difference; a bigger re-test found 14 of 34 positions differing by up to 9 cp and one best
+move changing - and the best move decides whether a player's move is graded 'best'. So the
 hash size is now part of the engine version. And multi-threading went from a warning to an
 error, because thread timing is an input no key can capture."
 
