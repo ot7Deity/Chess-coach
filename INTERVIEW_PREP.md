@@ -49,6 +49,65 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M4 ENTRIES BELOW (report SQL, report and sync API). Newest first. -->
 
+## 2026-11-06 - Which openings cost me rating: a window function, checked against real data `DONE`
+
+> **In plain English:** One question the report answers is "which openings lose me rating
+> points?" Chess.com stores my rating *after* each game, not how much it changed. So the
+> change for a game is "my rating after this game, minus my rating after the game before
+> it". The "game before it" has to be the previous *rated* game of the *same* kind (blitz
+> with blitz), in time order - including games whose opening has no name, even though those
+> are left out of the openings list itself. I wrote that as a database query, tested it on
+> small made-up data where I worked out every answer by hand, and then ran it on my real
+> 4,549 games. It matched the numbers the dashboard was already built with, exactly, for
+> every time control.
+
+**A bit deeper:** A *window function* (`LAG`) looks at the previous row in an ordered set
+without collapsing rows the way `GROUP BY` does - here, the previous rated game in the same
+time class, ordered by time (and by id, so two games at the same second still have a fixed
+order). The change is computed over every game *first* and only then filtered and grouped
+by opening, because filtering first would make the "previous game" skip games and inflate
+the changes.
+
+**What changed:** `src/chess_coach/analytics/report.py` - `summary`, `rating_trend` and
+`openings`, the report sections that come from ingested games and are complete as soon as a
+sync is. `analytics/progress.py` holds the "current rating" query, shared so the progress page
+and the report can never disagree about it.
+
+**Why the details are the way they are:**
+
+- *Window first, filter second.* A game with no opening name is not an opening row, but it is
+  still the previous game for the next one's rating change. A test puts an unnamed game
+  between two Italian Games and checks the change is measured from it.
+- *Ties break on id, everywhere.* The rating change's `LAG`, "current rating" and "the last
+  game of the day" all order by `(played_at, id)`, so no two of them can disagree about which
+  game came last.
+- *The UTC day, written out.* `(played_at AT TIME ZONE 'UTC')::date`, and a test runs the query
+  in a Los Angeles session to show a 02:00 UTC game still lands on its UTC day. Chess.com's own
+  monthly archives are filed in US Pacific time, which is why the contract has no month field.
+- *Percentages are computed in Python from integer counts.* Postgres `numeric` division returns
+  20 significant digits (`51.0392609699769053`), which is not the float the contract promises.
+
+**Verified against real data:** a read-only run against the development database
+(`deitythemenace`, 4,549 standard games) compared every summary count, current rating,
+rating-trend point and opening row with the dashboard's real-data fixture: blitz 433 games /
+141 trend days / 15 opening rows, bullet 3,690 / 907 / 50, rapid 424 / 161 / 17, daily 2 / 2 / 0.
+Zero differences.
+
+**Alternatives rejected:**
+- *Compute rating change in Python*: pulls every game of a time class over the wire to do what
+  one window function does next to the data.
+- *Filter out unnamed openings before the `LAG`*: simpler SQL, wrong numbers.
+
+**Talking point:** "Chess.com gives you the rating after each game, not the change, so the
+change is a LAG over the previous rated game in the same time class. The subtle part is the
+order of operations: the window has to run over every game before you filter to games with a
+named opening, or the 'previous game' skips some and the numbers inflate. I tested it on
+hand-computed data and then against my real 4,549 games, where it matched the dashboard's
+fixture exactly."
+
+**Where:** `src/chess_coach/analytics/report.py`, `src/chess_coach/analytics/progress.py`,
+`tests/test_report_games.py`.
+
 ## 2026-11-06 - Asking for a sync is a queued job, and a re-sync re-arms the old one `DONE`
 
 > **In plain English:** When someone types their username into the website, the website
