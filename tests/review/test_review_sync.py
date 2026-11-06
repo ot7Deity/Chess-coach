@@ -240,21 +240,43 @@ def test_the_lock_is_released_when_a_sync_dies(
 
 
 def test_the_lock_is_released_after_a_database_error(clean_engine: Engine, fake: FakeChessCom):
-    fake.add_game(ME, "2026-10", make_game("dup", white=ME, black="z"))
-    fake.add_game(ME, "2026-10", make_game("dup", white=ME, black="z"))
-    with pytest.raises(Exception, match="cannot affect row a second time"):
+    # A value Postgres rejects. (This test used a duplicate uuid until m1/7
+    # made duplicates harmless.)
+    bad = make_game("overflow", white=ME, black="z")
+    bad["white"]["rating"] = 10**12
+    fake.add_game(ME, "2026-10", bad)
+    with pytest.raises(Exception, match="out of range"):
         sync_player(clean_engine, fake.client(), ME, now=NOV_15)
     assert _advisory_locks_held(clean_engine, _player_id(clean_engine)) == 0
+    with Session(clean_engine) as s:
+        assert s.scalar(select(Player.sync_status)) == "error"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: sync.py:119 catches Exception, not BaseException, so Ctrl-C or "
-        "SystemExit mid-sync leaves players.sync_status='syncing' forever (the "
-        "lock is released, the status is not)."
-    ),
-)
+def test_a_month_with_a_rejected_game_is_downloaded_in_full_on_every_sync(
+    clean_engine: Engine,
+):
+    """The price of m1/7's recovery rule, pinned so it is a decision rather than
+    a surprise: until the parser accepts the game, that month is re-downloaded
+    in full on every sync (no ETag, never frozen) - a re-sync is 3 requests, not
+    2, forever, for every such month in the player's history."""
+    fake = FakeChessCom()
+    fake.add_player(ME)
+    fake.add_game(ME, "2024-03", make_game("ok", white=ME, black="x"))
+    fake.add_game(ME, "2024-03", make_game("weird", white=ME, black="y", time_class="hyper"))
+    fake.add_game(ME, "2026-11", make_game("now", white=ME, black="z"))
+    sync_player(clean_engine, fake.client(), ME, now=NOV_15)
+
+    for day in (1, 2, 3):
+        fake.log.clear()
+        result = sync_player(clean_engine, fake.client(), ME, now=NOV_15 + dt.timedelta(days=day))
+        assert f"player/{ME}/games/2024/03" in fake.log
+        assert (result.requests, result.months_fetched, result.games_new) == (3, 1, 0)
+        assert result.games_rejected == 1
+    with Session(clean_engine) as s:
+        march = s.scalar(select(Archive).where(Archive.month == "2024-03"))
+    assert (march.is_complete, march.etag) == (False, None)
+
+
 def test_ctrl_c_mid_sync_does_not_leave_the_player_marked_syncing(
     clean_engine: Engine, fake: FakeChessCom
 ):
@@ -273,16 +295,6 @@ def test_ctrl_c_mid_sync_does_not_leave_the_player_marked_syncing(
 # --- the upsert ---------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: sync.py:261-291 sends a month as one multi-row INSERT ... ON "
-        "CONFLICT DO UPDATE; a uuid that appears twice in one month's JSON raises "
-        "CardinalityViolation, fails the whole sync, and fails it again on every "
-        "retry because the month is never committed. _parse_month promises one bad "
-        "game never costs the rest of the month."
-    ),
-)
 def test_a_game_listed_twice_in_one_month_does_not_wedge_the_sync(
     clean_engine: Engine, fake: FakeChessCom
 ):
@@ -397,16 +409,6 @@ def test_a_304_after_the_grace_day_freezes_the_month_and_keeps_its_count(clean_e
     assert (archive.is_complete, archive.etag, archive.game_count) == (True, etag, 2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "DISAGREEMENT: a game rejected by the parser in a month that is already "
-        "final is lost for good - the month is marked complete and never fetched "
-        "again, so a parser fix can never recover it, and archives.game_count "
-        "records only the accepted games, so nothing in the database says a game "
-        "is missing (sync.py:209-217)."
-    ),
-)
 def test_a_rejected_game_in_a_final_month_is_recoverable_after_a_parser_fix(
     clean_engine: Engine,
 ):

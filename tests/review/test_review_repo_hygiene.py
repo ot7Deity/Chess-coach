@@ -30,7 +30,6 @@ def _mentions_claude(entries: list[str]) -> bool:
     return any(e.strip("/").startswith(".claude") for e in entries)
 
 
-@pytest.mark.xfail(strict=True, reason="DISAGREEMENT: .claude/ is not excluded from ruff")
 def test_ruff_skips_agent_worktrees():
     ruff = _pyproject().get("tool", {}).get("ruff", {})
     assert _mentions_claude(ruff.get("exclude", []) + ruff.get("extend-exclude", []))
@@ -49,7 +48,6 @@ def test_pytest_does_not_recurse_into_agent_worktrees():
     assert _mentions_claude(ini.get("norecursedirs", []))
 
 
-@pytest.mark.xfail(strict=True, reason="DISAGREEMENT: .claude/ is not in .gitignore")
 def test_git_ignores_agent_worktrees():
     lines = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert _mentions_claude([line for line in lines if not line.startswith("#")])

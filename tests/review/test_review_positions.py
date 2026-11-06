@@ -180,3 +180,63 @@ def test_a_checkmated_position_scores_mate_zero_and_negation_loses_the_sign(engi
     assert relative.mate() == 0
     assert (-relative).mate() == 0  # the sign does not survive as an int
     assert relative < chess.engine.Cp(0) < -relative  # python-chess keeps it
+
+
+# --- m1/6: engine_board -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fen",
+    [
+        "rnbqkbnr/ppp1pppp/8/8/3pP3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 3",  # live en passant
+        "8/8/8/KPp4r/8/8/8/7k w - c6 0 1",  # pinned, so no en passant
+        "r3k3/8/8/8/8/8/8/4K2R w KQkq - 37 60",  # impossible rights, high clock
+        "8/5k2/8/8/3R4/8/5K2/8 w - - 90 80",
+    ],
+)
+def test_engine_board_describes_exactly_the_key(fen):
+    """The board the engine sees must hash to the same key and carry nothing
+    else: no move stack, halfmove clock 0."""
+    from chess_coach.positions import engine_board
+
+    played = chess.Board(fen)
+    legal = list(played.legal_moves)
+    played.push(legal[0])  # give it a move stack
+    played.pop()
+    played.push(legal[0])
+    eb = engine_board(played)
+    assert fen_hash(eb) == fen_hash(played)
+    assert eb.halfmove_clock == 0
+    assert eb.move_stack == []
+
+
+@pytest.mark.engine
+def test_a_cold_eval_still_depends_on_the_hash_size_which_the_key_omits(stockfish_path):
+    """m1/6 removes the clock and the warm hash, but the hash table's *size* is
+    a third input: cleared hash, one thread, same board, same depth, and Hash=1
+    vs Hash=128 MB score most of this game differently. (At the production
+    depth of 16, Hash=16 vs 128 differed on 14 of 34 positions.) ENGINE_HASH_MB
+    is a setting, so a test run and production - or two workers configured
+    differently - write different values under one key. Threads > 1 is worse:
+    not reproducible from one run to the next."""
+    from chess_coach.positions import engine_board
+
+    game = chess.pgn.read_game(io.StringIO(_GAME))
+    boards, board = [], game.board()
+    for move in game.mainline_moves():
+        board.push(move)
+        boards.append(engine_board(board))
+
+    def scores(hash_mb: int) -> list[int]:
+        eng = chess.engine.SimpleEngine.popen_uci(str(stockfish_path))
+        try:
+            eng.configure({"Threads": 1, "Hash": hash_mb})
+            limit = chess.engine.Limit(depth=_DEPTH)
+            return [_cp(eng.analyse(b, limit, game=object())) for b in boards]
+        finally:
+            eng.quit()
+
+    small, big = scores(1), scores(128)
+    assert scores(128) == big  # each configuration is reproducible ...
+    differing = sum(s != b for s, b in zip(small, big, strict=True))
+    assert differing > len(boards) // 2  # ... but they disagree with each other

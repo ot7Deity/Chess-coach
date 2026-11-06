@@ -81,29 +81,12 @@ def test_a_non_json_200_is_an_error_not_an_empty_month():
         client.month(ME, "2026-10")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "DISAGREEMENT: client.py:156 reads a 200 body with no 'games' key as an "
-        "empty month; sync.py would then mark a finished month complete with zero "
-        "games and never fetch it again. A missing key should be an error."
-    ),
-)
 def test_a_month_body_without_a_games_key_is_an_error():
     client = _client(lambda r: httpx.Response(200, json={}))
     with pytest.raises(ChessComError):
         client.month(ME, "2026-10")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: client.py:33-35 says a Retry-After beyond _MAX_RETRY_AFTER_SEC means "
-        "'failing the sync is more useful than sleeping', but _retry_after clamps "
-        "it to 300 s and keeps retrying: up to 5 x 300 s asleep, penalising every "
-        "worker 300 s each time, before giving up."
-    ),
-)
 def test_an_absurd_retry_after_fails_fast_instead_of_sleeping():
     sleeps: list[float] = []
     client = _client(
