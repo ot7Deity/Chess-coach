@@ -61,6 +61,111 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M1 ENTRIES BELOW (ingestion). Newest first. -->
 
+## 2026-11-05 - The cache was built on a promise the chess engine didn't keep `DONE`
+
+> **In plain English:** The whole speed-up plan rests on one idea: if the chess engine has
+> already judged a board position, save the answer and reuse it, because the same position
+> always gets the same answer. My reviewer (an AI agent I set up whose only job is to try to
+> break things) tested that promise against the real engine, and it was false. The engine
+> gave one position four completely different scores depending on how close the game was to
+> a "draw after 50 quiet moves" rule - a number my saved answers ignored. It also gave
+> different answers depending on what it had been thinking about just before. So whichever
+> game happened to look at a position first would have decided the score for every other
+> game. The fix makes the engine forget everything before each position and always see it
+> fresh, so the same position really does get the same answer.
+
+**A bit deeper:** A cache is only correct if the saved value depends on nothing except the
+cache key. Here the key is "this board, this engine version, this search depth". The reviewer
+found two hidden inputs: the *halfmove clock* (the 50-move-rule counter, which Stockfish uses
+to pull scores towards a draw) and the engine's *transposition table* (its short-term memory
+of positions it searched recently, which steers later searches). Neither is in the key. The
+fix removes both inputs instead of adding them to the key: the engine is shown each position
+with the counter at zero and no move history, its memory is cleared first, and it runs on one
+thread, which makes the result a pure function of the key.
+
+**What changed:** `positions.engine_board(board)` returns the board the engine must be given
+(normalised FEN, halfmove clock 0, no move stack). The contract now requires the worker to
+clear the hash (`ucinewgame`) before every position and to run `Threads=1`, and documents
+`mate_in = 0` ("side to move is already checkmated"), which cannot be flipped to the other
+side's point of view by negation because `-0 == 0`. A real-engine test proves the guarantee:
+the same KRK position with the clock at 0 and at 90 scores differently raw and identically
+through `engine_board`.
+
+**Why:** The evidence, from the reviewer's tests against the pinned Stockfish 18:
+
+| Halfmove clock | Score (depth 12) |
+| --- | --- |
+| 0 | +529 |
+| 50 | +359 |
+| 90 | +11 |
+| 98 | 0 |
+
+and, across one 34-ply game, 31 positions scored differently with the hash kept between
+positions (the natural way to write a worker loop) than with it cleared - by up to 42
+centipawns, sometimes with a different best move. Cold, single-thread searches repeated
+exactly. With the original contract, first-write-wins would have frozen whichever of those
+answers arrived first, and the same move could be graded "good" in one game and "inaccuracy"
+in another.
+
+This is the **fifth** time this project has hit "the value depends on something the key
+doesn't name" - after the `positions` key, the CI engine cache, the engine image and the
+`games` idempotency key - and the first one where the fix was to remove the hidden input
+rather than add it to the key. Adding the halfmove clock to the key would have split every
+position into up to 100 cache entries and destroyed the hit rate the cache exists for.
+
+**Alternatives rejected:**
+- *Put the halfmove clock in the key*: correct, and multiplies cache entries by up to 100.
+- *Keep the warm hash and stop claiming reproducibility*: faster per position, but the cache
+  would then serve whichever answer won a race, and the "with cache vs without" benchmark
+  would compare two different things.
+- *Last-write-wins in the cache*: just picks a different arbitrary answer.
+
+**Talking point:** "My cache rested on 'same position, same depth, same answer'. The reviewer
+agent tested it against the real engine and it was false twice over: Stockfish's score moves
+with the 50-move counter, and with whatever is left in its hash table from the previous
+position. Instead of adding those to the key, which would have wrecked the hit rate, I made
+them stop mattering - every position is searched from a clean board with a cleared hash -
+and there's now a test that runs the reviewer's counter-example through the engine and
+requires identical results. The speed cost of clearing the hash is measured in the M2
+entries."
+
+**Where:** `src/chess_coach/positions.py` (`engine_board`, the `Evaluation` and `EvalCache`
+docstrings), `tests/test_positions.py::test_an_evaluation_is_a_function_of_its_cache_key`.
+The reviewer's original tests are on `review/adversarial` under `tests/review/`.
+
+---
+
+## 2026-11-05 - I reformatted other agents' half-written code by accident `DONE`
+
+> **In plain English:** Several AI agents build different parts of this project at the same
+> time, each in its own copy of the code. Those copies live in a hidden folder *inside* my
+> main copy. I ran a tidy-up tool on "everything in this folder" - and it went into their
+> copies too, rearranging code they were still in the middle of writing. No harm was done,
+> because the tool only changes spacing and layout, and they would have run it themselves
+> before saving. But it could just as easily have been a tool that deletes or rewrites
+> files. The fix is to tell every tool that the hidden folder is off-limits.
+
+**A bit deeper:** Each agent works in a *git worktree* - a second checkout of the same
+repository on a different branch. The tooling put those worktrees under `.claude/worktrees/`
+inside the main checkout. Git knows they are separate, but other tools do not: to `ruff`
+they are just more Python files under the current directory. Repo-wide commands from the
+main checkout therefore reached into other branches' uncommitted work.
+
+**What changed:** `.claude/` is excluded from ruff (`extend-exclude`) and gitignored.
+
+**Why:** Formatting is deterministic and the agents format before every commit, so this
+instance cost nothing. The class of bug is the problem: any repo-wide script (a codemod, a
+`find ... -delete`, a coverage run) would have had the same reach.
+
+**Talking point:** "Running parallel agents in nested worktrees has a sharp edge: git knows
+they're separate checkouts, but nothing else does. I found it by tripping over it - a format
+run reached into another branch's work in progress. Excluding the directory is one line; the
+lesson is that isolation has to hold for every tool, not just the version control."
+
+**Where:** `pyproject.toml` (`[tool.ruff] extend-exclude`), `.gitignore`.
+
+---
+
 ## 2026-11-05 - M1: the whole history loads once, and every re-sync costs two requests `DONE`
 
 > **In plain English:** The first big piece works. You type in a Chess.com username and the
