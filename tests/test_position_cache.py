@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import random
 import re
+import socket
 import threading
 from collections.abc import Iterator
 
@@ -17,7 +18,7 @@ import pytest
 import redis
 from sqlalchemy import Engine, event, select, text
 
-from chess_coach.cache import PositionCache, build_eval_cache, redis_key
+from chess_coach.cache import PositionCache, build_eval_cache, cache_redis_client, redis_key
 from chess_coach.cache.codec import decode, encode
 from chess_coach.config import Settings
 from chess_coach.models import Position
@@ -52,18 +53,35 @@ def opening_positions(count: int) -> list[tuple[bytes, str]]:
 
 
 class CountingRedis:
-    """A real client that counts pipelines, i.e. Redis round trips."""
+    """A real client that counts pipelines (Redis round trips) and can be told
+    to fail the way an unreachable Redis does."""
 
     def __init__(self, real: redis.Redis) -> None:
         self.real = real
         self.pipelines = 0
+        self.down = False
 
     def pipeline(self, transaction: bool = True):
         self.pipelines += 1
-        return self.real.pipeline(transaction=transaction)
+        pipe = self.real.pipeline(transaction=transaction)
+        if self.down:
+
+            def fail(*args, **kwargs):
+                raise redis.ConnectionError("simulated outage")
+
+            pipe.execute = fail
+        return pipe
 
     def __getattr__(self, name):
         return getattr(self.real, name)
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
 
 
 @pytest.fixture(autouse=True)
@@ -356,6 +374,93 @@ def test_a_key_of_the_wrong_redis_type_is_a_miss(cache, redis_client):
     assert cache.get(key, ENGINE, DEPTH) == EVAL
     assert cache.stats.corrupt_values == 1
     assert decode(redis_client.get(name), ENGINE, DEPTH) == EVAL  # SET replaced it
+
+
+# --- Redis unavailable -----------------------------------------------------------
+
+
+def test_redis_down_degrades_to_postgres_and_the_breaker_stops_retrying(make_cache, redis_client):
+    switch = CountingRedis(redis_client)
+    clock = FakeClock()
+    cache = make_cache(switch, redis_retry_sec=30, clock=clock)
+    key, fen = position("e4")
+    other_key, other_fen = position("d4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+
+    switch.down = True
+    assert cache.get(key, ENGINE, DEPTH) == EVAL  # from Postgres
+    assert not cache.redis_active
+    assert cache.stats.redis_errors == 1
+
+    calls = switch.pipelines
+    cache.put(other_key, other_fen, ENGINE, DEPTH, OTHER)  # Postgres only
+    assert cache.get(other_key, ENGINE, DEPTH) == OTHER
+    assert cache.get(key, ENGINE, DEPTH) == EVAL
+    assert switch.pipelines == calls, "breaker open: Redis must not be touched"
+    assert cache.stats.redis_errors == 1
+
+    switch.down = False
+    clock.now += 31
+    assert cache.get(other_key, ENGINE, DEPTH) == OTHER  # Redis miss, PG hit, backfill
+    assert cache.redis_active
+    assert redis_client.exists(rkey(redis_client, other_key))
+    assert cache.get(other_key, ENGINE, DEPTH) == OTHER
+    assert cache.stats.redis_hits == 1
+
+
+def test_a_put_while_redis_is_down_still_commits_to_postgres(make_cache, redis_client):
+    switch = CountingRedis(redis_client)
+    cache = make_cache(switch, clock=FakeClock())
+    key, fen = position("e4")
+    switch.down = True
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)  # must not raise
+    assert cache.stats.writes_inserted == 1
+    assert not redis_client.exists(rkey(redis_client, key))
+    assert make_cache(None).get(key, ENGINE, DEPTH) == EVAL
+
+
+def test_a_failed_backfill_trips_the_breaker_but_still_returns(make_cache, redis_client):
+    switch = CountingRedis(redis_client)
+    cache = make_cache(switch, clock=FakeClock())
+    key, fen = position("e4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    redis_client.delete(rkey(redis_client, key))
+
+    real_pipeline = switch.pipeline
+
+    def fail_on_writes(transaction=True):
+        pipe = real_pipeline(transaction)
+        original = pipe.execute
+
+        def execute(*args, **kwargs):
+            if any(cmd[0][0] == "SET" for cmd in pipe.command_stack):
+                raise redis.TimeoutError("simulated slow Redis")
+            return original(*args, **kwargs)
+
+        pipe.execute = execute
+        return pipe
+
+    switch.pipeline = fail_on_writes
+    assert cache.get(key, ENGINE, DEPTH) == EVAL
+    assert not cache.redis_active
+
+
+def test_an_unreachable_redis_server_is_survivable(make_cache):
+    """A real client against a port nothing listens on, so the exception types
+    are whatever redis-py actually raises, not what a fake chose to raise."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    dead = cache_redis_client(
+        Settings(redis_url=f"redis://127.0.0.1:{port}/0", position_cache_redis_timeout_sec=0.2)
+    )
+    cache = make_cache(dead, key_prefix="unused:")
+    key, fen = position("e4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    assert cache.get(key, ENGINE, DEPTH) == EVAL
+    assert cache.stats.postgres_hits == 1
+    assert cache.stats.redis_errors == 1  # the put's write tripped it; the get skipped Redis
+    dead.close()
 
 
 # --- batches ---------------------------------------------------------------------
