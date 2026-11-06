@@ -43,6 +43,9 @@ packages = ["src/chess_coach"]
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
+# Agent worktrees live under .claude/worktrees/. Without this, a repo-wide
+# `ruff format .` reformats other branches' uncommitted work in place.
+extend-exclude = [".claude"]
 
 [tool.ruff.lint]
 select = [

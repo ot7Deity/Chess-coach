@@ -61,6 +61,240 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M1 ENTRIES BELOW (ingestion). Newest first. -->
 
+## 2026-11-05 - Chess.com's months run on California time, not world time `DONE`
+
+> **In plain English:** Chess.com groups your games into months. I assumed those months
+> follow world standard time (UTC), the clock most computer systems use. My reviewer agent
+> checked every one of my 4,550 games against the month it was filed under, and found 71 that
+> didn't fit: games that finished just after midnight on the 1st were filed under the
+> *previous* month. Every single one of the 4,550 fit perfectly once you use California time
+> instead. My code happened to work anyway - it already waits a full day after a month ends
+> before treating it as finished, and the difference is at most eight hours - but my written
+> explanation of *why* it waits was wrong, and the monthly reports would have quietly
+> disagreed with Chess.com's numbers.
+
+**A bit deeper:** The archive endpoint for a month returns games whose end time falls in
+that month in `America/Los_Angeles`. A UTC month therefore keeps receiving games for 7-8
+hours after it ends. Correctness here came from margin rather than understanding: the 24-hour
+grace was chosen for a different reason ("a game finishing at 23:59 might not be indexed by
+00:00") and happens to cover the real one.
+
+**How it was found:** the reviewer's live acceptance test on `deitythemenace` recorded, for
+every game, which month's archive it came from, and compared that with its `end_time` in UTC
+and in Pacific time: 71 of 4,550 (1.6%) mismatched in UTC, 0 in Pacific. The largest gap
+was 7 h 26 min past UTC midnight.
+
+**What changed:** the `ARCHIVE_GRACE` comment and the M1 entry's explanation now give the
+measured mechanism. The 24-hour value stays.
+
+**Consequence for M4:** a report that groups games by UTC month will not match Chess.com's
+monthly archive counts - about 1.6% of games land in a different month. Reports should state
+which they use; grouping by the player's own time zone is probably what a person expects.
+
+**Talking point:** "My code was right for the wrong reason. I'd guessed why Chess.com's
+monthly archives lag at midnight; the reviewer agent tested it against all 4,550 of my games
+and found the archives are bucketed in Pacific time - 71 games filed under the previous month
+in UTC, zero in Pacific. The safety margin I'd picked happened to cover an eight-hour skew.
+I'd rather know that than be lucky, because the next report I write groups by month."
+
+**Where:** `src/chess_coach/ingest/sync.py` (`ARCHIVE_GRACE`), the reviewer's
+`tests/review/test_live_deitythemenace.py` on `review/adversarial`.
+
+---
+
+## 2026-11-05 - The comment said "give up", the code said "wait 25 minutes" `DONE`
+
+> **In plain English:** When Chess.com is overloaded it can reply "try again in N seconds".
+> I wrote a rule: if it asks us to wait more than five minutes, something is badly wrong,
+> so stop and report a failure. The note above the code said exactly that. The code did
+> something else: it shortened the wait to five minutes and tried again - five times. So a
+> server asking for an hour would have kept the program asleep for 25 minutes, holding up
+> every other download, before finally giving up. My reviewer agent caught it by reading
+> the note and the code side by side.
+
+**A bit deeper:** `Retry-After` is an HTTP header a server sends with "too many requests"
+or "temporarily unavailable" responses. The intent was a *ceiling*: honour short waits,
+refuse long ones. The code implemented a *clamp*, which turns "refuse" into "wait the
+maximum, repeatedly". The bug was invisible to the existing tests because they only used
+short waits.
+
+**What changed:** A server-requested wait above 300 s now raises `ChessComUnavailable`
+immediately. The shared rate-limit bucket is still penalised, by 300 s rather than the full
+value, so the other workers back off without stalling for an hour. The ceiling applies only to
+waits the server asks for, not to our own configured backoff (there is a test for that too).
+
+**Talking point:** "A small one, but a good example of why the reviewer reads comments
+against code: my comment said 'above five minutes, give up', and the code clamped to five
+minutes and retried five times. One `min()` was the difference between failing in a
+millisecond and stalling every worker for 25 minutes."
+
+**Where:** `src/chess_coach/chesscom/client.py` (`_get`, `_retry_after`),
+`tests/test_chesscom_client.py::test_an_absurd_retry_after_fails_fast_instead_of_sleeping`.
+
+---
+
+## 2026-11-05 - Four ways the sync could get stuck forever or lose a game quietly `DONE`
+
+> **In plain English:** After the download feature worked on my real account, my reviewer
+> agent went looking for the unusual situations that break it, and found four. If Chess.com
+> ever listed the same game twice in a month, the download would fail on that month every
+> single time, forever. If I stopped the program with Ctrl-C, my account would say "syncing"
+> forever. If one game confused the program, it would skip it - and then never look at that
+> month again, even after I fixed the code, so the game would be gone for good. And if
+> Chess.com sent back a broken reply, the program would read it as "you played no games
+> this month" and lock that in. None of these happened with my real data. They are the kind
+> of bug that shows up months later, for someone else, with no clue where to look.
+
+**A bit deeper:** All four are the same shape: a rare input turns into a *permanent* bad
+state, because the system remembers its mistakes. A month marked "finished" is never fetched
+again; a status column is only reset by the code path that was skipped; a database statement
+that fails fails identically on every retry. The fixes make each of those states either
+impossible or recoverable, and each has a test that reproduces it.
+
+**What changed / the four stories:**
+
+1. **A duplicate game wedged the sync.** *Symptom:* every sync of the player fails at the
+   same month. *Cause:* a month is inserted as one `INSERT ... ON CONFLICT DO UPDATE`, and
+   Postgres refuses to let one statement update the same row twice
+   (`CardinalityViolation`). The month never commits, so every retry hits it again. *Fix:*
+   deduplicate by uuid before inserting, with a warning.
+2. **Ctrl-C left the player "syncing" forever.** *Cause:* the error handler caught
+   `Exception`, and `KeyboardInterrupt` / `SystemExit` are not Exceptions in Python. The
+   advisory lock was still released (the reviewer verified every exit path), but the status
+   column was not. *Fix:* `except BaseException`. A hard kill (`kill -9`) can still leave
+   it, which is why a later version should derive "syncing" from `pg_locks` instead of a
+   column.
+3. **A game the parser rejected was lost for good.** *Cause:* the month was still marked
+   complete, so it was never fetched again, and its ETag meant even a re-fetch would get a
+   304. *Fix:* a month with a rejected game is never frozen and its ETag is dropped, so the
+   next sync downloads it in full and a parser fix recovers the game. The test fakes the
+   parser fix and checks the game arrives.
+4. **A malformed reply read as an empty month.** *Cause:* `resp.json().get("games", [])`.
+   *Fix:* a 200 without a `games` list raises, and the month is retried later instead of
+   being frozen with zero games.
+
+**Alternatives rejected:** *catching the CardinalityViolation and retrying row by row* -
+slower on every month to handle a case that has never happened; deduplicating up front is
+one dictionary.
+
+**Talking point:** "The reviewer agent's best finds were rare inputs that become permanent
+states. The sync remembers that a month is finished, so any mistake made while finishing it
+is remembered too. A duplicate game in Chess.com's JSON would have failed one month on every
+retry forever, and a game my parser rejected would have been skipped and then never looked at
+again. Each fix either makes the bad state impossible or makes it recoverable, and each one
+has a test that reproduces it."
+
+**Where:** `src/chess_coach/ingest/sync.py` (`_parse_month`, `_sync_months`, the
+`BaseException` handler), `src/chess_coach/chesscom/client.py` (`month`), tests in
+`tests/test_sync.py` and `tests/test_chesscom_client.py`.
+
+---
+
+## 2026-11-05 - The cache was built on a promise the chess engine didn't keep `DONE`
+
+> **In plain English:** The whole speed-up plan rests on one idea: if the chess engine has
+> already judged a board position, save the answer and reuse it, because the same position
+> always gets the same answer. My reviewer (an AI agent I set up whose only job is to try to
+> break things) tested that promise against the real engine, and it was false. The engine
+> gave one position four completely different scores depending on how close the game was to
+> a "draw after 50 quiet moves" rule - a number my saved answers ignored. It also gave
+> different answers depending on what it had been thinking about just before. So whichever
+> game happened to look at a position first would have decided the score for every other
+> game. The fix makes the engine forget everything before each position and always see it
+> fresh, so the same position really does get the same answer.
+
+**A bit deeper:** A cache is only correct if the saved value depends on nothing except the
+cache key. Here the key is "this board, this engine version, this search depth". The reviewer
+found two hidden inputs: the *halfmove clock* (the 50-move-rule counter, which Stockfish uses
+to pull scores towards a draw) and the engine's *transposition table* (its short-term memory
+of positions it searched recently, which steers later searches). Neither is in the key. The
+fix removes both inputs instead of adding them to the key: the engine is shown each position
+with the counter at zero and no move history, its memory is cleared first, and it runs on one
+thread, which makes the result a pure function of the key.
+
+**What changed:** `positions.engine_board(board)` returns the board the engine must be given
+(normalised FEN, halfmove clock 0, no move stack). The contract now requires the worker to
+clear the hash (`ucinewgame`) before every position and to run `Threads=1`, and documents
+`mate_in = 0` ("side to move is already checkmated"), which cannot be flipped to the other
+side's point of view by negation because `-0 == 0`. A real-engine test proves the guarantee:
+the same KRK position with the clock at 0 and at 90 scores differently raw and identically
+through `engine_board`.
+
+**Why:** The evidence, from the reviewer's tests against the pinned Stockfish 18:
+
+| Halfmove clock | Score (depth 12) |
+| --- | --- |
+| 0 | +529 |
+| 50 | +359 |
+| 90 | +11 |
+| 98 | 0 |
+
+and, across one 34-ply game, 31 positions scored differently with the hash kept between
+positions (the natural way to write a worker loop) than with it cleared - by up to 42
+centipawns, sometimes with a different best move. Cold, single-thread searches repeated
+exactly. With the original contract, first-write-wins would have frozen whichever of those
+answers arrived first, and the same move could be graded "good" in one game and "inaccuracy"
+in another.
+
+This is the **fifth** time this project has hit "the value depends on something the key
+doesn't name" - after the `positions` key, the CI engine cache, the engine image and the
+`games` idempotency key - and the first one where the fix was to remove the hidden input
+rather than add it to the key. Adding the halfmove clock to the key would have split every
+position into up to 100 cache entries and destroyed the hit rate the cache exists for.
+
+**Alternatives rejected:**
+- *Put the halfmove clock in the key*: correct, and multiplies cache entries by up to 100.
+- *Keep the warm hash and stop claiming reproducibility*: faster per position, but the cache
+  would then serve whichever answer won a race, and the "with cache vs without" benchmark
+  would compare two different things.
+- *Last-write-wins in the cache*: just picks a different arbitrary answer.
+
+**Talking point:** "My cache rested on 'same position, same depth, same answer'. The reviewer
+agent tested it against the real engine and it was false twice over: Stockfish's score moves
+with the 50-move counter, and with whatever is left in its hash table from the previous
+position. Instead of adding those to the key, which would have wrecked the hit rate, I made
+them stop mattering - every position is searched from a clean board with a cleared hash -
+and there's now a test that runs the reviewer's counter-example through the engine and
+requires identical results. The speed cost of clearing the hash is measured in the M2
+entries."
+
+**Where:** `src/chess_coach/positions.py` (`engine_board`, the `Evaluation` and `EvalCache`
+docstrings), `tests/test_positions.py::test_an_evaluation_is_a_function_of_its_cache_key`.
+The reviewer's original tests are on `review/adversarial` under `tests/review/`.
+
+---
+
+## 2026-11-05 - I reformatted other agents' half-written code by accident `DONE`
+
+> **In plain English:** Several AI agents build different parts of this project at the same
+> time, each in its own copy of the code. Those copies live in a hidden folder *inside* my
+> main copy. I ran a tidy-up tool on "everything in this folder" - and it went into their
+> copies too, rearranging code they were still in the middle of writing. No harm was done,
+> because the tool only changes spacing and layout, and they would have run it themselves
+> before saving. But it could just as easily have been a tool that deletes or rewrites
+> files. The fix is to tell every tool that the hidden folder is off-limits.
+
+**A bit deeper:** Each agent works in a *git worktree* - a second checkout of the same
+repository on a different branch. The tooling put those worktrees under `.claude/worktrees/`
+inside the main checkout. Git knows they are separate, but other tools do not: to `ruff`
+they are just more Python files under the current directory. Repo-wide commands from the
+main checkout therefore reached into other branches' uncommitted work.
+
+**What changed:** `.claude/` is excluded from ruff (`extend-exclude`) and gitignored.
+
+**Why:** Formatting is deterministic and the agents format before every commit, so this
+instance cost nothing. The class of bug is the problem: any repo-wide script (a codemod, a
+`find ... -delete`, a coverage run) would have had the same reach.
+
+**Talking point:** "Running parallel agents in nested worktrees has a sharp edge: git knows
+they're separate checkouts, but nothing else does. I found it by tripping over it - a format
+run reached into another branch's work in progress. Excluding the directory is one line; the
+lesson is that isolation has to hold for every tool, not just the version control."
+
+**Where:** `pyproject.toml` (`[tool.ruff] extend-exclude`), `.gitignore`.
+
+---
+
 ## 2026-11-05 - M1: the whole history loads once, and every re-sync costs two requests `DONE`
 
 > **In plain English:** The first big piece works. You type in a Chess.com username and the
@@ -85,17 +319,21 @@ CLI), migration `0002`, and tests for each against real Postgres and Redis.
 
 **Why the details are the way they are:**
 
-- *A month is final a day after it ends, not at midnight.* Games are filed by end time, and a
-  game that finishes at 23:59 UTC on the 31st is not guaranteed to be in the archive at
-  00:00. Freezing on the stroke of midnight would lose it forever. The grace day costs at
-  most one extra 304.
+- *A month is final a day after it ends, not at midnight.* Chess.com files games by their
+  end date in **US Pacific time**, so a UTC month keeps gaining games for up to eight hours
+  after it ends (see the "Pacific time" entry above - my first explanation here was wrong).
+  Freezing at UTC midnight would lose them forever. The grace day costs at most one extra
+  304.
 - *One commit per month.* A crash mid-sync leaves the finished months marked done, so a
   resumed sync re-requests only what it had not finished - and nothing is half-written,
   because a month's games and its archive row commit together.
 - *The upsert never touches analysis state.* A re-ingested game keeps its
   `analysis_status`; otherwise every re-sync would send finished games back to the queue. The
-  only field allowed to change is Chess.com's accuracy score, which appears later if someone
-  requests a review. A `WHERE` on the `ON CONFLICT DO UPDATE` means re-downloading an
+  only field allowed to change is Chess.com's accuracy score, which appears if someone
+  requests a review. (Only while the month is still being re-fetched - the current month plus
+  the grace day. A review requested after a month is frozen is not picked up; that is fine,
+  because these numbers are a cross-check, not a report input.) A `WHERE` on the
+  `ON CONFLICT DO UPDATE` means re-downloading an
   unchanged month writes zero rows, and `RETURNING (xmax = 0)` counts which rows were
   genuinely new without a second query.
 - *Wins and losses are decided by where `win` appears.* Chess.com marks the winner `win` and
@@ -913,7 +1151,7 @@ the repo is public. Same reason the database URL isn't committed."
 > cheapest fixes in the project, because none of that code had been written yet.
 
 **What changed:** Before writing any ingestion code, the Chess.com API was called directly to
-check what it actually returns. Five assumptions in the design doc were wrong.
+check what it actually returns. Seven assumptions in the design doc were wrong.
 
 **Why / what was found:**
 
@@ -939,7 +1177,7 @@ check what it actually returns. Five assumptions in the design doc were wrong.
    the raw termination kept for the "how do I lose" breakdown.
 
 **Talking point:** "Before I wrote the ingestion layer I spent ten minutes just calling the
-API and reading the response, and found five things my design document had wrong - including
+API and reading the response, and found seven things my design document had wrong - including
 that the field I planned to use for opening classification contains a URL, not an opening
 code. Cheapest bug fixes in the project, because none of them had been written yet."
 
@@ -978,13 +1216,23 @@ the same interpreter or 'works on my machine' becomes the default failure mode."
 
 ---
 
-## 2026-11-05 - Repo moved out of OneDrive to `C:\dev\chess-coach` `DONE`
+## 2026-11-05 - Repo moved out of OneDrive to `C:\dev\chess-coach` `DECIDED`
 
 > **In plain English:** I moved the project folder off OneDrive. A project like this generates
 > tens of thousands of small working files, and OneDrive tries to back up every one of them as
 > it changes. While it's doing that it holds files open, which makes installs and test runs
 > fail with "permission denied" and "file in use" - errors that look exactly like bugs in your
 > own code and send you hunting in the wrong place. GitHub is already the backup.
+
+**Status update (M1):** this had quietly regressed. The working checkout ended up back under
+`OneDrive\Desktop\chess\Chess-coach`, so this entry said `DONE` for something that was no
+longer true - which the reviewer agent caught, and then tripped over exactly as predicted:
+deleting a temporary worktree failed with "Access denied" on a locked `.pyd` file. With four
+agents' worktrees (each with its own virtualenv) inside the folder, the exposure was far
+larger than when this entry was written. OneDrive is stopped for now and the move to
+`C:\dev\chess-coach` happens once the parallel agents finish their current round. The lesson
+worth telling: a decision log needs re-checking against reality, or it turns into a list of
+things that used to be true.
 
 **What changed:** The repository was moved from `OneDrive\Desktop\Chess coach\` to
 `C:\dev\chess-coach` while it was still empty.

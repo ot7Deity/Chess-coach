@@ -36,9 +36,12 @@ from chess_coach.models import Archive, Game, Player
 
 log = get_logger(__name__)
 
-# How long after a month ends before it is treated as final. Games are archived
-# by end time, and a game that ends at 23:59 UTC on the 31st is not necessarily
-# in the archive at 00:00. A day of slack costs one extra 304 at most.
+# How long after a month ends (in UTC) before it is treated as final. Chess.com
+# files a game under its end month in US Pacific time, not UTC - measured on
+# deitythemenace: 71 of 4,550 games ended up to 7h26m into the next UTC month
+# and were filed under the earlier one; 0 were filed outside their Pacific
+# month. So a UTC month keeps changing for up to 8 hours after it ends. A day
+# covers that with margin and costs one extra 304 at most.
 ARCHIVE_GRACE = dt.timedelta(hours=24)
 
 # First key of pg_try_advisory_lock(int, int). Namespaces ingest's locks so they
@@ -116,7 +119,11 @@ def sync_player(
             _set_status(engine, player_id, "syncing")
             try:
                 _sync_months(engine, client, player_id, username, now, result)
-            except Exception as exc:
+            # BaseException, not Exception: Ctrl-C (KeyboardInterrupt) and
+            # SystemExit are not Exceptions, and missing them left a player
+            # marked 'syncing' forever. A hard kill still can; see
+            # INTERVIEW_PREP.md.
+            except BaseException as exc:
                 _set_status(engine, player_id, "error", error=f"{type(exc).__name__}: {exc}")
                 raise
             _set_status(engine, player_id, "complete", synced_at=now)
@@ -212,9 +219,18 @@ def _sync_months(
                 result.months_not_modified += 1
             else:
                 result.months_fetched += 1
+                rejected_before = result.games_rejected
                 rows = _parse_month(resp.games, username, player_id, month, result)
                 result.games_new += _upsert_games(session, rows)
                 archive_values["game_count"] = len(rows)
+                if result.games_rejected > rejected_before:
+                    # A month with a game we could not parse is never frozen,
+                    # and its ETag is dropped so the next sync downloads it in
+                    # full rather than getting a 304. Otherwise a parser fix
+                    # could never recover the game: the month would be skipped
+                    # forever and nothing would record that a game was missing.
+                    archive_values["is_complete"] = False
+                    archive_values["etag"] = None
 
             session.execute(
                 insert(Archive)
@@ -241,7 +257,7 @@ def _parse_month(
     month: str,
     result: SyncResult,
 ) -> list[dict[str, Any]]:
-    rows = []
+    rows: dict[str, dict[str, Any]] = {}
     for raw in games:
         result.games_seen += 1
         try:
@@ -254,8 +270,13 @@ def _parse_month(
             log.warning("sync.game_rejected", month=month, uuid=raw.get("uuid"), reason=str(exc))
             continue
         row["player_id"] = player_id
-        rows.append(row)
-    return rows
+        # Deduplicated by uuid before the INSERT. One `INSERT ... ON CONFLICT
+        # DO UPDATE` may not touch the same row twice, so a month listing a
+        # game twice would fail the whole month - on every retry, forever.
+        if row["chesscom_uuid"] in rows:
+            log.warning("sync.game_duplicated", month=month, uuid=row["chesscom_uuid"])
+        rows[row["chesscom_uuid"]] = row
+    return list(rows.values())
 
 
 def _upsert_games(session: Session, rows: list[dict[str, Any]]) -> int:
