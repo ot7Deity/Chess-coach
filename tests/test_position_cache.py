@@ -1,24 +1,29 @@
-"""The position cache against a real Postgres.
+"""The position cache against a real Postgres and a real Redis.
 
-The properties that matter are the ones a mock cannot show: that the composite
-key separates searches, and that a lost race leaves exactly the winner's row.
+The properties that matter are the ones a mock cannot show: which layer answers,
+that the composite key separates searches in both layers, and that a lost race
+leaves both layers agreeing with the winner.
 """
 
 from __future__ import annotations
 
 import random
+import re
 import threading
 from collections.abc import Iterator
 
 import chess
 import pytest
+import redis
 from sqlalchemy import Engine, event, select, text
 
-from chess_coach.cache import PositionCache
+from chess_coach.cache import PositionCache, build_eval_cache, redis_key
+from chess_coach.cache.codec import decode, encode
+from chess_coach.config import Settings
 from chess_coach.models import Position
-from chess_coach.positions import EvalCache, Evaluation, fen_hash, normalize_fen
+from chess_coach.positions import EvalCache, Evaluation, NullCache, fen_hash, normalize_fen
 
-pytestmark = [pytest.mark.postgres]
+pytestmark = [pytest.mark.postgres, pytest.mark.redis]
 
 ENGINE = "sf_18"
 DEPTH = 16
@@ -46,10 +51,45 @@ def opening_positions(count: int) -> list[tuple[bytes, str]]:
     return list(out.items())
 
 
+class CountingRedis:
+    """A real client that counts pipelines, i.e. Redis round trips."""
+
+    def __init__(self, real: redis.Redis) -> None:
+        self.real = real
+        self.pipelines = 0
+
+    def pipeline(self, transaction: bool = True):
+        self.pipelines += 1
+        return self.real.pipeline(transaction=transaction)
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+@pytest.fixture(autouse=True)
+def glob_safe_prefix(redis_client) -> Iterator[None]:
+    """Give `redis_client` a key prefix with no glob metacharacters.
+
+    conftest's cleanup deletes `SCAN MATCH <prefix>*` with the prefix
+    unescaped, and the prefix contains the test name - which for a
+    parametrized test has `[...]` in it. Redis reads that as a character
+    class, the pattern matches nothing, and every key leaks. This swaps in a
+    sanitised prefix and cleans it up here.
+    """
+    safe = re.sub(r"[\[\]*?\\]", "_", redis_client.key_prefix)
+    redis_client.key_prefix = safe
+    yield
+    keys = list(redis_client.scan_iter(match=safe + "*"))
+    if keys:
+        redis_client.delete(*keys)
+
+
 @pytest.fixture
-def make_cache(clean_engine: Engine):
-    def make(**kwargs) -> PositionCache:
-        return PositionCache(clean_engine, **kwargs)
+def make_cache(clean_engine: Engine, redis_client):
+    def make(client=redis_client, **kwargs) -> PositionCache:
+        kwargs.setdefault("key_prefix", redis_client.key_prefix)
+        kwargs.setdefault("ttl_sec", 3600)
+        return PositionCache(clean_engine, client, **kwargs)
 
     return make
 
@@ -71,6 +111,10 @@ def pg_selects(clean_engine: Engine) -> Iterator[list[str]]:
     event.listen(clean_engine, "before_cursor_execute", listener)
     yield seen
     event.remove(clean_engine, "before_cursor_execute", listener)
+
+
+def rkey(redis_client, key: bytes, engine: str = ENGINE, depth: int = DEPTH) -> str:
+    return redis_key(redis_client.key_prefix, key, engine, depth)
 
 
 def pg_row(engine: Engine, key: bytes, depth: int = DEPTH):
@@ -102,24 +146,38 @@ def test_a_miss_is_counted_and_returns_none(cache):
     assert cache.stats.hit_rate == 0.0
 
 
-def test_put_writes_the_row_and_the_next_get_is_a_hit(cache, clean_engine):
+def test_put_writes_both_layers_and_the_next_get_is_a_redis_hit(cache, redis_client, clean_engine):
     key, fen = position("e4")
     cache.put(key, fen, ENGINE, DEPTH, EVAL)
 
     row = pg_row(clean_engine, key)
     assert (row.fen, row.eval_cp, row.mate_in, row.compute_ms) == (fen, 31, None, 250)
+    assert decode(redis_client.get(rkey(redis_client, key)), ENGINE, DEPTH) == EVAL
 
     assert cache.get(key, ENGINE, DEPTH) == EVAL
     stats = cache.stats
-    assert (stats.postgres_hits, stats.misses) == (1, 0)
+    assert (stats.redis_hits, stats.postgres_hits, stats.misses) == (1, 0, 0)
     assert stats.engine_ms_saved == 250
     assert stats.writes_inserted == 1
 
 
+def test_a_redis_miss_falls_through_to_postgres_and_backfills(cache, redis_client):
+    key, fen = position("d4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    redis_client.delete(rkey(redis_client, key))  # expired or evicted
+
+    assert cache.get(key, ENGINE, DEPTH) == EVAL
+    assert redis_client.exists(rkey(redis_client, key))
+    assert cache.get(key, ENGINE, DEPTH) == EVAL
+    stats = cache.stats
+    assert (stats.postgres_hits, stats.redis_hits) == (1, 1)
+    assert stats.engine_ms_saved == 500
+
+
 @pytest.mark.parametrize(("engine", "depth"), [("sf_18", 12), ("sf_18", 20), ("sf_17", 16)])
-def test_another_engine_or_depth_is_a_miss(cache, engine, depth):
+def test_another_engine_or_depth_is_a_miss_in_both_layers(cache, engine, depth):
     """The bug the composite key exists to prevent: a depth-16 result must never
-    answer a depth-12 question."""
+    answer a depth-12 question, from Redis or from Postgres."""
     key, fen = position("e4")
     cache.put(key, fen, ENGINE, DEPTH, EVAL)
     assert cache.get(key, engine, depth) is None
@@ -137,12 +195,23 @@ def test_hits_without_compute_ms_are_counted_separately(cache):
     assert cache.stats.hits_without_compute_ms == 1
 
 
-def test_a_mate_round_trips(cache):
+def test_a_mate_round_trips_through_both_layers(cache, redis_client):
     board = chess.Board("6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1")
     key, fen = fen_hash(board), normalize_fen(board)
     mate = Evaluation(eval_cp=None, mate_in=1, best_move="a1a8", compute_ms=3)
     cache.put(key, fen, ENGINE, DEPTH, mate)
     assert cache.get(key, ENGINE, DEPTH) == mate
+    redis_client.delete(rkey(redis_client, key))
+    assert cache.get(key, ENGINE, DEPTH) == mate
+
+
+def test_postgres_only_mode(make_cache):
+    cache = make_cache(None)
+    key, fen = position("e4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    assert cache.get(key, ENGINE, DEPTH) == EVAL
+    assert cache.stats.postgres_hits == 1
+    assert not cache.redis_active
 
 
 # --- input checking -----------------------------------------------------------
@@ -179,20 +248,36 @@ def test_get_refuses_malformed_keys(cache, key, engine, depth):
 # --- first write wins -------------------------------------------------------
 
 
-def test_the_first_write_wins_and_the_second_is_a_no_op(cache, clean_engine):
+def test_the_first_write_wins_and_the_second_is_a_no_op(cache, redis_client, clean_engine):
     key, fen = position("e4", "e5")
     cache.put(key, fen, ENGINE, DEPTH, EVAL)
     cache.put(key, fen, ENGINE, DEPTH, OTHER)
 
     assert pg_row(clean_engine, key).eval_cp == EVAL.eval_cp
+    assert decode(redis_client.get(rkey(redis_client, key)), ENGINE, DEPTH) == EVAL
     assert cache.get(key, ENGINE, DEPTH) == EVAL
     assert (cache.stats.writes_inserted, cache.stats.writes_existing) == (1, 1)
 
 
-def test_concurrent_writers_leave_exactly_one_row_each(make_cache, clean_engine):
+def test_a_losing_write_never_reaches_redis(cache, redis_client):
+    """If the loser wrote Redis, Redis would disagree with Postgres. Here the
+    winner's Redis copy is gone (expired, say); the loser must not fill the gap
+    with its own value."""
+    key, fen = position("e4", "c5")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    redis_client.delete(rkey(redis_client, key))
+
+    cache.put(key, fen, ENGINE, DEPTH, OTHER)
+    assert not redis_client.exists(rkey(redis_client, key))
+    assert cache.get(key, ENGINE, DEPTH) == EVAL  # backfilled from the winner
+
+
+def test_concurrent_writers_leave_one_row_and_redis_agrees_with_it(
+    make_cache, redis_client, clean_engine
+):
     """Eight workers race to write the same 25 positions, each with its own
-    (different) evaluation. Exactly one write per position wins, and every
-    writer agrees on which: inserted + existing adds up with no errors."""
+    (different) evaluation. Exactly one write per position wins, and Redis holds
+    the winner's value - not whichever writer happened to touch Redis last."""
     positions = opening_positions(25)
     writers = 8
     caches = [make_cache() for _ in range(writers)]
@@ -220,31 +305,99 @@ def test_concurrent_writers_leave_exactly_one_row_each(make_cache, clean_engine)
     with clean_engine.connect() as conn:
         count = conn.execute(text("SELECT count(*) FROM positions")).scalar_one()
     assert count == len(positions)
+    for key, _ in positions:
+        winner = pg_row(clean_engine, key)
+        cached = decode(redis_client.get(rkey(redis_client, key)), ENGINE, DEPTH)
+        assert (cached.eval_cp, cached.compute_ms) == (winner.eval_cp, winner.compute_ms)
+
     inserted = sum(c.stats.writes_inserted for c in caches)
     existing = sum(c.stats.writes_existing for c in caches)
     assert (inserted, existing) == (len(positions), len(positions) * (writers - 1))
 
 
+# --- bad data in Redis ------------------------------------------------------------
+
+
+def test_a_corrupt_redis_value_is_a_miss_then_repaired_from_postgres(cache, redis_client):
+    key, fen = position("Nf3")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    redis_client.set(rkey(redis_client, key), b"\x00garbage")
+
+    assert cache.get(key, ENGINE, DEPTH) == EVAL
+    assert cache.stats.corrupt_values == 1
+    assert cache.stats.postgres_hits == 1
+    assert decode(redis_client.get(rkey(redis_client, key)), ENGINE, DEPTH) == EVAL
+
+
+def test_a_corrupt_value_with_nothing_in_postgres_is_just_a_miss(cache, redis_client):
+    key, fen = position("g3")
+    redis_client.set(rkey(redis_client, key), b"[1,")
+    assert cache.get(key, ENGINE, DEPTH) is None
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)  # the worker computes and writes
+    assert decode(redis_client.get(rkey(redis_client, key)), ENGINE, DEPTH) == EVAL
+
+
+def test_a_value_for_another_depth_under_this_key_is_not_served(cache, redis_client):
+    """Simulates a key-building bug: a depth-12 value sitting under the depth-16
+    key. The value's own (engine, depth) disagrees, so it is refused."""
+    key, _ = position("b3")
+    redis_client.set(rkey(redis_client, key), encode(ENGINE, 12, EVAL))
+    assert cache.get(key, ENGINE, DEPTH) is None
+    assert cache.stats.corrupt_values == 1
+
+
+def test_a_key_of_the_wrong_redis_type_is_a_miss(cache, redis_client):
+    key, fen = position("f4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    name = rkey(redis_client, key)
+    redis_client.delete(name)
+    redis_client.hset(name, "x", "1")  # WRONGTYPE for GETEX
+
+    assert cache.get(key, ENGINE, DEPTH) == EVAL
+    assert cache.stats.corrupt_values == 1
+    assert decode(redis_client.get(name), ENGINE, DEPTH) == EVAL  # SET replaced it
+
+
 # --- batches ---------------------------------------------------------------------
 
 
-def test_get_many_is_one_query_for_a_whole_game(cache, pg_selects):
+def test_get_many_is_three_round_trips_for_a_whole_game(
+    make_cache, redis_client, clean_engine, pg_selects
+):
     positions = opening_positions(60)
-    for key, fen in positions[:40]:
+    counting = CountingRedis(redis_client)
+    cache = make_cache(counting)
+    in_redis = positions[:20]
+    in_postgres_only = positions[20:40]
+    for key, fen in in_redis + in_postgres_only:
         cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    for key, _ in in_postgres_only:
+        redis_client.delete(rkey(redis_client, key))
 
+    counting.pipelines = 0
     pg_selects.clear()
     keys = [k for k, _ in positions]
     found = cache.get_many(keys + keys[:5], ENGINE, DEPTH)  # with repeats
 
     assert set(found) == set(keys[:40])
+    assert counting.pipelines == 2  # one read, one backfill
     assert len(pg_selects) == 1
     stats = cache.stats
-    assert (stats.postgres_hits, stats.misses) == (40, 20)
+    assert (stats.redis_hits, stats.postgres_hits, stats.misses) == (20, 20, 20)
     assert stats.lookups == 60  # repeats inside a batch count once
 
 
-def test_a_huge_batch_is_chunked_rather_than_one_giant_in_list(cache, pg_selects):
+def test_get_many_with_everything_in_redis_never_touches_postgres(cache, pg_selects):
+    positions = opening_positions(10)
+    for key, fen in positions:
+        cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    pg_selects.clear()
+    assert len(cache.get_many([k for k, _ in positions], ENGINE, DEPTH)) == 10
+    assert pg_selects == []
+
+
+def test_a_huge_batch_is_chunked_rather_than_one_giant_in_list(make_cache, pg_selects):
+    cache = make_cache(None)
     key, fen = position("e4")
     cache.put(key, fen, ENGINE, DEPTH, EVAL)
     keys = [random.Random(i).randbytes(32) for i in range(2499)] + [key]
@@ -253,6 +406,79 @@ def test_a_huge_batch_is_chunked_rather_than_one_giant_in_list(cache, pg_selects
     assert len(pg_selects) == 3
 
 
-def test_get_many_of_nothing_does_no_io(cache, pg_selects):
+def test_get_many_of_nothing_does_no_io(make_cache, redis_client, pg_selects):
+    counting = CountingRedis(redis_client)
+    cache = make_cache(counting)
     assert cache.get_many([], ENGINE, DEPTH) == {}
+    assert counting.pipelines == 0
     assert pg_selects == []
+
+
+# --- expiry ------------------------------------------------------------------------
+
+
+def test_every_hit_refreshes_the_ttl(make_cache, redis_client):
+    cache = make_cache(ttl_sec=1000)
+    key, fen = position("e4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    name = rkey(redis_client, key)
+    assert 990 <= redis_client.ttl(name) <= 1000
+
+    redis_client.expire(name, 5)
+    cache.get(key, ENGINE, DEPTH)
+    assert redis_client.ttl(name) > 990
+
+
+def test_backfilled_entries_get_a_ttl(make_cache, redis_client):
+    cache = make_cache(ttl_sec=1000)
+    key, fen = position("e4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    redis_client.delete(rkey(redis_client, key))
+    cache.get(key, ENGINE, DEPTH)
+    assert redis_client.ttl(rkey(redis_client, key)) > 990
+
+
+def test_ttl_zero_means_no_expiry(make_cache, redis_client):
+    cache = make_cache(ttl_sec=0)
+    key, fen = position("e4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    assert cache.get(key, ENGINE, DEPTH) == EVAL
+    assert redis_client.ttl(rkey(redis_client, key)) == -1
+
+
+# --- maintenance and wiring --------------------------------------------------------
+
+
+def test_purge_redis_is_scoped_to_one_search(cache, redis_client):
+    key, fen = position("e4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    cache.put(key, fen, ENGINE, 12, EVAL)
+    cache.put(key, fen, "sf_17", DEPTH, EVAL)
+    sibling = redis_client.key_prefix.rstrip(":") + "-sibling:x"
+    redis_client.set(sibling, b"keep")
+
+    assert cache.purge_redis(ENGINE, 12) == 1
+    assert cache.purge_redis(ENGINE) == 1
+    assert redis_client.exists(rkey(redis_client, key, "sf_17", DEPTH))
+    assert cache.purge_redis() == 1
+    assert redis_client.exists(sibling)
+    redis_client.delete(sibling)
+
+    # Postgres still has all three, and Redis refills from it.
+    assert cache.get(key, ENGINE, 12) == EVAL
+    assert cache.stats.postgres_hits == 1
+
+
+def test_build_eval_cache_follows_the_setting(clean_engine, redis_url):
+    assert isinstance(build_eval_cache(Settings(position_cache="off"), clean_engine), NullCache)
+
+    pg_only = build_eval_cache(Settings(position_cache="postgres"), clean_engine)
+    assert isinstance(pg_only, PositionCache)
+    assert not pg_only.redis_active
+
+    full = build_eval_cache(Settings(position_cache="full", redis_url=redis_url), clean_engine)
+    assert isinstance(full, PositionCache)
+    assert full.redis_active
+
+    with pytest.raises(ValueError):
+        Settings(position_cache="redis")
