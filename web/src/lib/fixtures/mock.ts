@@ -33,7 +33,10 @@ import {
 interface RealClass {
   ingested: number;
   skipped: number;
+  /** All standard games, rated and unrated. */
   games: number;
+  /** The record below is rated games only, as on Chess.com. */
+  rated_games: number;
   wins: number;
   draws: number;
   losses: number;
@@ -153,7 +156,7 @@ export async function getReport(username: string, tc: TimeClass, signal?: AbortS
   if (!r) {
     return {
       username, time_class: tc, generated_at, games: 0, analyzed_games: 0,
-      summary: { wins: 0, draws: 0, losses: 0, win_rate_pct: null, current_rating: null, blunders_per_game: null },
+      summary: { games: 0, wins: 0, draws: 0, losses: 0, win_rate_pct: null, current_rating: null, blunders_per_game: null },
       rating_trend: [], openings: [], blunders_by_phase: null, time_pressure: null,
     };
   }
@@ -167,6 +170,7 @@ export async function getReport(username: string, tc: TimeClass, signal?: AbortS
     games: r.games,
     analyzed_games: analyzed,
     summary: {
+      games: r.rated_games,
       wins: r.wins,
       draws: r.draws,
       losses: r.losses,
