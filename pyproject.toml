@@ -30,6 +30,7 @@ dev = [
 
 [project.scripts]
 chess-coach-api = "chess_coach.api.main:run"
+chess-coach-sync = "chess_coach.ingest.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -61,4 +62,5 @@ addopts = "-q --strict-markers"
 markers = [
     "engine: needs a real Stockfish binary (set STOCKFISH_PATH)",
     "postgres: needs a real Postgres (set DATABASE_URL)",
+    "redis: needs a real Redis (set REDIS_URL)",
 ]

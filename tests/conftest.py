@@ -123,6 +123,62 @@ def migrated_engine(database_url: str) -> Iterator[Engine]:
 
 
 @pytest.fixture
+def clean_engine(migrated_engine: Engine) -> Iterator[Engine]:
+    """The migrated engine, emptied after the test.
+
+    For code that opens and commits its own sessions - ingestion commits once
+    per month, the queue once per claim - and so cannot run inside the
+    rolled-back transaction `db_session` provides.
+    """
+    yield migrated_engine
+    with migrated_engine.begin() as conn:
+        conn.execute(text("TRUNCATE players, archives, games, moves, positions, jobs CASCADE"))
+
+
+@pytest.fixture(scope="session")
+def redis_url() -> str:
+    """A reachable Redis URL, or skip. Same reasoning as `database_url`."""
+    import redis
+
+    url = os.environ.get("REDIS_URL")
+    if not url:
+        from chess_coach.config import get_settings
+
+        url = get_settings().redis_url
+    client = redis.Redis.from_url(url, socket_connect_timeout=2)
+    try:
+        client.ping()
+    except Exception as exc:
+        pytest.skip(f"no Redis at {_redact(url)}: {type(exc).__name__}")
+    finally:
+        client.close()
+    return url
+
+
+@pytest.fixture
+def redis_client(redis_url: str, request: pytest.FixtureRequest) -> Iterator:
+    """A Redis client plus a key prefix unique to this test, cleaned up after.
+
+    Prefixing rather than FLUSHDB: several agents and CI jobs may share one
+    Redis, and a test must never be able to delete keys it did not create.
+    """
+    import uuid
+
+    import redis
+
+    client = redis.Redis.from_url(redis_url)
+    prefix = f"test:{request.node.name}:{uuid.uuid4().hex[:8]}:"
+    client.key_prefix = prefix  # type: ignore[attr-defined]
+    try:
+        yield client
+    finally:
+        keys = list(client.scan_iter(match=prefix + "*"))
+        if keys:
+            client.delete(*keys)
+        client.close()
+
+
+@pytest.fixture
 def db_session(migrated_engine: Engine) -> Iterator[Session]:
     """A session whose work is rolled back, so tests cannot affect each other.
 
