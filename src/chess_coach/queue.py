@@ -34,9 +34,6 @@ job can be *executed* more than once:
 Time always comes from the database's `now()`, never a worker's clock, so a
 worker with a skewed clock cannot make a lease look fresh or expired.
 
-This module starts with claiming and completion; retries, dead-lettering and
-the reaper build on the same lease.
-
 Functions here take a `Session` and never commit: the caller owns the
 transaction, which is what lets `complete()` share one with the results. A claim
 should be committed immediately; holding it open holds the row lock.
@@ -44,7 +41,8 @@ should be committed immediately; holding it open holds the row lock.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import random
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,6 +72,14 @@ class Lease:
     # jobs.attempts as set by this claim. The fencing token.
     attempt: int
     max_attempts: int
+
+
+@dataclass(frozen=True)
+class ReapedJob:
+    job_id: int
+    type: str
+    payload: dict[str, Any]
+    status: str  # 'pending' (will be retried) or 'dead' (attempts exhausted)
 
 
 # The predicate every write by a lease holder is conditional on.
@@ -196,6 +202,99 @@ def complete(session: Session, lease: Lease) -> None:
         raise LeaseLost(f"job {lease.job_id} attempt {lease.attempt} is no longer ours")
 
 
+def fail(
+    session: Session,
+    lease: Lease,
+    error: str,
+    *,
+    retry_in_sec: float,
+    permanent: bool = False,
+) -> str:
+    """Record a failed attempt; return the job's new status.
+
+    `pending` again after `retry_in_sec` while attempts remain; `dead` once they
+    are spent; `failed` straight away if `permanent` (bad input that no retry
+    can fix - a corrupt PGN will be just as corrupt in 30 seconds). Raises
+    `LeaseLost` if the job is no longer ours, in which case it is untouched.
+    """
+    row = session.execute(
+        text(
+            f"""
+            UPDATE jobs
+            SET status = CASE
+                    WHEN :permanent THEN 'failed'
+                    WHEN attempts >= max_attempts THEN 'dead'
+                    ELSE 'pending'
+                END,
+                run_after = CASE
+                    WHEN NOT :permanent AND attempts < max_attempts
+                    THEN now() + :retry_in_sec * interval '1 second'
+                    ELSE run_after
+                END,
+                finished_at = CASE
+                    WHEN :permanent OR attempts >= max_attempts THEN now()
+                END,
+                locked_by = CASE
+                    WHEN :permanent OR attempts >= max_attempts THEN locked_by
+                END,
+                locked_at = NULL,
+                last_error = :error,
+                updated_at = now()
+            WHERE {_OWNED}
+            RETURNING status
+            """
+        ),
+        {
+            **_lease_params(lease),
+            "permanent": permanent,
+            "retry_in_sec": retry_in_sec,
+            "error": error[:2000],
+        },
+    ).one_or_none()
+    if row is None:
+        raise LeaseLost(f"job {lease.job_id} attempt {lease.attempt} is no longer ours")
+    return row.status
+
+
+_REAP = text(
+    """
+    UPDATE jobs
+    SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END,
+        finished_at = CASE WHEN attempts >= max_attempts THEN now() END,
+        last_error = 'lease expired: ' || coalesce(locked_by, '?')
+                     || ' stopped heartbeating on attempt ' || attempts,
+        locked_by = NULL,
+        locked_at = NULL,
+        run_after = now(),
+        updated_at = now()
+    WHERE id IN (
+        -- ix_jobs_running_locked_at. SKIP LOCKED: a row that is locked is
+        -- being heartbeated or completed right now, which is the opposite of
+        -- abandoned - and two reapers running at once must not block each
+        -- other either.
+        SELECT id FROM jobs
+        WHERE status = 'running'
+          AND locked_at < now() - :timeout_sec * interval '1 second'
+        FOR UPDATE SKIP LOCKED
+    )
+    RETURNING id, type, payload, status
+    """
+)
+
+
+def reap_expired(session: Session, lock_timeout_sec: float) -> list[ReapedJob]:
+    """Hand back jobs whose worker has stopped heartbeating.
+
+    The attempt still counts. A job that kills every worker that touches it
+    (out of memory, a crashing engine) must eventually be dead-lettered rather
+    than take the pool down one worker at a time forever. It goes back with
+    `run_after = now()` rather than a backoff: the lock timeout it just sat out
+    already is one.
+    """
+    rows = session.execute(_REAP, {"timeout_sec": lock_timeout_sec}).all()
+    return [ReapedJob(job_id=r.id, type=r.type, payload=r.payload, status=r.status) for r in rows]
+
+
 def has_unfinished(session: Session, types: Sequence[str]) -> bool:
     """Whether any job of these types is pending or running.
 
@@ -212,3 +311,21 @@ def has_unfinished(session: Session, types: Sequence[str]) -> bool:
             {"types": list(types)},
         ).scalar_one()
     )
+
+
+def retry_delay(
+    attempt: int,
+    *,
+    base_sec: float,
+    cap_sec: float,
+    rng: Callable[[], float] = random.random,
+) -> float:
+    """Seconds before retrying after failed attempt number `attempt` (from 1).
+
+    Exponential with equal jitter, the same shape as the Chess.com client's
+    backoff: half the window is fixed so a retry is never immediate, half is
+    random so jobs that failed together (a database blip fails all of them at
+    once) do not all come back together.
+    """
+    window = min(cap_sec, base_sec * 2 ** max(0, attempt - 1))
+    return window / 2 + rng() * window / 2

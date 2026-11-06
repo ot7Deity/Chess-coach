@@ -55,6 +55,65 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
 
+## 2026-11-05 - Retries back off, crashes count, and hopeless jobs stop retrying `DONE`
+
+> **In plain English:** Sometimes analysing a game fails. If it failed for a passing reason
+> - the database hiccupped - it should be tried again, but not instantly, and not all at the
+> same moment as every other job that failed at the same time. So each retry waits longer
+> than the last, plus a little randomness. If a game has failed five times, it is set aside
+> on a "needs a human" pile instead of being retried forever. And if the game itself is
+> broken - its move list is garbage - it goes straight to that pile, because trying again
+> won't fix it. Finally, a cleaner comes round and takes back games from workers that have
+> gone silent, so a crashed worker can never keep a game hostage.
+
+**A bit deeper:** *Exponential backoff* doubles the wait after each failure; *jitter* adds
+randomness so jobs that failed together don't retry together (a *thundering herd*). A job that
+has used up its attempts is *dead-lettered*: moved to a terminal state where it is visible
+for inspection but no longer runs. The *reaper* is a periodic sweep that returns jobs whose
+lease expired - their worker stopped heartbeating - to the queue.
+
+**What changed:** `queue.fail`, `queue.reap_expired` and `queue.retry_delay`; Workers
+settings `JOB_RETRY_BASE_SEC` / `JOB_RETRY_CAP_SEC`, and `JOB_LOCK_TIMEOUT_SEC` documented
+as a heartbeat timeout rather than a job-length limit.
+
+**Why the details are the way they are:**
+
+- *The backoff lives in `run_after`.* The claim query already skips rows whose `run_after`
+  is in the future, so a retry policy needs no scheduler and no extra state.
+- *Equal jitter, the same shape as the Chess.com client's backoff.* Half the window is fixed
+  so a retry is never immediate; half is random to spread the herd out.
+- *Two kinds of terminal failure.* `failed` is "the input is bad, retrying cannot help" (a
+  PGN that does not replay). `dead` is "five honest attempts failed". They mean different
+  things to whoever reads the dead-letter pile, so they are different statuses - and the
+  schema already had both.
+- *A reaped attempt counts.* A job that kills every worker that touches it - out of memory,
+  an engine crash that takes the process down - would otherwise loop forever, one worker
+  at a time. It is dead-lettered after `max_attempts` like any other.
+- *Reaped jobs come back immediately, not after a backoff.* The lock timeout they just sat
+  out already was one; adding more would only delay recovering from an ordinary crash.
+- *The reaper uses `SKIP LOCKED` too.* A row that is locked is being heartbeated or completed
+  at that moment - the opposite of abandoned. Blocking on it would make the reaper wait for a
+  job to finish and then (after the lock released) look again at a row that is now `done`.
+  A test holds a completion transaction open and asserts the reaper walks straight past.
+- *The lock timeout is about silence, not duration.* Workers heartbeat while they work, so
+  a long game at a high depth is never reaped while its worker is alive.
+
+**Alternatives rejected:**
+- *Retry immediately*: a database blip that fails 50 jobs brings 50 jobs back at once,
+  into the same blip.
+- *Retry forever*: a poison job never surfaces; it just costs a worker every few minutes.
+- *A reaper that ignores attempts*: the poison job again, via a different door.
+
+**Talking point:** "There are two ways a job ends badly and they mean different things:
+'the input is broken' goes straight to failed, 'it failed five times' is dead-lettered. And a
+crash counts as an attempt - otherwise a job that crashes its worker takes down the whole
+pool, one worker at a time, forever. The reaper skips locked rows on purpose: a locked row
+is a job that's completing right now, which is the opposite of abandoned."
+
+**Where:** `src/chess_coach/queue.py`, `tests/test_queue_retries.py` (including three zombie
+worker scenarios: reaped and re-claimed by someone else, reaped and not yet re-claimed, and
+re-claimed by a restart under the same worker id).
+
 ## 2026-11-05 - A claimed job is a lease with a fencing token, not just a lock `DONE`
 
 > **In plain English:** The work queue is a list of games waiting to be analysed, and
