@@ -49,6 +49,41 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-06 - A default that only exists in Python is not a default `DONE`
+
+> **In plain English:** The benchmark puts jobs into the queue table directly. I assumed the
+> table would fill in the boring columns itself - priority, attempt count - because the
+> program's own code never mentions them either. But those blanks are filled in by the
+> program's helper layer, not by the database. Talk to the database directly and nothing fills
+> them in, so it refuses the row. It's like assuming a form auto-fills your address because
+> the website always does, then getting the paper version.
+
+**A bit deeper:** In SQLAlchemy, `mapped_column(default=100)` is a *client-side default*:
+the ORM adds the value when *it* builds the INSERT. A *server default* (`server_default=`) is
+part of the table and applies to any INSERT from anywhere. `jobs.priority`, `attempts` and
+`max_attempts` are `NOT NULL` with client-side defaults only.
+
+**Symptom:** None - caught before the first run.
+
+**How I found it:** Reviewing the harness's raw `INSERT INTO jobs (type, payload, status,
+dedupe_key)`, I checked the migration for which columns had `server_default`. Those three
+didn't.
+
+**Root cause:** Reading the model (`default=100`) as if it described the table.
+
+**Fix:** The harness's INSERT names every `NOT NULL` column. A schema change (adding server
+defaults) would be the other fix, but migrations belong to M2, so it's noted for them rather
+than done here.
+
+**Lesson:** The ORM model describes what the ORM does; the migration describes what the
+database enforces. Anything that bypasses the ORM - a benchmark, a `psql` session, a
+second service - only gets the second.
+
+**Where:** `bench/harness.py::enqueue`, `migrations/versions/0001_initial_schema.py`,
+`tests/test_bench_harness.py::test_enqueue_fills_every_not_null_column_and_replaces_its_own_jobs`.
+
+---
+
 ## 2026-11-06 - Metrics: one scoreboard per worker, added up by Prometheus `DONE`
 
 > **In plain English:** To say "eight workers are this much faster than one" I need numbers,
