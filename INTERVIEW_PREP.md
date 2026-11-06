@@ -49,6 +49,54 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
 
+## 2026-11-06 - The progress page is calm on purpose `DONE`
+
+> **In plain English:** While the computer works through thousands of games, there is a
+> page that shows how far along it is. I made it deliberately boring: one big number
+> ("2,069 of 4,549 games analyzed"), a slow-moving bar, and a rough "about 6 hours left"
+> rather than a countdown to the second. A ticking clock makes people anxious and is wrong
+> anyway. And there is always a button to see the report so far, because you never have to
+> wait for 100%.
+
+**A bit deeper:** The page *polls* - asks the server for an update every five seconds -
+and stops when there is nothing left to do. It also stops while the browser tab is hidden,
+because nobody is looking and each poll is a query against the database the workers are
+busy writing to. The time estimate comes from one number the server provides (games
+analyzed in the last hour); the server does not guess, because it cannot know how many
+workers will be running.
+
+**What changed:** `web/src/app/players/[username]/progress/`.
+
+**Why the details are the way they are:**
+
+- *Vague estimates.* "About 6 hours", rounded to the nearest 5 minutes or hour. The rate
+  moves as workers come and go, and a precise number that jumps around reads as broken.
+- *The bar eases over 1.2 s,* so each poll makes it drift rather than jump.
+- *Polls continue after a failed poll,* with the last good numbers still on screen and a
+  quiet "couldn't refresh" line: a blip should not freeze the page until a manual reload.
+- *Per time control, in a fixed order,* with the queue's priority explained in one
+  sentence ("rapid and blitz go first, then bullet") so a bullet bar sitting at 30% does not
+  look stuck.
+- *Failed and skipped games are said out loud,* in a sentence, so totals that do not reach
+  100% are explained instead of looking like a bug.
+- *Progress updates are announced politely* to screen readers (`aria-live="polite"`), and
+  each bar is a real `progressbar` with its numbers.
+
+**Alternatives rejected:**
+- *Server-sent events or WebSockets*: a push channel for a number that changes a few times
+  a minute, with reconnection logic to write and test. Five-second polling of a cheap
+  `COUNT ... GROUP BY` is simpler and fast enough.
+- *A spinner until done*: hides exactly the information that makes the wait bearable.
+
+**Talking point:** "Progress is polled every five seconds, paused when the tab is hidden,
+and the ETA is deliberately vague - 'about six hours' - because worker count changes and a
+precise countdown that jumps around reads as broken. The most important element on the page
+is the button that says 'see your report so far'."
+
+**Where:** `web/src/app/players/[username]/progress/Progress.tsx`.
+
+---
+
 ## 2026-11-06 - Bug: the page said 1,210 games analyzed, and the tile under it said 1,211 `DONE`
 
 > **In plain English:** On the bullet page, a note at the top said "1,210 games analyzed" and
