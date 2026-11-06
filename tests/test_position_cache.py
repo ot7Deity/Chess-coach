@@ -120,11 +120,12 @@ def cache(make_cache) -> PositionCache:
 
 @pytest.fixture
 def pg_selects(clean_engine: Engine) -> Iterator[list[str]]:
-    """Every SELECT against `positions`, to count round trips."""
+    """Every SELECT that reads the positions table's rows, to count round trips.
+    The epoch lookup (`FROM pg_class`) is counted separately by `epoch_reads`."""
     seen: list[str] = []
 
     def listener(conn, cursor, statement, params, context, executemany):
-        if statement.lstrip().upper().startswith("SELECT") and "positions" in statement:
+        if statement.lstrip().upper().startswith("SELECT") and "FROM positions" in statement:
             seen.append(statement)
 
     event.listen(clean_engine, "before_cursor_execute", listener)
@@ -132,8 +133,37 @@ def pg_selects(clean_engine: Engine) -> Iterator[list[str]]:
     event.remove(clean_engine, "before_cursor_execute", listener)
 
 
+@pytest.fixture
+def epoch_reads(clean_engine: Engine) -> Iterator[list[str]]:
+    seen: list[str] = []
+
+    def listener(conn, cursor, statement, params, context, executemany):
+        if "relfilenode" in statement:
+            seen.append(statement)
+
+    event.listen(clean_engine, "before_cursor_execute", listener)
+    yield seen
+    event.remove(clean_engine, "before_cursor_execute", listener)
+
+
+_KEY_ENGINE: dict[str, Engine] = {}
+
+
+@pytest.fixture(autouse=True)
+def _engine_for_rkey(clean_engine: Engine) -> None:
+    _KEY_ENGINE["engine"] = clean_engine
+
+
 def rkey(redis_client, key: bytes, engine: str = ENGINE, depth: int = DEPTH) -> str:
-    return redis_key(redis_client.key_prefix, key, engine, depth)
+    """Where the cache keeps this entry right now, worked out independently of
+    the cache: <prefix><database>:<positions relfilenode>:<engine>:<depth>:<hex>."""
+    db_engine = _KEY_ENGINE["engine"]
+    with db_engine.connect() as conn:
+        epoch = conn.execute(
+            text("SELECT relfilenode FROM pg_class WHERE oid = 'positions'::regclass")
+        ).scalar_one()
+    namespace = f"{redis_client.key_prefix}{db_engine.url.database}:{epoch}:"
+    return redis_key(namespace, key, engine, depth)
 
 
 def pg_row(engine: Engine, key: bytes, depth: int = DEPTH):
@@ -377,6 +407,74 @@ def test_a_key_of_the_wrong_redis_type_is_a_miss(cache, redis_client):
     assert decode(redis_client.get(name), ENGINE, DEPTH) == EVAL  # SET replaced it
 
 
+# --- Redis never outlives Postgres ----------------------------------------------------
+
+
+def test_after_truncate_redis_no_longer_answers(cache, clean_engine):
+    """The reviewer's case: Redis kept serving an evaluation Postgres no longer
+    had, so the worker never wrote the row back. TRUNCATE gives the table a new
+    relfilenode, which is part of the Redis namespace."""
+    key, fen = position("c4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    with clean_engine.begin() as conn:
+        conn.execute(text("TRUNCATE positions"))
+
+    assert cache.get(key, ENGINE, DEPTH) is None
+    cache.put(key, fen, ENGINE, DEPTH, OTHER)  # the worker recomputes and writes
+    assert pg_row(clean_engine, key).eval_cp == OTHER.eval_cp
+    assert cache.get(key, ENGINE, DEPTH) == OTHER  # not the pre-truncate EVAL
+
+
+def test_a_hit_is_always_backed_by_a_postgres_row(cache, clean_engine):
+    key, fen = position("c4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    with clean_engine.begin() as conn:
+        conn.execute(text("TRUNCATE positions"))
+    hit = cache.get(key, ENGINE, DEPTH)
+    with clean_engine.connect() as conn:
+        rows = conn.execute(text("SELECT count(*) FROM positions")).scalar_one()
+    assert hit is None or rows == 1
+
+
+def test_the_namespace_names_the_database(cache, clean_engine, redis_client):
+    """Two databases sharing one Redis db under the default prefix (a test DB
+    and a dev DB, say) must not answer from each other's entries."""
+    key, _ = position("e4")
+    name = cache.redis_name(key, ENGINE, DEPTH)
+    assert name.startswith(f"{redis_client.key_prefix}{clean_engine.url.database}:")
+    assert name == rkey(redis_client, key)
+
+
+def test_purge_also_reclaims_entries_from_old_epochs(cache, clean_engine, redis_client):
+    key, fen = position("e4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    with clean_engine.begin() as conn:
+        conn.execute(text("TRUNCATE positions"))
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)  # same key, new epoch
+    assert len(list(redis_client.scan_iter(match=redis_client.key_prefix + "*"))) == 2
+    assert cache.purge_redis() == 2
+
+
+def test_postgres_only_mode_never_reads_the_epoch(make_cache, epoch_reads):
+    cache = make_cache(None)
+    key, fen = position("e4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    cache.get(key, ENGINE, DEPTH)
+    assert epoch_reads == []
+
+
+def test_with_the_breaker_open_the_epoch_is_not_read(make_cache, redis_client, epoch_reads):
+    switch = CountingRedis(redis_client)
+    cache = make_cache(switch, clock=FakeClock())
+    key, fen = position("e4")
+    switch.down = True
+    cache.get(key, ENGINE, DEPTH)  # trips the breaker
+    epoch_reads.clear()
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    cache.get(key, ENGINE, DEPTH)
+    assert epoch_reads == []
+
+
 # --- Redis unavailable -----------------------------------------------------------
 
 
@@ -467,8 +565,8 @@ def test_an_unreachable_redis_server_is_survivable(make_cache):
 # --- batches ---------------------------------------------------------------------
 
 
-def test_get_many_is_three_round_trips_for_a_whole_game(
-    make_cache, redis_client, clean_engine, pg_selects
+def test_get_many_is_four_round_trips_for_a_whole_game(
+    make_cache, redis_client, clean_engine, pg_selects, epoch_reads
 ):
     positions = opening_positions(60)
     counting = CountingRedis(redis_client)
@@ -482,24 +580,28 @@ def test_get_many_is_three_round_trips_for_a_whole_game(
 
     counting.pipelines = 0
     pg_selects.clear()
+    epoch_reads.clear()
     keys = [k for k, _ in positions]
     found = cache.get_many(keys + keys[:5], ENGINE, DEPTH)  # with repeats
 
     assert set(found) == set(keys[:40])
+    assert len(epoch_reads) == 1  # the table's epoch, once for the batch
     assert counting.pipelines == 2  # one read, one backfill
-    assert len(pg_selects) == 1
+    assert len(pg_selects) == 1  # the rows Redis lacked
     stats = cache.stats
     assert (stats.redis_hits, stats.postgres_hits, stats.misses) == (20, 20, 20)
     assert stats.lookups == 60  # repeats inside a batch count once
 
 
-def test_get_many_with_everything_in_redis_never_touches_postgres(cache, pg_selects):
+def test_get_many_with_everything_in_redis_reads_only_the_epoch(cache, pg_selects, epoch_reads):
     positions = opening_positions(10)
     for key, fen in positions:
         cache.put(key, fen, ENGINE, DEPTH, EVAL)
     pg_selects.clear()
+    epoch_reads.clear()
     assert len(cache.get_many([k for k, _ in positions], ENGINE, DEPTH)) == 10
     assert pg_selects == []
+    assert len(epoch_reads) == 1
 
 
 def test_a_huge_batch_is_chunked_rather_than_one_giant_in_list(make_cache, pg_selects):

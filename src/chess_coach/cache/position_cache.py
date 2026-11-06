@@ -8,6 +8,17 @@ Implements `chess_coach.positions.EvalCache`. The rules it keeps:
   copied) - never by holding a different one. A missing entry costs one
   Postgres read, after which it is backfilled.
 
+* **Redis entries belong to one database and one generation of its table.**
+  The Redis namespace is `<prefix><database>:<epoch>:`, where the epoch is the
+  `positions` table's `relfilenode`. Postgres gives the table a new one on
+  `TRUNCATE`, on drop-and-recreate and on a dump restore, so everything Redis
+  copied from the old table becomes unreachable at once - otherwise Redis
+  would keep serving evaluations Postgres no longer has, and the worker,
+  seeing a hit, would never write the row back. The epoch is read once per
+  batch (one catalog query). Two databases sharing a Redis db no longer see
+  each other's entries. Deleting rows with `DELETE` keeps the epoch, so do it
+  together with `purge_redis()`.
+
 * **The first write wins, and only the winner writes Redis.** `INSERT ... ON
   CONFLICT DO NOTHING RETURNING` tells the writer whether it won. At a fixed
   depth Stockfish is reproducible only from the same state (measured: with a
@@ -53,7 +64,7 @@ from dataclasses import asdict, dataclass
 
 import chess
 import redis
-from sqlalchemy import Engine, select
+from sqlalchemy import Connection, Engine, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from chess_coach import metrics
@@ -73,10 +84,13 @@ _PG_CHUNK = 1000  # keys per `fen_hash IN (...)` query
 # What an unreachable or misbehaving Redis raises. redis-py wraps socket errors
 # in ConnectionError / TimeoutError; OSError is caught too in case one escapes.
 _REDIS_ERRORS = (redis.RedisError, OSError)
+# The positions table's current storage file. Changes on TRUNCATE, re-creation
+# and restore; not on INSERT, UPDATE or DELETE.
+_EPOCH = text("SELECT relfilenode FROM pg_class WHERE oid = 'positions'::regclass")
 
 
 def redis_key(prefix: str, key: bytes, engine_version: str, depth: int) -> str:
-    """`<prefix><engine_version>:<depth>:<sha256 hex>`.
+    """`<prefix><engine_version>:<depth>:<sha256 hex>`, prefix being the namespace.
 
     Unambiguous even if an engine version contains ':' - the hash is fixed
     length and the depth is digits only, so the key parses from the right.
@@ -175,6 +189,8 @@ class PositionCache:
         self._engine = engine
         self._redis = redis_client
         self._prefix = key_prefix
+        # Every key of this database, whatever the epoch: what purge_redis clears.
+        self._db_prefix = f"{key_prefix}{engine.url.database or 'default'}:"
         self._ttl = ttl_sec or None
         self._retry_sec = redis_retry_sec
         self._clock = clock
@@ -213,8 +229,13 @@ class PositionCache:
             .returning(Position.fen_hash)
         )
         stored = None
+        namespace = None
         with self._engine.begin() as conn:
             inserted = conn.execute(stmt).first() is not None
+            if inserted and self._redis_usable():
+                # Read in the transaction that inserted the row, so the copy
+                # lands in the namespace of the table generation that has it.
+                namespace = self._namespace(conn)
             if not inserted:
                 # A separate statement, so under READ COMMITTED it sees the
                 # winning row even if that committed after the INSERT began.
@@ -232,8 +253,8 @@ class PositionCache:
                 self._stats.writes_inserted += 1
             else:
                 self._stats.writes_existing += 1
-        if inserted:
-            self._redis_set({key: evaluation}, engine_version, depth)
+        if namespace is not None:
+            self._redis_set({key: evaluation}, engine_version, depth, namespace)
         elif stored is not None:
             self._check_agreement(stored, fen, engine_version, depth, evaluation)
 
@@ -273,10 +294,10 @@ class PositionCache:
         """Look up a whole game's positions at once.
 
         The worker replays the PGN before evaluating anything, so it knows every
-        position up front. At most three round trips however many keys: one
-        pipelined Redis read, one Postgres query for what Redis lacked, one
-        pipelined Redis backfill. Returns only the hits; a key absent from the
-        result is a miss.
+        position up front. At most four round trips however many keys: the
+        table's epoch, one pipelined Redis read, one Postgres query for what
+        Redis lacked, one pipelined Redis backfill. Returns only the hits; a key
+        absent from the result is a miss.
         """
         _check_search(engine_version, depth)
         unique = list(dict.fromkeys(keys))
@@ -285,13 +306,19 @@ class PositionCache:
         if not unique:
             return {}
 
-        found = self._redis_get(unique, engine_version, depth) if self._redis_usable() else {}
+        namespace = None
+        found: dict[bytes, Evaluation] = {}
+        if self._redis_usable():
+            with self._engine.connect() as conn:
+                namespace = self._namespace(conn)
+            found = self._redis_get(unique, engine_version, depth, namespace)
         from_redis = list(found.values())
 
         missing = [k for k in unique if k not in found]
         from_postgres = self._postgres_get(missing, engine_version, depth) if missing else {}
         if from_postgres:
-            self._redis_set(from_postgres, engine_version, depth)
+            if namespace is not None:
+                self._redis_set(from_postgres, engine_version, depth, namespace)
             found.update(from_postgres)
 
         self._record(from_redis, list(from_postgres.values()), len(missing) - len(from_postgres))
@@ -300,24 +327,28 @@ class PositionCache:
     # --- maintenance ----------------------------------------------------------
 
     def purge_redis(self, engine_version: str | None = None, depth: int | None = None) -> int:
-        """Delete Redis entries under this cache's prefix; Postgres is untouched.
+        """Delete this database's Redis entries, every epoch; Postgres is untouched.
 
-        The one case where Redis could outlive Postgres is someone deleting
-        `positions` rows by hand (say, throwing away a bad engine build's
-        evaluations). Do this alongside such a delete. Returns keys deleted.
+        A `TRUNCATE` needs no purge (it changes the epoch), but deleting
+        `positions` rows with `DELETE` - say, throwing away a bad engine build's
+        evaluations - keeps the epoch, so do this alongside it. Old epochs'
+        entries are unreachable anyway and expire; this reclaims their memory.
+        Returns keys deleted.
         """
         if self._redis is None:
             return 0
         if depth is not None and engine_version is None:
             raise ValueError("purging by depth needs an engine_version too")
 
-        match = _glob_escape(self._prefix) + "*"
+        match = _glob_escape(self._db_prefix) + "*"
         deleted = 0
         batch: list[str | bytes] = []
         for raw in self._redis.scan_iter(match=match, count=1000):
             name = raw.decode() if isinstance(raw, bytes) else raw
             if engine_version is not None:
-                parts = name[len(self._prefix) :].rsplit(":", 2)
+                # <epoch>:<engine_version>:<depth>:<hex>; the epoch is digits.
+                _, _, rest = name[len(self._db_prefix) :].partition(":")
+                parts = rest.rsplit(":", 2)
                 if len(parts) != 3 or parts[0] != engine_version:
                     continue
                 if depth is not None and parts[1] != str(depth):
@@ -343,8 +374,14 @@ class PositionCache:
 
     # --- layers -----------------------------------------------------------------
 
-    def _rkey(self, key: bytes, engine_version: str, depth: int) -> str:
-        return redis_key(self._prefix, key, engine_version, depth)
+    def redis_name(self, key: bytes, engine_version: str, depth: int) -> str:
+        """The Redis key this entry has right now (reads the current epoch)."""
+        with self._engine.connect() as conn:
+            return redis_key(self._namespace(conn), key, engine_version, depth)
+
+    def _namespace(self, conn: Connection) -> str:
+        epoch = conn.execute(_EPOCH).scalar_one()
+        return f"{self._db_prefix}{epoch}:"
 
     def _postgres_get(
         self, keys: Sequence[bytes], engine_version: str, depth: int
@@ -377,10 +414,10 @@ class PositionCache:
         return out
 
     def _redis_get(
-        self, keys: Sequence[bytes], engine_version: str, depth: int
+        self, keys: Sequence[bytes], engine_version: str, depth: int, namespace: str
     ) -> dict[bytes, Evaluation]:
         assert self._redis is not None
-        names = [self._rkey(k, engine_version, depth) for k in keys]
+        names = [redis_key(namespace, k, engine_version, depth) for k in keys]
         pipe = self._redis.pipeline(transaction=False)
         for name in names:
             if self._ttl:
@@ -413,14 +450,16 @@ class PositionCache:
             log.warning("cache.corrupt_values", count=len(bad), first=bad[0])
         return out
 
-    def _redis_set(self, items: dict[bytes, Evaluation], engine_version: str, depth: int) -> None:
+    def _redis_set(
+        self, items: dict[bytes, Evaluation], engine_version: str, depth: int, namespace: str
+    ) -> None:
         if not items or not self._redis_usable():
             return
         assert self._redis is not None
         pipe = self._redis.pipeline(transaction=False)
         for key, evaluation in items.items():
             pipe.set(
-                self._rkey(key, engine_version, depth),
+                redis_key(namespace, key, engine_version, depth),
                 encode(engine_version, depth, evaluation),
                 ex=self._ttl,
             )
