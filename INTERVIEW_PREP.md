@@ -49,6 +49,84 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-06 - The benchmark said "no cache" had a 100% cache hit rate `DONE`
+
+> **In plain English:** One way to show the cache is worth having is to run the same work with
+> the cache switched off and compare. When I tested that, the benchmark reported that the
+> switched-off cache answered **every** question - a perfect score for something that wasn't
+> there. It worked out "how often did we skip the engine" by counting how many new answers got
+> saved. With the cache off, nothing gets saved, and "nothing new saved" looks exactly like
+> "we never needed the engine". Like judging how much homework someone did by how many pages
+> they handed in, when they weren't allowed to hand anything in.
+
+**A bit deeper:** The harness measures from the database. It counts engine evaluations as
+*new rows in `positions`* during the round, and computes hit rate = 1 - evaluations /
+lookups. That is an *indirect measurement*, and it silently assumes every evaluation gets
+stored. `POSITION_CACHE=off` (`NullCache`) breaks that assumption: real engine work, zero rows.
+
+**Symptom:** A test I wrote for the no-cache run failed with `assert 1.0 is None`: a 100% hit
+rate where the truth is 0%.
+
+**How I found it:** Writing a test for the "without cache" configuration on purpose, because
+it's the baseline the engine-seconds-saved number is compared against and had never been run.
+The first version of the test only checked the round finished; adding "and the hit rate is
+not nonsense" caught it.
+
+**Root cause:** Treating "no rows" as "no work". Absence of evidence was read as evidence of
+absence.
+
+**Fix:** `measure()` only reports a hit rate when the round stored its evaluations under one
+identifiable (engine version, depth). Otherwise the hit rate is `None`, shown as `-` in the
+table: unknown, which is honest, instead of 100%, which is the opposite of the truth. For the
+no-cache baseline the right source is the workers' own `chess_coach_positions_evaluated_total`
+counter, once metrics are wired into the real worker.
+
+**Lesson:** An indirect measurement carries the assumptions of the thing it reads from. Test
+every configuration a number will be reported for, especially the baseline: every comparison
+is made against it. Here, "no cache: 100% hit rate" next to "with cache: 60%" would have made
+the cache look worse than nothing.
+
+**Where:** `bench/harness.py::measure`,
+`tests/test_bench_end_to_end.py::test_the_no_cache_baseline_runs_too`.
+
+---
+
+## 2026-11-06 - My "time saved" sum compared two different sets of positions `DONE`
+
+> **In plain English:** The benchmark reports how much engine time the cache saved: "what it
+> would have cost with no saved answers" minus "what it actually cost". My first version took
+> the first number from one list of positions and the second number from a slightly bigger
+> list - like working out your savings by comparing the price of the groceries on your list
+> with what you paid for everything in the bag, including the snacks you added at the till.
+> The answer always came out a bit too small.
+
+**A bit deeper:** The worker evaluates the position before every move *plus* the final
+position of each game. The "no cache" cost was summed from the `moves` table, which has one
+row per move and so never includes the final position. The "actually spent" cost was summed
+from every `positions` row computed during the run, which does include it. Subtracting
+across two different populations biases the result.
+
+**Symptom:** None yet - caught before the first run, while writing the test's expected
+values by hand from the PGNs.
+
+**How I found it:** To assert an exact number I had to say exactly which positions each side
+covered, and the two sides didn't match.
+
+**Root cause:** A difference of two sums whose ranges weren't the same set.
+
+**Fix:** Both sides now cover only positions some move refers to; final positions are left
+out of both (documented as a slight undercount). The end-to-end test asserts the saved seconds
+exactly: (plies - distinct ply positions) x engine milliseconds per evaluation.
+
+**Lesson:** Writing the expected value by hand, from first principles, is a design review of
+the formula. If you can't say exactly what an assertion should equal, the code doesn't know
+either.
+
+**Where:** `bench/harness.py::measure`,
+`tests/test_bench_end_to_end.py::test_a_two_round_benchmark_measures_the_workload_exactly`.
+
+---
+
 ## 2026-11-06 - The scaling benchmark measures from the database, not from the workers `DONE`
 
 > **In plain English:** To find out how much faster eight workers are than one, I built a

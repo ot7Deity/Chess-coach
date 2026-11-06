@@ -23,7 +23,9 @@ Each round:
    * plies/second: `moves` rows written / the same window;
    * engine evaluations: `positions` rows computed since the round started;
    * cache hit rate: 1 - engine evaluations / lookups, where lookups = plies +
-     one final position per game;
+     one final position per game. Reported only when the round stored its
+     evaluations under one (engine version, depth); with POSITION_CACHE=off
+     nothing is stored and the hit rate is unknown ("-"), not 100%;
    * engine seconds spent: sum of those new rows' `compute_ms`;
    * engine seconds saved: sum of `compute_ms` over every ply's position (what
      the plies would have cost with no cache) minus what this round spent on
