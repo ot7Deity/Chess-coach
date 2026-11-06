@@ -295,6 +295,12 @@ def measure(
 
     wall = (last_done - started).total_seconds() if last_done is not None else None
     lookups = plies + games_done
+    # The hit rate is "1 - evaluations / lookups" with evaluations counted as
+    # new positions rows - which only works if the round's evaluations were
+    # stored. With no cache (POSITION_CACHE=off) nothing is stored, and 0 rows
+    # would read as a 100% hit rate. So no identifiable search this round (no
+    # new rows, or a mix of engines/depths) means no hit rate: unknown, not 1.
+    hit_rate = 1 - evals / lookups if lookups and search is not None else None
     return RoundResult(
         workers=n,
         games_target=len(game_ids),
@@ -305,7 +311,7 @@ def measure(
         plies_per_second=plies / wall if wall else None,
         lookups=lookups,
         engine_evaluations=evals,
-        cache_hit_rate=1 - evals / lookups if lookups else None,
+        cache_hit_rate=hit_rate,
         engine_seconds_spent=spent_ms / 1000,
         engine_seconds_without_cache=without_ms / 1000,
         engine_seconds_saved=max(0, without_ms - spent_on_plies_ms) / 1000,
