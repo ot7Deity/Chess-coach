@@ -29,7 +29,7 @@ FAKE_WORKER = [
     "bench.fake_worker",
     "--worker-id",
     "{worker_id}",
-    "--exit-when-empty",
+    "--until-empty",
     "--ms-per-eval",
     str(MS),
 ]
