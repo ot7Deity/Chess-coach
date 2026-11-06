@@ -49,6 +49,111 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-05 - The test clean-up deleted nothing, because of square brackets `DONE`
+
+> **In plain English:** Every test that uses Redis gets its own private label for the data it
+> creates, so that afterwards it can sweep up exactly its own mess and nobody else's. The
+> sweeping used a "find everything starting with my label" search. But some of my tests have
+> names with square brackets in them, and in that kind of search square brackets are a special
+> symbol, not ordinary letters. So the search found nothing, the sweep deleted nothing, and
+> every run left junk behind. Nothing failed - I only noticed because I went and looked.
+
+**A bit deeper:** Redis's `SCAN MATCH` takes a *glob pattern*, where `*`, `?` and `[...]` are
+wildcards. pytest names a *parametrized* test (one test run with several inputs) like
+`test_x[sf_18-12]`, and the shared test fixture builds each test's key prefix from that name.
+In a glob, `[sf_18-12]` means "one character from this set", so `prefix*` no longer matches
+the prefix itself.
+
+**Symptom:** None in the test results. After a green run, Redis database 3 held 24 keys
+starting `test:test_another_engine_or_depth_is_a_miss_in_both_layers[...]`.
+
+**How I found it:** Reviewing my diff, I checked that my own `purge_redis` escaped glob
+characters - and then asked whether the shared fixture's cleanup did. It didn't. Then I
+counted the keys to confirm.
+
+**Root cause:** `tests/conftest.py::redis_client` cleans up with `scan_iter(match=prefix +
+"*")`, prefix unescaped, prefix containing the test name.
+
+**Fix:** `conftest.py` is shared, not mine to change, so my test module has an autouse fixture
+that swaps in a prefix with the glob characters replaced and cleans that up itself. After the
+fix: 0 keys left after a full run. The one-line fix for `conftest.py` (escape the prefix, or
+build it from a hash of the node id) is reported to the owner. I deleted the 24 leaked keys
+by name in my own database - never `FLUSHDB`, which would hit other agents' keys.
+
+**Lesson:** Clean-up code needs a test too; "the test passed" says nothing about what it left
+behind. And any string that goes into a pattern language - glob, regex, SQL `LIKE` - has to be
+escaped, including ones you built yourself from "safe" names.
+
+**Where:** `tests/test_position_cache.py::glob_safe_prefix`;
+`src/chess_coach/cache/position_cache.py::_glob_escape` (the same bug, avoided in
+`purge_redis`).
+
+---
+
+## 2026-11-05 - Redis in front of Postgres, and Redis may only ever copy Postgres `DONE`
+
+> **In plain English:** The main database is reliable but each question to it takes a moment.
+> Redis is a much faster store that keeps everything in memory, so the most-used answers are
+> kept there too, like keeping the books you use every day on your desk instead of walking to
+> the library shelf. The important rule: the desk copy is only ever a photocopy of what is on
+> the shelf. Answers go on the shelf first, and only the person whose answer actually got
+> shelved may put a copy on the desk. So the desk can be missing a book, but it can never have
+> a *different* book from the shelf. And books you have not opened in a week get cleared off
+> the desk, while the ones you use every day stay.
+
+**A bit deeper:** Redis is the *hot layer* of a two-level cache; Postgres is the *source of
+truth*. Reads try Redis, then Postgres, and copy a Postgres hit back into Redis (*backfill*).
+Writes go to Postgres first; only the writer whose insert won copies its value to Redis. Each
+Redis entry has a *TTL* (time to live) that is reset whenever the entry is read, a *sliding
+expiry*, so frequently used entries stay and one-off ones age out.
+
+**What changed:** `PositionCache` now takes an optional Redis client. `get_many` pipelines the
+Redis reads, sends what Redis lacked to Postgres in one query, and pipelines the backfill.
+`build_eval_cache()` picks the configuration from `POSITION_CACHE` (`full` / `postgres` /
+`off`). New settings in their own block in `config.py` and `.env.example`.
+
+**Why the details are the way they are:**
+- *Postgres first, and only the winner writes Redis.* Two workers can compute different scores
+  for one position (measured: warm-hash Stockfish moved 10/10 scores by a few centipawns). If
+  both wrote Redis, Redis could end up with the loser's value while Postgres kept the winner's.
+  Writing Redis first has the same flaw. With this order, every value Redis has ever held is
+  one Postgres committed, so the two can disagree only by Redis *missing* an entry - and a
+  missing entry costs one Postgres read.
+- *Sliding TTL via `GETEX`.* Opening positions recur across thousands of games; most
+  middlegame positions occur once. Refreshing the TTL on read keeps the first kind and lets the
+  second expire, so Redis holds the working set rather than the history. `GETEX` reads and
+  refreshes in one command, so it costs no extra round trip. Default 7 days; `0` disables.
+- *Keys:* `<prefix><engine_version>:<depth>:<sha256 hex>`. Hex so they are readable in
+  `redis-cli`; a versioned prefix (`chess_coach:pos:v1:`) so the whole Redis copy can be
+  orphaned at once without touching Postgres.
+- *A bad Redis value is a miss.* Undecodable, wrong type, or for a different search: counted,
+  logged, and overwritten by the backfill.
+- *Three round trips per game, not 160.* Measured by counting pipelines and SQL statements in
+  a test: a 60-position batch with 20 in Redis, 20 only in Postgres and 20 new is exactly two
+  Redis pipelines and one `SELECT`.
+- *`purge_redis()`.* The one way Redis could outlive Postgres is someone deleting `positions`
+  rows by hand; this deletes the matching Redis entries, scoped by engine and depth.
+
+**Alternatives rejected:**
+- *Redis only*: Redis is memory, so a restart or eviction would throw away hours of engine
+  time. Postgres keeps every evaluation forever, which the reports need anyway.
+- *Postgres only*: kept as a configuration (`POSITION_CACHE=postgres`) precisely so the
+  benchmark can measure what Redis adds, rather than assuming it.
+- *No TTL, rely on Redis eviction*: the local Redis runs with `maxmemory 0` and `noeviction`
+  (checked with `CONFIG GET`), so without a TTL it would grow forever.
+- *Write-through to Redis on every put, winner or not*: the disagreement bug above.
+
+**Talking point:** "The rule I designed around is that Redis may only ever hold a copy of
+something Postgres has committed. Writes go to Postgres first with `ON CONFLICT DO NOTHING
+RETURNING`, and only the writer that actually won copies to Redis. That means Redis can be
+missing an entry, which costs one database read, but it can never hold a different answer
+from the database - so I never have to decide which one is right."
+
+**Where:** `src/chess_coach/cache/position_cache.py`, `src/chess_coach/cache/__init__.py`,
+`tests/test_position_cache.py`.
+
+---
+
 ## 2026-11-05 - My decoder was stricter than my encoder `DONE`
 
 > **In plain English:** Saved answers go into the fast store in a compact written form, and a
