@@ -149,11 +149,17 @@ class ChessComClient:
                 etag=resp.headers.get("etag", etag),
                 last_modified=resp.headers.get("last-modified"),
             )
+        body = resp.json()
+        games = body.get("games") if isinstance(body, dict) else None
+        if not isinstance(games, list):
+            # Never read a malformed 200 as "no games": a finished month would
+            # be frozen empty and never fetched again.
+            raise ChessComError(f"month {month} for {username}: response has no 'games' list")
         return MonthResponse(
             not_modified=False,
             etag=resp.headers.get("etag"),
             last_modified=resp.headers.get("last-modified"),
-            games=resp.json().get("games", []),
+            games=games,
         )
 
     # --- transport ----------------------------------------------------------
