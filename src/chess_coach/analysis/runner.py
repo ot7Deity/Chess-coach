@@ -18,15 +18,11 @@ is seconds to minutes of engine time:
 
 from __future__ import annotations
 
-import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, field
 
 import chess
 from sqlalchemy import Engine, func, select, update
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from chess_coach import queue
@@ -34,14 +30,13 @@ from chess_coach.analysis.game import BadGame, MoveRow, analyze_game
 from chess_coach.analysis.jobs import JOB_TYPE
 from chess_coach.config import Settings
 from chess_coach.engine import StockfishEngine
+from chess_coach.jobrunner import JobRunner
 from chess_coach.logging import get_logger
 from chess_coach.models import Game, Move
 from chess_coach.positions import EvalCache, Evaluation, NullCache, fen_hash, normalize_fen
-from chess_coach.queue import Lease, LeaseLost
+from chess_coach.queue import Lease
 
 log = get_logger(__name__)
-
-_TYPES = [JOB_TYPE]
 
 
 class CachedEvaluator:
@@ -67,28 +62,11 @@ class CachedEvaluator:
         return evaluation
 
 
-@dataclass
-class _Heartbeat:
-    """Renews the lease from inside the analysis loop, at most every `interval`."""
+class Worker(JobRunner):
+    """Analyses `analyze-game` jobs with one Stockfish."""
 
-    db: Engine
-    lease: Lease
-    interval: float
-    clock: Callable[[], float] = time.monotonic
-    last: float = field(default=0.0)
+    job_types = (JOB_TYPE,)
 
-    def __post_init__(self) -> None:
-        self.last = self.clock()
-
-    def __call__(self) -> None:
-        if self.clock() - self.last < self.interval:
-            return
-        with Session(self.db) as session, session.begin():
-            queue.heartbeat(session, self.lease)
-        self.last = self.clock()
-
-
-class Worker:
     def __init__(
         self,
         db: Engine,
@@ -107,122 +85,45 @@ class Worker:
                 f"ENGINE_TIMEOUT_SEC ({settings.engine_timeout_sec}) must be under two thirds "
                 f"of JOB_LOCK_TIMEOUT_SEC ({settings.job_lock_timeout_sec})"
             )
-        if len(worker_id) > 64:
-            raise ValueError("worker id must fit jobs.locked_by (64 characters)")
-        self.db = db
+        super().__init__(db, worker_id=worker_id, settings=settings)
         self.engine = engine
-        self.worker_id = worker_id
-        self.settings = settings
         self.evaluate = CachedEvaluator(engine, cache)
-        self.heartbeat_interval = settings.job_lock_timeout_sec / 3
 
-    # --- loop ---------------------------------------------------------------
-
-    def run(
-        self,
-        *,
-        max_jobs: int | None = None,
-        until_empty: bool = False,
-        stop: threading.Event | None = None,
-    ) -> int:
-        """Process jobs until stopped; return how many were processed.
-
-        `until_empty` exits once no analysis job is pending or running - not
-        merely when none is claimable, because a job held by a dead worker is
-        still running until the reaper frees it, and somebody has to stay to
-        pick it up. `max_jobs` counts attempts, failed ones included.
-        """
-        stop = stop or threading.Event()
-        processed = 0
-        log.info(
-            "worker.start",
-            worker_id=self.worker_id,
-            engine=self.engine.version,
-            depth=self.engine.depth,
-        )
-        while not stop.is_set():
-            try:
-                self.reap()
-                lease = self._claim()
-                if lease is None:
-                    if until_empty and not self._unfinished():
-                        break
-                    stop.wait(self.settings.worker_poll_interval_sec)
-                    continue
-            except OperationalError as exc:
-                # The database is unreachable. Nothing is held that needs
-                # releasing - an in-flight job's lease simply lapses - so wait
-                # and try again rather than exit.
-                log.warning("worker.db_unavailable", error=str(exc).splitlines()[0])
-                stop.wait(self.settings.worker_poll_interval_sec)
-                continue
-            self.process(lease)
-            processed += 1
-            if max_jobs is not None and processed >= max_jobs:
-                break
-        log.info("worker.stop", worker_id=self.worker_id, processed=processed)
-        return processed
-
-    def _claim(self) -> Lease | None:
-        with Session(self.db) as session, session.begin():
-            return queue.claim(session, self.worker_id, _TYPES)
-
-    def _unfinished(self) -> bool:
-        with Session(self.db) as session:
-            return queue.has_unfinished(session, _TYPES)
-
-    def reap(self) -> list[queue.ReapedJob]:
-        """Free expired leases, and put their games' status back in step."""
-        with Session(self.db) as session, session.begin():
-            reaped = queue.reap_expired(session, self.settings.job_lock_timeout_sec)
-            for job in reaped:
-                if job.type != JOB_TYPE:
-                    continue
-                game_id = _game_id(job.payload)
-                if game_id is not None:
-                    _set_game_status(
-                        session, game_id, "error" if job.status == "dead" else "pending"
-                    )
-        for job in reaped:
-            log.warning("job.reaped", job_id=job.job_id, status=job.status)
-        return reaped
+    def describe(self) -> dict[str, object]:
+        return {"engine": self.engine.version, "depth": self.engine.depth}
 
     # --- one job ------------------------------------------------------------
 
-    def process(self, lease: Lease) -> None:
+    def handle(self, lease: Lease) -> None:
         game_id = _game_id(lease.payload)
+        if game_id is None:
+            raise BadGame(f"payload has no game id: {lease.payload!r}")
         bound = log.bind(job_id=lease.job_id, game_id=game_id, attempt=lease.attempt)
         started = time.monotonic()
-        try:
-            if game_id is None:
-                raise BadGame(f"payload has no game id: {lease.payload!r}")
-            game = self._start(lease, game_id)
-            if game is None:
-                bound.info("job.already_analysed")
-                return
-            rows = analyze_game(
-                game.pgn,
-                start_fen=game.start_fen,
-                player_color=game.color,
-                time_control=game.time_control,
-                evaluate=self.evaluate,
-                on_position=_Heartbeat(self.db, lease, self.heartbeat_interval),
-            )
-            self._finish(lease, game_id, rows)
-        except LeaseLost:
-            # Reaped while working - presumably by someone who thought we were
-            # dead. The job is theirs now; nothing was written.
-            bound.warning("job.lease_lost", seconds=round(time.monotonic() - started, 2))
+        game = self._start(lease, game_id)
+        if game is None:
+            bound.info("job.already_analysed")
             return
-        except BadGame as exc:
-            bound.error("job.bad_game", error=str(exc))
-            self._fail(lease, game_id, exc, permanent=True)
-            return
-        except Exception as exc:
-            bound.exception("job.error", error=f"{type(exc).__name__}: {exc}")
-            self._fail(lease, game_id, exc, permanent=False)
-            return
+        rows = analyze_game(
+            game.pgn,
+            start_fen=game.start_fen,
+            player_color=game.color,
+            time_control=game.time_control,
+            evaluate=self.evaluate,
+            on_position=self.heartbeat(lease),
+        )
+        self._finish(lease, game_id, rows)
         bound.info("job.done", plies=len(rows), seconds=round(time.monotonic() - started, 2))
+
+    def on_failed(self, session: Session, lease: Lease, status: str) -> None:
+        game_id = _game_id(lease.payload)
+        if game_id is not None:
+            _set_game_status(session, game_id, "pending" if status == "pending" else "error")
+
+    def on_reaped(self, session: Session, job: queue.ReapedJob) -> None:
+        game_id = _game_id(job.payload)
+        if game_id is not None:
+            _set_game_status(session, game_id, "error" if job.status == "dead" else "pending")
 
     def _start(self, lease: Lease, game_id: int):
         """Load the game and mark it running. None if there is nothing to do."""
@@ -257,33 +158,6 @@ class Worker:
                 .where(Game.id == game_id)
                 .values(analysis_status="complete", analyzed_at=func.now(), ply_count=len(rows))
             )
-
-    def _fail(
-        self, lease: Lease, game_id: int | None, exc: BaseException, *, permanent: bool
-    ) -> None:
-        delay = queue.retry_delay(
-            lease.attempt,
-            base_sec=self.settings.job_retry_base_sec,
-            cap_sec=self.settings.job_retry_cap_sec,
-        )
-        try:
-            with Session(self.db) as session, session.begin():
-                status = queue.fail(
-                    session,
-                    lease,
-                    f"{type(exc).__name__}: {exc}",
-                    retry_in_sec=delay,
-                    permanent=permanent,
-                )
-                if game_id is not None:
-                    _set_game_status(
-                        session, game_id, "pending" if status == "pending" else "error"
-                    )
-        except LeaseLost:
-            log.warning("job.lease_lost", job_id=lease.job_id, during="fail")
-        except OperationalError as exc2:
-            # The lease will lapse and the reaper will retry the job.
-            log.warning("job.fail_unrecorded", job_id=lease.job_id, error=str(exc2))
 
 
 def _game_id(payload: dict) -> int | None:
