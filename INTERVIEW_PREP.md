@@ -49,6 +49,66 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-06 - Measured: what one cache lookup costs, layer by layer `DONE`
+
+> **In plain English:** Before the real speed test, I timed the cache itself. Getting a saved
+> answer from Redis takes about half a thousandth of a second; from the main database, about
+> five times longer. The big win is asking for a whole game's positions at once instead of one
+> by one: **15 times faster** from Redis and **47 times faster** from the database - like
+> handing the librarian your whole list instead of walking back to the desk for each book.
+> And when Redis is switched off, the shortcut I built to skip it makes each lookup about
+> **90 times faster** than knocking on Redis's door every time.
+
+**A bit deeper:** A *microbenchmark* times one small operation in isolation, many times, and
+reports the *median* (the middle value, which ignores rare slow outliers). These are not
+throughput numbers - those come from the worker benchmark once the real worker exists - but
+they explain where a game's cache time goes, and they check two design decisions: the batch
+lookup and the circuit breaker.
+
+**Results** (`uv run python -m bench.cache_micro`; Windows 10 laptop, Postgres 17 and Redis 7.4
+in Docker Desktop on the same machine; medians):
+
+| Measurement | Median |
+| --- | ---: |
+| One `get` served by Redis | 0.53 ms |
+| One `get` served by Postgres (Redis-less cache) | 2.39 ms |
+| One `get` that misses both layers | 3.14 ms |
+| A game's 80 positions, 80 single `get`s, Redis | 46.2 ms |
+| A game's 80 positions, one `get_many`, Redis | 3.04 ms |
+| A game's 80 positions, 80 single `get`s, Postgres | 305.8 ms |
+| A game's 80 positions, one `get_many`, Postgres | 6.53 ms |
+| One `put` (Postgres insert + Redis copy) | 6.64 ms |
+| One `get` with Redis unreachable, breaker open | 5.90 ms |
+| One `get` with Redis unreachable, no breaker | 526 ms |
+| Redis memory per entry (benchmark's longer key and engine name) | 208 B |
+
+**What it shows:**
+- *Batching is the biggest single win:* 15x via Redis, 47x via Postgres, because a game's
+  lookups become one or two round trips instead of 80.
+- *Redis is worth ~3.5 ms per game over Postgres alone* when batched (3.0 vs 6.5 ms). That's
+  real but small next to a depth-16 Stockfish search, and it's why `POSITION_CACHE=postgres`
+  exists: the worker benchmark will show whether Redis matters at system level, instead of me
+  assuming it does.
+- *The breaker matters:* 526 ms without it is two 0.25 s timeouts per lookup (the read, then
+  the backfill write); with it, the lookup costs a Postgres read.
+- *208 bytes per entry* here versus 184 in my earlier spot check: this run's key and engine
+  name are longer (`bench:micro:<tag>:micro-<tag>:...`). The production key format is close to
+  the earlier one.
+
+**Caveats, stated plainly:** one laptop, Docker Desktop's virtual network (a Linux server would
+be faster for both layers), warm connection pools, no concurrent load. A `put` includes a
+commit, so it measures Postgres's write path, not the cache's logic.
+
+**Talking point:** "I microbenchmarked the cache before the system benchmark. Redis answers a
+lookup in about half a millisecond against two and a half for Postgres, but the much bigger
+lever was batching: a whole game's eighty lookups in one round trip is fifteen times faster
+from Redis and forty-seven times faster from Postgres. And the circuit breaker turns a Redis
+outage from half a second per lookup into the cost of a normal database read."
+
+**Where:** `bench/cache_micro.py`; results JSON in `bench/results/` (gitignored).
+
+---
+
 ## 2026-11-06 - I quoted a measurement from a script nobody else could run, and overstated it `DONE`
 
 > **In plain English:** Earlier I wrote that when the chess engine "remembers" its last
