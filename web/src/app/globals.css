@@ -1,0 +1,195 @@
+/*
+ * Design tokens. Every colour, size and duration in the app comes from here,
+ * so light/dark mode is one block each and nothing is themed by accident.
+ *
+ * Palette: neutral greys plus one accent (blue). Red appears only as the
+ * negative pole of a diverging chart (rating lost), never as decoration.
+ * Contrast was measured, not eyeballed: the "-ink" variants are the accent
+ * stepped darker/lighter until text on the page clears 4.5:1.
+ */
+
+:root {
+  color-scheme: light;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  /* surfaces */
+  --bg: #fbfbfd;
+  --surface: #ffffff;
+  --surface-sunken: #f2f2f5;
+  --separator: rgba(0, 0, 0, 0.08);
+  --separator-strong: rgba(0, 0, 0, 0.14);
+  --shadow-raised: 0 1px 2px rgba(0, 0, 0, 0.06), 0 4px 16px rgba(0, 0, 0, 0.04);
+
+  /* ink */
+  --text-primary: #1d1d1f;
+  --text-secondary: #6e6e73; /* 5.1:1 on surface */
+  --text-tertiary: #86868b; /* non-essential text only (axis ticks, captions) */
+
+  /* accent: marks use --accent, text and filled buttons use --accent-ink */
+  --accent: #2a78d6;
+  --accent-ink: #256abf; /* 5.4:1 on white, and white-on-it */
+  --accent-wash: rgba(42, 120, 214, 0.1);
+  --on-accent: #ffffff;
+
+  /* data: the two poles of a diverging scale, plus a de-emphasis grey */
+  --data-positive: #2a78d6;
+  --data-negative: #e34948;
+  --data-muted: #c7c7cc;
+  --chart-grid: #ececef;
+  --chart-baseline: #c7c7cc;
+
+  /* status (used with an icon and a label, never colour alone) */
+  --status-critical: #d03b3b;
+
+  /* shape */
+  --radius-s: 8px;
+  --radius-m: 14px;
+  --radius-l: 22px;
+  --radius-pill: 999px;
+
+  /* spacing (4px grid) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 72px;
+
+  /* type scale */
+  --text-xs: 12px;
+  --text-s: 14px;
+  --text-m: 17px;
+  --text-l: 21px;
+  --text-xl: 28px;
+  --text-2xl: 40px;
+  --text-hero: clamp(40px, 7vw, 64px);
+
+  /* motion: short and soft; disabled entirely under prefers-reduced-motion */
+  --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --dur-fast: 150ms;
+  --dur: 280ms;
+
+  --content-width: 980px;
+  --gutter: 16px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+
+    --bg: #000000;
+    --surface: #1c1c1e;
+    --surface-sunken: #2c2c2e;
+    --separator: rgba(255, 255, 255, 0.1);
+    --separator-strong: rgba(255, 255, 255, 0.18);
+    --shadow-raised: none;
+
+    --text-primary: #f5f5f7;
+    --text-secondary: #a1a1a6; /* 6.6:1 on surface */
+    --text-tertiary: #86868b;
+
+    --accent: #3987e5;
+    --accent-ink: #5598e7; /* 5.7:1 on surface */
+    --accent-wash: rgba(57, 135, 229, 0.16);
+    --on-accent: #ffffff;
+
+    --data-positive: #3987e5;
+    --data-negative: #e66767;
+    --data-muted: #48484a;
+    --chart-grid: #2c2c2e;
+    --chart-baseline: #48484a;
+
+    --status-critical: #e66767;
+  }
+}
+
+@media (min-width: 720px) {
+  :root {
+    --gutter: 32px;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--text-m);
+  line-height: 1.47;
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1,
+h2,
+h3 {
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+a {
+  color: var(--accent-ink);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 3px solid var(--accent-wash);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
