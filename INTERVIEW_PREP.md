@@ -228,6 +228,44 @@ fencing token for leases - resetting it would let a stale worker's old lease mat
 
 <!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
 
+## 2026-11-06 - My explanation was wrong, the code was right, and real data showed it `DONE`
+
+> **In plain English:** To work out how long a player spent on each move, my code takes
+> their clock before the move, subtracts their clock after it, and adds back the bonus
+> seconds the game gives per move. Next to that code I wrote an explanation: "the clock
+> doesn't run on your first move, so the first move always costs zero". The project's tester
+> checked my formula against every move of my 4,550 real games, and found the formula was
+> right - but my explanation was not. In most games the clock *is* running on the first move.
+> The formula never relied on that claim, so it gave the right answers anyway. I deleted the
+> wrong sentence. A wrong comment is a trap for the next person who reads it.
+
+**A bit deeper:** A *code comment* is a claim that no test checks. Mine claimed a fact about
+Chess.com's clocks that I had inferred from one synthetic example. The formula (previous
+reading - this reading + increment, with the base time as the "previous reading" for a
+player's first move) is correct whether or not the first move is free, so the false claim
+never caused a wrong number - which is exactly why nothing caught it.
+
+**Measured, by the tester, read-only over the 4,550 real games (254,553 plies):**
+- The formula produces **0** negative move times. Treating `%clk` as if it excluded the
+  increment would have produced **31,262** - so the readings really do include the increment.
+- White's first reading is already **below** the base time in **1,018 of 1,143** bullet games
+  without increment, so the first move is not free.
+
+**Fix:** the docstring in `analysis/clock.py` now states what was measured instead of the
+false claim, and a test comment that repeated it was corrected. No code changed.
+
+**Lesson:** I had tested the formula and explained it with a guess. Tests check behaviour;
+nothing checks prose. When a comment states a fact about someone else's system, it should
+be a fact somebody measured, and say so.
+
+**Talking point:** "A reviewer ran my move-time formula over a quarter of a million real moves.
+The formula was right - zero negative times, versus 31,000 if I'd misread the clock format -
+but the comment explaining it claimed the first move is free, and in 1,018 of 1,143 games it
+isn't. The code never depended on the claim, so nothing failed. I fixed the comment, and now
+the docstring cites the measurement instead of my guess."
+
+**Where:** `src/chess_coach/analysis/clock.py`, `tests/test_clock.py`.
+
 ## 2026-11-06 - Bug: with the cache switched off, engine time was recorded nowhere `DONE`
 
 > **In plain English:** One of the numbers this project exists to produce is "how much
