@@ -141,9 +141,11 @@ class Game(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
 
-    # The idempotency key. Ingestion upserts on this, so re-fetching a month -
-    # or crashing halfway through one - cannot duplicate games.
-    chesscom_uuid: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # Half of the idempotency key; the other half is player_id (see
+    # uq_games_player_uuid below). Ingestion upserts on the pair, so
+    # re-fetching a month - or crashing halfway through one - cannot duplicate
+    # games.
+    chesscom_uuid: Mapped[str] = mapped_column(String(64), nullable=False)
 
     player_id: Mapped[int] = mapped_column(
         ForeignKey("players.id", ondelete="CASCADE"), nullable=False
@@ -202,6 +204,13 @@ class Game(Base, TimestampMixin):
     moves: Mapped[list[Move]] = relationship(back_populates="game", cascade="all, delete-orphan")
 
     __table_args__ = (
+        # Unique per player, not globally. A row is a game *from one player's
+        # point of view* - its color, result and ratings are all relative - so
+        # when two tracked players meet, that one Chess.com game is two rows.
+        # With chesscom_uuid unique on its own, the second player's sync would
+        # collide with the first's and the game would silently be missing from
+        # their history. See INTERVIEW_PREP.md.
+        UniqueConstraint("player_id", "chesscom_uuid", name="uq_games_player_uuid"),
         _check("color", COLORS, "ck_games_color"),
         _check("result", RESULTS, "ck_games_result"),
         _check("time_class", TIME_CLASSES, "ck_games_time_class"),
