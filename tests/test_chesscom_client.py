@@ -192,3 +192,48 @@ def test_a_month_without_a_games_list_is_an_error_not_an_empty_month(body):
     )
     with pytest.raises(ChessComError):
         client.month("someone", "2026-08")
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_an_absurd_retry_after_fails_fast_instead_of_sleeping(status):
+    """Found by the reviewer: the cap used to clamp to 300 s and retry, so a
+    server asking for an hour kept a sync asleep for 25 minutes."""
+    limiter, sleeps = NoopLimiter(), []
+    client = ChessComClient(
+        user_agent="t",
+        limiter=limiter,
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(status, headers={"retry-after": "3600"})
+        ),
+        sleep=sleeps.append,
+    )
+    with pytest.raises(ChessComUnavailable, match="3600"):
+        client.archive_months("someone")
+    assert sleeps == []
+    assert client.requests_sent == 1
+    # Other workers still back off, by the cap rather than the full hour.
+    assert limiter.penalties == ([300.0] if status == 429 else [])
+
+
+def test_a_large_configured_backoff_cap_does_not_trip_the_retry_after_limit():
+    """The fail-fast applies to waits the *server* asks for, not our own backoff."""
+    sleeps: list[float] = []
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return (
+            httpx.Response(503) if len(calls) == 1 else httpx.Response(200, json={"archives": []})
+        )
+
+    client = ChessComClient(
+        user_agent="t",
+        limiter=NoopLimiter(),
+        transport=httpx.MockTransport(handler),
+        sleep=sleeps.append,
+        rng=lambda: 1.0,
+        backoff_base_sec=500.0,
+        backoff_cap_sec=1000.0,
+    )
+    assert client.archive_months("someone") == []
+    assert sleeps == [500.0]
