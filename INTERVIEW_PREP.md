@@ -49,6 +49,48 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-06 - The benchmark's default job type matched nothing `DONE`
+
+> **In plain English:** The benchmark puts a pile of jobs in the queue and then lets the
+> workers loose on it. I had to guess what the jobs should be labelled, because the team
+> building the workers hadn't decided yet. I guessed `analyze_game`, with an underscore. They
+> chose `analyze-game`, with a dash. One character. The workers would have looked at the
+> queue, seen nothing with their label, decided there was no work, and gone home - and the
+> benchmark would have reported "zero games finished" as if the system were broken. It's like
+> leaving a parcel for "Jon" when the person is "John": nobody picks it up, and nobody tells
+> you why.
+
+**A bit deeper:** The harness and the worker share an implicit *interface*: the `jobs.type`
+string the harness writes is the one the worker's claim query filters on. Nothing checks that
+the two agree - a mismatch isn't an error, just an empty query result. And because workers
+run with `--until-empty`, an empty result means "finished", so the failure looks like success
+that did nothing.
+
+**Symptom:** None in a run - caught before the first real one, when M2 answered my question
+about the job format.
+
+**How I found it:** I had flagged the format as an open question rather than treating my
+guess as settled, and M2's answer differed from the default by one character.
+
+**Root cause:** A default chosen before the owner of the format had decided it - a guess with
+the same standing in the code as a fact.
+
+**Fix:** The defaults are now M2's confirmed format: type `analyze-game`, payload
+`{"game_id": N}`, dedupe key `analyze-game:N`. The default worker command is M2's real CLI,
+`chess-coach-worker --worker-id {worker_id} --until-empty`, and the docs say not to add
+`--enqueue-pending`, which would enqueue every pending game and grow the workload mid-round.
+The fake worker uses the same type and flag. A test pins all of it, so a future change on
+either side fails loudly instead of producing an empty benchmark.
+
+**Lesson:** When two components meet at a string, the string is an interface - test it like
+one. And when you have to guess someone else's decision, write the guess down as a question
+for them, not just as a default in your code. Asking is what caught this.
+
+**Where:** `bench/harness.py` (defaults), `bench/throughput.py` (`DEFAULT_WORKER_CMD`),
+`bench/fake_worker.py`, `tests/test_bench_harness.py::test_job_defaults_match_the_format_m2_confirmed`.
+
+---
+
 ## 2026-11-06 - Measured: what one cache lookup costs, layer by layer `DONE`
 
 > **In plain English:** Before the real speed test, I timed the cache itself. Getting a saved
@@ -260,8 +302,10 @@ the next change.
   `{metrics_port}`), passed after `--` so Windows paths need no quoting. It defaults to
   `chess-coach-worker`; M2's exact flags plug in without changing the harness.
 - *Job format is configurable* (`--job-type`, `--job-payload`, `--dedupe-key`) because M2
-  owns it; the defaults are `analyze_game`, `{"game_id": N}` and `analyze-game:N` (the key
-  format `models.Job` documents), and the harness assumes nothing beyond them.
+  owns it; the defaults are M2's confirmed format - type `analyze-game`, payload
+  `{"game_id": N}`, dedupe key `analyze-game:N` - and the worker command defaults to M2's
+  `chess-coach-worker --worker-id {worker_id} --until-empty`. (The first default type was
+  wrong; see "The benchmark's default job type matched nothing".)
 - *A known bias, written down:* if two workers evaluate one position simultaneously only the
   winner's row exists, so the loser's engine time is invisible to SQL and the hit rate reads
   slightly high at large N. The workers' Prometheus counters count both and will be the
@@ -307,8 +351,9 @@ didn't.
 **Root cause:** Reading the model (`default=100`) as if it described the table.
 
 **Fix:** The harness's INSERT names every `NOT NULL` column. A schema change (adding server
-defaults) would be the other fix, but migrations belong to M2, so it's noted for them rather
-than done here.
+defaults) would be the other fix, but migrations belong to M2, so I reported it rather than
+doing it here. M2's migration `0003` now adds server defaults to `jobs` (status, priority,
+attempts, max_attempts); the harness keeps naming the columns, which works with or without it.
 
 **Lesson:** The ORM model describes what the ORM does; the migration describes what the
 database enforces. Anything that bypasses the ORM - a benchmark, a `psql` session, a
