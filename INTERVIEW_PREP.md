@@ -55,6 +55,72 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
 
+## 2026-11-06 - The container proved the "probe at start" decision on my own laptop `DONE`
+
+> **In plain English:** Earlier I decided the chess engine must be chosen when the
+> container starts, on the machine that runs it, not when the package is built - because the
+> fastest version crashes on processors that lack one special feature. I expected that to
+> matter on *other* machines. The first time I ran the container on my own laptop, the
+> fastest version crashed right there. My laptop's processor has the feature, but the little
+> virtual computer Docker runs containers in doesn't pass it through. The installer noticed
+> the crash, stepped down one level, and the worker started normally. If the engine had been
+> picked while building the package on this same laptop, every container would have crashed.
+
+**A bit deeper:** On Windows, Docker Desktop runs Linux containers inside a lightweight
+*virtual machine* (WSL 2). A VM can expose a subset of the host CPU's *instruction set
+extensions*. Here the host (Intel Core Ultra 7 155H) supports AVX-VNNI, the VM did not
+expose it, and the AVX-VNNI build of Stockfish died with an illegal instruction (exit -4).
+The fallback chain picked the AVX2 build.
+
+**What changed:** a `Dockerfile` (one image for the API, migrations and the worker; Stockfish
+deliberately absent), `docker/entrypoint.sh` (runs `tools/fetch_stockfish.py`, then `exec`s
+the command), and `migrate` / `api` / `worker` services in `docker-compose.yml` behind an
+`app` profile, with the engine in a named `vendor` volume.
+
+**What I ran, and what it printed** (first start, empty volume):
+
+```
+[fetch-stockfish] trying stockfish-ubuntu-x86-64-avxvnni.tar (109 MiB)
+[fetch-stockfish]   smoke test exited -4 (wrong SIMD build for this CPU)
+[fetch-stockfish] trying stockfish-ubuntu-x86-64-avx2.tar (109 MiB)
+[fetch-stockfish]   OK - Stockfish 18 (searched both evaluation networks)
+worker.start depth=8 engine=sf_18
+```
+
+The second start re-probed the binary already in the volume ("nothing to do"), and the whole
+`docker run` took 3.6 s. Then the container analysed the 90-ply test game at depth 12 in
+6.3 s against the test database: `complete`, 90 moves. The engine version is `sf_18` on the
+host's AVX-VNNI build and the container's AVX2 build alike, which is what lets their cached
+evaluations be shared.
+
+**Why the details are the way they are:**
+
+- *The `app` profile.* `docker compose up -d` is what every developer and the tests already
+  run for Postgres and Redis. Adding the app without a profile would quietly start a second
+  worker competing for the same queue as the ones on the host.
+- *`flock` around the installer.* `--scale worker=4` starts four containers at once on one
+  shared volume; without a lock, four installers would download into the same directory at
+  once. With it, the first downloads and the rest wait, then find a verified binary.
+- *Only the worker probes.* The API and migrations never touch the engine, so they set
+  `FETCH_STOCKFISH=0` and start in a second instead of waiting on a download.
+- *Dependencies are a separate layer* from the source, so a code change rebuilds in seconds;
+  uv is pinned to the version the lock file is maintained with; the app runs as a non-root
+  user; `stop_grace_period: 60s` gives SIGTERM time to finish the current game.
+
+**Alternatives rejected:** the ones in the original `DECIDED` entry (fetch at build time, bake
+the baseline build, one image per SIMD level) - and this run is the evidence for that call:
+build-time selection on this very laptop would have produced an image that crashes on this
+very laptop.
+
+**Talking point:** "I'd decided the engine build must be picked on the machine that runs it,
+because an image moves between CPUs. I assumed that mattered for other machines. The first
+container I ran on my own laptop proved it: the host CPU has AVX-VNNI, Docker's VM doesn't
+expose it, the fast build died with an illegal instruction, and the probe fell back to AVX2.
+A build-time choice would have shipped an image that crashes on the machine that built it."
+
+**Where:** `Dockerfile`, `docker/entrypoint.sh`, `docker-compose.yml`. The original decision is
+the "engine is probed at container start" entry in the pre-M1 block.
+
 ## 2026-11-06 - M2: kill a worker mid-game, and the game is still analysed exactly once `DONE`
 
 > **In plain English:** This is the test the whole second milestone was aiming at. I start
