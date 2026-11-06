@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     chesscom_rate_per_sec: float = 1.0
     chesscom_burst: int = 3
     chesscom_timeout_sec: float = 30.0
+    # Retries after the first attempt, for 429s, 5xx and transport errors.
+    chesscom_max_retries: int = Field(default=5, ge=0)
+    chesscom_backoff_base_sec: float = Field(default=1.0, gt=0)
+    chesscom_backoff_cap_sec: float = Field(default=60.0, gt=0)
 
     # --- Engine -------------------------------------------------------------
     stockfish_path: Path = Path("vendor/stockfish/stockfish.exe")
