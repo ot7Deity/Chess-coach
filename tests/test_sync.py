@@ -243,3 +243,68 @@ def test_username_case_does_not_create_a_second_player(clean_engine: Engine, fak
     sync_player(clean_engine, fake.client(), "DeityTheMenace", now=NOV_15)
     sync_player(clean_engine, fake.client(), ME, now=NOV_15)
     assert _count(clean_engine, Player) == 1
+
+
+def test_a_game_listed_twice_in_one_month_is_stored_once(clean_engine: Engine):
+    """Found by the reviewer: one multi-row ON CONFLICT DO UPDATE may not touch
+    a row twice, so a duplicate used to fail the month on every retry."""
+    fake = FakeChessCom()
+    fake.add_player(ME)
+    game = make_game("dup", white=ME, black="a")
+    fake.add_game(ME, "2026-08", game)
+    fake.add_game(ME, "2026-08", dict(game))
+
+    result = sync_player(clean_engine, fake.client(), ME, now=NOV_15)
+    assert result.games_new == 1
+    assert _count(clean_engine, Game) == 1
+
+
+def test_ctrl_c_mid_sync_does_not_leave_the_player_marked_syncing(
+    clean_engine: Engine, fake: FakeChessCom
+):
+    real_handle = fake.handle
+
+    def interrupt_on_october(request):
+        if request.url.path.endswith("/2026/10"):
+            raise KeyboardInterrupt
+        return real_handle(request)
+
+    fake.handle = interrupt_on_october  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        sync_player(clean_engine, fake.client(), ME, now=NOV_15)
+
+    with Session(clean_engine) as s:
+        player = s.scalar(select(Player))
+    assert player.sync_status == "error"
+    assert "KeyboardInterrupt" in player.sync_error
+
+
+def test_a_rejected_game_in_a_final_month_is_recovered_after_a_parser_fix(
+    clean_engine: Engine, monkeypatch
+):
+    """A month with a rejected game is neither frozen nor revalidated with its
+    ETag, so once the parser learns the game, the next sync stores it."""
+    from chess_coach.chesscom import parse
+
+    fake = FakeChessCom()
+    fake.add_player(ME)
+    fake.add_game(ME, "2026-08", make_game("ok", white=ME, black="a"))
+    fake.add_game(
+        ME,
+        "2026-08",
+        make_game("odd", white=ME, black="b", white_result="newdraw", black_result="newdraw"),
+    )
+
+    first = sync_player(clean_engine, fake.client(), ME, now=NOV_15)
+    assert (first.games_new, first.games_rejected) == (1, 1)
+    with Session(clean_engine) as s:
+        archive = s.scalar(select(Archive))
+    assert archive.is_complete is False
+    assert archive.etag is None
+
+    monkeypatch.setattr(parse, "DRAW_CODES", parse.DRAW_CODES | {"newdraw"})
+    second = sync_player(clean_engine, fake.client(), ME, now=NOV_15)
+    assert second.months_fetched == 1  # a full download, not a 304
+    assert second.games_new == 1
+    with Session(clean_engine) as s:
+        assert s.scalar(select(Archive.is_complete)) is True

@@ -180,3 +180,15 @@ def test_other_4xx_is_not_retried():
     with pytest.raises(ChessComError):
         client.archive_months("someone")
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("body", [{}, {"games": None}, [], {"games": "nope"}])
+def test_a_month_without_a_games_list_is_an_error_not_an_empty_month(body):
+    """Read as 'no games', a malformed 200 would freeze a finished month empty."""
+    client = ChessComClient(
+        user_agent="t",
+        limiter=NoopLimiter(),
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=body)),
+    )
+    with pytest.raises(ChessComError):
+        client.month("someone", "2026-08")

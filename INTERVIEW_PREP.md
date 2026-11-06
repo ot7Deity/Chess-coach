@@ -61,6 +61,63 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M1 ENTRIES BELOW (ingestion). Newest first. -->
 
+## 2026-11-05 - Four ways the sync could get stuck forever or lose a game quietly `DONE`
+
+> **In plain English:** After the download feature worked on my real account, my reviewer
+> agent went looking for the unusual situations that break it, and found four. If Chess.com
+> ever listed the same game twice in a month, the download would fail on that month every
+> single time, forever. If I stopped the program with Ctrl-C, my account would say "syncing"
+> forever. If one game confused the program, it would skip it - and then never look at that
+> month again, even after I fixed the code, so the game would be gone for good. And if
+> Chess.com sent back a broken reply, the program would read it as "you played no games
+> this month" and lock that in. None of these happened with my real data. They are the kind
+> of bug that shows up months later, for someone else, with no clue where to look.
+
+**A bit deeper:** All four are the same shape: a rare input turns into a *permanent* bad
+state, because the system remembers its mistakes. A month marked "finished" is never fetched
+again; a status column is only reset by the code path that was skipped; a database statement
+that fails fails identically on every retry. The fixes make each of those states either
+impossible or recoverable, and each has a test that reproduces it.
+
+**What changed / the four stories:**
+
+1. **A duplicate game wedged the sync.** *Symptom:* every sync of the player fails at the
+   same month. *Cause:* a month is inserted as one `INSERT ... ON CONFLICT DO UPDATE`, and
+   Postgres refuses to let one statement update the same row twice
+   (`CardinalityViolation`). The month never commits, so every retry hits it again. *Fix:*
+   deduplicate by uuid before inserting, with a warning.
+2. **Ctrl-C left the player "syncing" forever.** *Cause:* the error handler caught
+   `Exception`, and `KeyboardInterrupt` / `SystemExit` are not Exceptions in Python. The
+   advisory lock was still released (the reviewer verified every exit path), but the status
+   column was not. *Fix:* `except BaseException`. A hard kill (`kill -9`) can still leave
+   it, which is why a later version should derive "syncing" from `pg_locks` instead of a
+   column.
+3. **A game the parser rejected was lost for good.** *Cause:* the month was still marked
+   complete, so it was never fetched again, and its ETag meant even a re-fetch would get a
+   304. *Fix:* a month with a rejected game is never frozen and its ETag is dropped, so the
+   next sync downloads it in full and a parser fix recovers the game. The test fakes the
+   parser fix and checks the game arrives.
+4. **A malformed reply read as an empty month.** *Cause:* `resp.json().get("games", [])`.
+   *Fix:* a 200 without a `games` list raises, and the month is retried later instead of
+   being frozen with zero games.
+
+**Alternatives rejected:** *catching the CardinalityViolation and retrying row by row* -
+slower on every month to handle a case that has never happened; deduplicating up front is
+one dictionary.
+
+**Talking point:** "The reviewer agent's best finds were rare inputs that become permanent
+states. The sync remembers that a month is finished, so any mistake made while finishing it
+is remembered too. A duplicate game in Chess.com's JSON would have failed one month on every
+retry forever, and a game my parser rejected would have been skipped and then never looked at
+again. Each fix either makes the bad state impossible or makes it recoverable, and each one
+has a test that reproduces it."
+
+**Where:** `src/chess_coach/ingest/sync.py` (`_parse_month`, `_sync_months`, the
+`BaseException` handler), `src/chess_coach/chesscom/client.py` (`month`), tests in
+`tests/test_sync.py` and `tests/test_chesscom_client.py`.
+
+---
+
 ## 2026-11-05 - The cache was built on a promise the chess engine didn't keep `DONE`
 
 > **In plain English:** The whole speed-up plan rests on one idea: if the chess engine has
