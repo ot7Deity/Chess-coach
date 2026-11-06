@@ -9,6 +9,7 @@ disagreeing, and the value-must-match-the-key rule from positions.py.
 from __future__ import annotations
 
 import threading
+import time
 
 import chess
 import pytest
@@ -46,15 +47,6 @@ def dead_redis():
 # --- Redis down ---------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: position_cache.py:320-326 and 350-357 call pipe.execute() with "
-        "raise_on_error=False, which only swallows per-command errors; a "
-        "connection failure still raises, so a Redis outage fails every lookup "
-        "instead of falling back to Postgres. _redis_usable() only checks for None."
-    ),
-)
 def test_a_redis_outage_falls_back_to_postgres_on_get(clean_engine, redis_client, dead_redis):
     key, fen = _position("e4")
     _cache(clean_engine, None, redis_client.key_prefix).put(
@@ -64,20 +56,55 @@ def test_a_redis_outage_falls_back_to_postgres_on_get(clean_engine, redis_client
     assert hit is not None and hit.eval_cp == 30
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: put() commits to Postgres, then _redis_set raises ConnectionError "
-        "when Redis is down - the caller sees a failed put for a value that was "
-        "in fact stored, and the analysis job fails."
-    ),
-)
 def test_a_redis_outage_does_not_fail_a_put(clean_engine, redis_client, dead_redis):
     key, fen = _position("d4")
     cache = _cache(clean_engine, dead_redis, redis_client.key_prefix)
     cache.put(key, fen, ENGINE, DEPTH, Evaluation(eval_cp=20, mate_in=None, best_move="d7d5"))
     with clean_engine.connect() as c:
         assert c.scalar(text("SELECT count(*) FROM positions")) == 1
+
+
+def test_an_outage_costs_one_timeout_per_retry_window_not_one_per_lookup(
+    clean_engine, redis_client, dead_redis
+):
+    keys = [_position(*m) for m in (["e4"], ["d4"], ["c4"], ["Nf3"], ["g3"], ["b3"])]
+    pg = _cache(clean_engine, None, redis_client.key_prefix)
+    for key, fen in keys:
+        pg.put(key, fen, ENGINE, DEPTH, Evaluation(eval_cp=1, mate_in=None, best_move="a7a6"))
+
+    cache = pc.PositionCache(
+        clean_engine, dead_redis, key_prefix=redis_client.key_prefix, redis_retry_sec=60
+    )
+    key0 = keys[0][0]
+    assert cache.get(key0, ENGINE, DEPTH) is not None  # pays the one timeout, trips the breaker
+    started = time.monotonic()
+    for _ in range(5):
+        for key, _fen in keys:
+            assert cache.get(key, ENGINE, DEPTH) is not None
+    elapsed = time.monotonic() - started
+    # Inside the retry window Redis is not touched at all.
+    assert elapsed < 1.0, elapsed
+    assert cache.stats.redis_errors == 1
+    assert cache.stats.postgres_hits == 31
+
+
+def test_the_production_redis_client_fails_fast(dead_redis):
+    """The breaker only bounds how *often* an outage is paid for; the client
+    decides how much each payment costs. A default redis-py client retries a
+    failed connect (measured here: 6.5 s per call against a dead port with a
+    0.2 s timeout). cache_redis_client must not."""
+    from chess_coach.cache import cache_redis_client
+
+    from chess_coach.config import Settings
+
+    settings = Settings(
+        _env_file=None, redis_url="redis://127.0.0.1:1/0", position_cache_redis_timeout_sec=0.2
+    )
+    client = cache_redis_client(settings)
+    started = time.monotonic()
+    with pytest.raises(redis.RedisError):
+        client.ping()
+    assert time.monotonic() - started < 1.5
 
 
 # --- Postgres and Redis disagreeing -----------------------------------------
@@ -106,21 +133,16 @@ def test_a_hit_is_always_backed_by_a_postgres_row(clean_engine, redis_client):
     assert hit is None or rows == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "DISAGREEMENT: the m1/6 contract (positions.py EvalCache) says a put that "
-        "disagrees with the stored value means the reproducibility rule was broken "
-        "and 'should be reported, not silently resolved'. put() only counts it as "
-        "writes_existing; nothing distinguishes a duplicate from a contradiction."
-    ),
-)
 def test_a_put_that_contradicts_the_stored_value_is_reported(clean_engine, redis_client):
     key, fen = _position("Nf3")
     cache = _cache(clean_engine, redis_client, redis_client.key_prefix)
     cache.put(key, fen, ENGINE, DEPTH, Evaluation(eval_cp=25, mate_in=None, best_move="d7d5"))
     cache.put(key, fen, ENGINE, DEPTH, Evaluation(eval_cp=-400, mate_in=None, best_move="a7a6"))
-    assert any("conflict" in k or "contradict" in k for k in cache.stats.as_dict())
+    # A counter that exists is not enough: it has to have counted this one.
+    assert getattr(cache.stats, "eval_conflicts", 0) == 1
+    # And a put that agrees is not a conflict.
+    cache.put(key, fen, ENGINE, DEPTH, Evaluation(eval_cp=25, mate_in=None, best_move="d7d5"))
+    assert cache.stats.eval_conflicts == 1
 
 
 def test_concurrent_puts_of_one_key_agree_in_both_layers(clean_engine, redis_client):

@@ -60,10 +60,13 @@ def test_downgrade_refuses_when_two_players_share_a_game_and_changes_nothing(
         _insert_game(conn, a, "shared")
         _insert_game(conn, b, "shared")
 
+    before = _revision(clean_engine)  # head; 0002 or later
     with pytest.raises(Exception, match=r"games_chesscom_uuid_key|duplicate key"):
         command.downgrade(_config(database_url), "0001")
 
-    assert _revision(clean_engine) == "0002"
+    # Every step of the downgrade ran in one transaction, so even the steps
+    # above 0002 that succeeded are rolled back.
+    assert _revision(clean_engine) == before
     assert "uq_games_player_uuid" in _unique_constraints(clean_engine)
 
 
