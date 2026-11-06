@@ -22,6 +22,12 @@ Implements `chess_coach.positions.EvalCache`. The rules it keeps:
   key embeds all three, and the Redis value repeats engine version and depth so
   that a value for the wrong search can never be returned (see `codec`).
 
+* **Redis being down degrades to Postgres-only; it never fails a job.** A Redis
+  error trips a breaker: for `redis_retry_sec` the cache does not touch Redis at
+  all, so an outage costs one timeout per retry window rather than one per
+  lookup. After the window the next call tries Redis again. Entries written
+  meanwhile are only in Postgres and get backfilled on their next read.
+
 * **A corrupt Redis value is a miss.** It is counted, logged, and overwritten
   by the Postgres backfill (or by the next put, if Postgres lacks it too).
 
@@ -41,7 +47,8 @@ inside one batch (a threefold repetition) is one lookup.
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterable, Sequence
+import time
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 
 import chess
@@ -62,6 +69,9 @@ DEFAULT_TTL_SEC = 7 * 24 * 3600
 _MAX_ENGINE_VERSION_LEN = 32  # positions.engine_version is VARCHAR(32)
 _MAX_DEPTH = 32767  # positions.depth is SMALLINT
 _PG_CHUNK = 1000  # keys per `fen_hash IN (...)` query
+# What an unreachable or misbehaving Redis raises. redis-py wraps socket errors
+# in ConnectionError / TimeoutError; OSError is caught too in case one escapes.
+_REDIS_ERRORS = (redis.RedisError, OSError)
 
 
 def redis_key(prefix: str, key: bytes, engine_version: str, depth: int) -> str:
@@ -138,9 +148,9 @@ class CacheStats:
 class PositionCache:
     """`EvalCache` backed by Postgres, with Redis as an optional hot layer.
 
-    `redis_client=None` gives a Postgres-only cache, which is also a benchmark
-    configuration ("what does Redis add?"). Safe to share between threads; each
-    call checks out its own connection.
+    `redis_client=None` gives a Postgres-only cache, which is both the degraded
+    mode and a benchmark configuration ("what does Redis add?"). Safe to share
+    between threads; each call checks out its own connection.
     """
 
     def __init__(
@@ -150,6 +160,8 @@ class PositionCache:
         *,
         key_prefix: str = DEFAULT_KEY_PREFIX,
         ttl_sec: int = DEFAULT_TTL_SEC,
+        redis_retry_sec: float = 30.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if ttl_sec < 0:
             raise ValueError("ttl_sec must be >= 0 (0 disables expiry)")
@@ -157,6 +169,10 @@ class PositionCache:
         self._redis = redis_client
         self._prefix = key_prefix
         self._ttl = ttl_sec or None
+        self._retry_sec = redis_retry_sec
+        self._clock = clock
+        self._redis_down_until = 0.0
+        self._redis_healthy = redis_client is not None
         self._lock = threading.Lock()
         self._stats = CacheStats()
 
@@ -272,15 +288,13 @@ class PositionCache:
 
     @property
     def redis_active(self) -> bool:
+        """False while the breaker has the cache in Postgres-only mode."""
         return self._redis_usable()
 
     # --- layers -----------------------------------------------------------------
 
     def _rkey(self, key: bytes, engine_version: str, depth: int) -> str:
         return redis_key(self._prefix, key, engine_version, depth)
-
-    def _redis_usable(self) -> bool:
-        return self._redis is not None
 
     def _postgres_get(
         self, keys: Sequence[bytes], engine_version: str, depth: int
@@ -323,7 +337,12 @@ class PositionCache:
                 pipe.getex(name, ex=self._ttl)
             else:
                 pipe.get(name)
-        raws = pipe.execute(raise_on_error=False)
+        try:
+            raws = pipe.execute(raise_on_error=False)
+        except _REDIS_ERRORS as exc:
+            self._redis_failed("get", exc)
+            return {}
+        self._redis_succeeded()
 
         out: dict[bytes, Evaluation] = {}
         bad: list[str] = []
@@ -354,16 +373,44 @@ class PositionCache:
                 encode(engine_version, depth, evaluation),
                 ex=self._ttl,
             )
-        results = pipe.execute(raise_on_error=False)
+        try:
+            results = pipe.execute(raise_on_error=False)
+        except _REDIS_ERRORS as exc:
+            self._redis_failed("set", exc)
+            return
+        self._redis_succeeded()
 
         # Per-command errors (e.g. OOM under `maxmemory` + `noeviction`) mean
-        # Redis is up but refusing writes. Postgres already has the value, so
-        # this is counted, not raised.
+        # Redis is up but refusing writes. Reads still work, so this is counted
+        # rather than tripping the breaker; Postgres already has the value.
         errors = [r for r in results if isinstance(r, Exception)]
         if errors:
             with self._lock:
                 self._stats.redis_errors += len(errors)
             log.warning("cache.redis_write_rejected", count=len(errors), error=str(errors[0]))
+
+    # --- breaker ----------------------------------------------------------------
+
+    def _redis_usable(self) -> bool:
+        return self._redis is not None and self._clock() >= self._redis_down_until
+
+    def _redis_failed(self, op: str, exc: BaseException) -> None:
+        with self._lock:
+            self._stats.redis_errors += 1
+        self._redis_down_until = self._clock() + self._retry_sec
+        if self._redis_healthy:
+            self._redis_healthy = False
+            log.warning(
+                "cache.redis_unavailable",
+                op=op,
+                error=f"{type(exc).__name__}: {exc}",
+                postgres_only_for_sec=self._retry_sec,
+            )
+
+    def _redis_succeeded(self) -> None:
+        if not self._redis_healthy:
+            self._redis_healthy = True
+            log.info("cache.redis_recovered")
 
     # --- accounting ---------------------------------------------------------------
 

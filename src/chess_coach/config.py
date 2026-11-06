@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     position_cache_key_prefix: str = "chess_coach:pos:v1:"
     # Sliding expiry, refreshed on every hit. 0 disables expiry.
     position_cache_ttl_sec: int = Field(default=7 * 24 * 3600, ge=0)
+    # Redis answers in well under a millisecond; anything near this is an outage.
+    position_cache_redis_timeout_sec: float = Field(default=0.25, gt=0)
+    # After a Redis failure, go Postgres-only for this long before retrying.
+    position_cache_redis_retry_sec: float = Field(default=30.0, ge=0)
 
     # --- Workers ------------------------------------------------------------
     worker_poll_interval_sec: float = 1.0
