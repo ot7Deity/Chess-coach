@@ -6,6 +6,11 @@ what lands in Postgres agrees with independent sources of truth.
 Skipped unless RUN_LIVE=1. It sends about 60 requests at 1 request/second
 through the real RedisTokenBucket on the default key, so run it rarely.
 
+The bucket lives in the *ingester's* Redis database (LIVE_RATELIMIT_REDIS_URL,
+default db 0), not the test database: Redis databases are separate keyspaces,
+so a bucket in db 4 would not share the real budget with a running ingester.
+Only the bucket key is touched there; nothing else in this suite uses db 0.
+
 The sources of truth, none of which go through parse.py:
 
 * Chess.com's own `stats` endpoint: rated win/loss/draw per time class.
@@ -40,6 +45,7 @@ from chess_coach.ratelimit import RedisTokenBucket
 USERNAME = "deitythemenace"
 CONTACT = "https://github.com/ot7Deity/Chess-coach"
 TIME_CLASSES = ("bullet", "blitz", "rapid", "daily")
+RATELIMIT_REDIS_URL = os.environ.get("LIVE_RATELIMIT_REDIS_URL", "redis://localhost:6379/0")
 
 pytestmark = [
     pytest.mark.live,
@@ -67,11 +73,11 @@ class RecordingClient(ChessComClient):
 
 
 @pytest.fixture
-def live_client(redis_url: str, monkeypatch: pytest.MonkeyPatch):
+def live_client(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CHESSCOM_CONTACT", CONTACT)
     settings = Settings()
     assert "@" not in settings.user_agent, settings.user_agent
-    conn = redis.Redis.from_url(redis_url)
+    conn = redis.Redis.from_url(RATELIMIT_REDIS_URL)
     limiter = RedisTokenBucket(conn, rate_per_sec=1.0)  # default key: ratelimit:chesscom
     client = RecordingClient(user_agent=settings.user_agent, limiter=limiter)
     try:
