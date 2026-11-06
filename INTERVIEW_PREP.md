@@ -49,6 +49,53 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M4 ENTRIES BELOW (report SQL, report and sync API). Newest first. -->
 
+## 2026-11-06 - "Under 30 seconds" means the clock when you *started* the move `DONE`
+
+> **In plain English:** The report asks "do I fall apart when my clock runs low?", so it
+> needs to know how much time a player had when they started each move. The saved clock
+> reading is from *after* the move, so the right number is the reading from the player's
+> previous move - their opponent's thinking doesn't use up their clock. For a player's very
+> first move there is no previous reading, so it's the starting time. The trap was telling
+> "this is the first move" apart from "the previous reading is missing". If I'd treated both
+> the same, a move after a missing reading would be counted as if the player had their full
+> starting time - a confident, wrong answer. Now the first move is found by its position in
+> the game, and a move after a gap is simply left out.
+
+**A bit deeper:** The start-of-move clock is `LAG(clock_seconds)` over the player's own moves
+in a game, ordered by ply. `LAG` returns NULL both for the first row and for a row whose
+previous value is NULL, so `COALESCE(lag(...), base_time)` - the obvious way to write "or the
+base time for the first move" - silently conflates the two. Using `row_number() = 1` to pick
+the base time keeps "unknown" as unknown.
+
+**What changed:** `analytics/report.py`: `move_summary` (`analyzed_games`, the player's own
+`blunders_per_game`), `blunders_by_phase` (always three rows, counts not rates) and
+`time_pressure` (two buckets split at 30 s, accuracy as best+good over moves, and the number of
+analysed games with at least one low-clock move).
+
+**Why the details are the way they are:**
+- *Only analysed games, only the player's own classified moves.* The opponent's blunders, games
+  still in the queue and other time classes are all excluded; a test fills each of those with
+  blunders and checks none are counted.
+- *Counts, not rates, by phase*, so there is exactly one definition of each rate and it lives
+  in the UI: per game (the three phases sum to the headline) and per 100 moves.
+- *The base time is parsed in SQL from `time_control`*; a daily control (`1/86400`) has none,
+  so a daily game's first move is in neither bucket - and the endpoint returns no time-pressure
+  section for daily at all.
+
+**The test, worked by hand:** two analysed games. The white game's starting clocks are 180
+(base), 182, 40, 25 and 10 seconds, so its last two moves are "low". The black game's first
+move starts on the base time even though its own reading is missing, its second move follows
+that missing reading and is excluded, and its third starts on 20 s. Result: 4 normal moves
+(50% accurate, 1 blunder), 3 low-clock moves (66.7%, 1 blunder), 2 low-clock games.
+
+**Talking point:** "The time-pressure stat needs the clock when a move was *started*, which is
+the player's previous reading. The bug I designed out was the obvious SQL: LAG, coalesced to
+the base time. LAG is NULL for the first move *and* after a missing reading, so the coalesce
+would hand a move with unknown timing the full starting clock. Picking the first move by
+row_number keeps unknown as unknown."
+
+**Where:** `src/chess_coach/analytics/report.py`, `tests/test_report_moves.py`.
+
 ## 2026-11-06 - Which openings cost me rating: a window function, checked against real data `DONE`
 
 > **In plain English:** One question the report answers is "which openings lose me rating
