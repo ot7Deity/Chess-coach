@@ -49,6 +49,81 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
 
+## 2026-11-05 - The website and the server agreed on a contract before either was built `DONE`
+
+> **In plain English:** The website and the part of the program that answers its questions
+> are being built at the same time, by different people. So before anyone wrote code, I
+> wrote down exactly what the website will ask for and exactly what it gets back: every
+> number, what it means, and what unit it is in. It is like two teams building a bridge
+> from opposite banks - they agree on where the middle is first. While I was at it, I
+> checked one thing in the real data instead of assuming it: whether the rating stored with
+> each game is the rating *before* or *after* that game. It is after, which is what makes
+> "which openings cost me rating" possible to answer at all.
+
+**A bit deeper:** The agreement is an *API contract*: the addresses the website calls
+(*endpoints*), what goes in, and the exact shape of the data that comes back. Until the real
+server exists the website talks to a *mock* - a pretend server that returns saved sample
+data in that same shape - and one setting switches it to the real thing. The sample data is
+my real game history; the parts that need the chess engine, which has not run yet, are made
+up and labelled as made up.
+
+**What changed:** `docs/api-contract.md` (three endpoints: add a player, sync progress,
+report per time control), `web/src/lib/api-types.ts` (the same shapes in TypeScript),
+`web/src/lib/api.ts` (the only data door; `NEXT_PUBLIC_API_URL` set means the real API,
+unset means fixtures), `web/scripts/fixtures.sql` (a read-only query that produced the real
+fixtures), and `web/src/lib/fixtures/` (real ingested numbers plus a clearly marked
+`synthetic.ts`).
+
+**Why the details are the way they are:**
+
+- *One report call per time control.* Every view is scoped to exactly one, and DESIGN.md
+  says results are never mixed across them, so the API shape makes mixing impossible.
+- *The rating is the after-game rating - measured, not assumed.* Taking each rated game's
+  rating minus the previous one's, the average is +10.9 after a rapid win and -13.1 after a
+  loss; the same calculation shifted one game the other way is about zero. So a game's
+  rating change is a `LAG()` away, and "rating lost per opening" is a sum, not a guess from
+  win rate.
+- *Openings are grouped into families,* because Chess.com names are too fine-grained (111
+  names in 434 blitz games). One regular expression - cut the name after the first
+  "Opening / Defense / Game / Gambit / System / Attack" - turns "Queens Pawn Opening
+  Zukertort Variation" into "Queens Pawn Opening". It is written into the contract as SQL,
+  so the fixtures and the real API cannot group differently.
+- *Opening and colour are separate rows.* Meeting the Caro-Kann as White and playing it as
+  Black are different problems.
+- *Counts, not rates, for move-level sections.* The API sends "4,210 moves, 38 blunders",
+  and each rate has one definition, in one place.
+- *Every unit is stated once:* percentages 0-100, timestamps UTC with `Z`, dates are UTC
+  days, ratings are integers, and no field is in centipawns at all.
+- *`null` means "not applicable or not known yet", never zero.* Time pressure is `null` for
+  daily games, where clocks run in days; a section with no analyzed games is `null` rather
+  than a misleading 0 blunders.
+- *Progress always lists all four time controls,* and analyzed + pending + failed + skipped
+  always equals games, so the UI never has to guess what a missing entry means.
+
+**Alternatives rejected:**
+- *One endpoint per report section*: four requests and four loading states for one screen,
+  and four chances to disagree about how many games were analyzed.
+- *Win rate per opening as "the cost"*: it ignores who you played. Rating change already
+  accounts for opponent strength, because Chess.com's rating formula does.
+- *Grouping openings by ECO code*: D02 covers both the London System and the Zukertort,
+  which a player thinks of as different openings.
+
+**Known limitation:** the first handful of games in each time control carry provisional
+rating swings of up to 155 points, which can dominate a small opening group. Six games per
+time control at most, so it is documented rather than special-cased.
+
+**Talking point:** "I wrote the API contract before either side existed, down to units and
+nulls, so the frontend and the backend could be built in parallel and a reviewer could
+check them against one document. The best part was a question I could have assumed: is the
+stored rating before or after the game? I measured it - the average change after a win is
++11 and after a loss -13 - and that turned 'which openings cost me rating' into a one-line
+window function instead of an estimate."
+
+**Where:** `docs/api-contract.md`, `web/src/lib/api-types.ts`, `web/src/lib/api.ts`,
+`web/src/lib/fixtures/`, `web/scripts/fixtures.sql`.
+
+---
+
 ## 2026-11-05 - The dashboard ships three runtime dependencies, every version pinned `DONE`
 
 > **In plain English:** The website is built from other people's code - a framework, a
