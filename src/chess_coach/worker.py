@@ -1,8 +1,9 @@
-"""`chess-coach-worker`: one analysis worker process with one Stockfish.
+"""`chess-coach-worker`: one worker process - analysis (one Stockfish) or sync.
 
-    uv run chess-coach-worker                       # run until stopped
+    uv run chess-coach-worker                       # analysis, until stopped
     uv run chess-coach-worker --until-empty         # drain the queue, then exit
     uv run chess-coach-worker --worker-id w3 --max-jobs 50
+    uv run chess-coach-worker --kind sync           # sync-player jobs (Chess.com)
     python -m chess_coach.worker ...
 
 Scale by starting more of these, not by giving one more threads: each owns
@@ -34,6 +35,12 @@ def default_worker_id() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="chess-coach-worker", description=__doc__.split("\n")[0])
+    parser.add_argument(
+        "--kind",
+        choices=("analysis", "sync"),
+        default="analysis",
+        help="analysis: analyze-game jobs with Stockfish; sync: sync-player jobs",
+    )
     parser.add_argument(
         "--worker-id",
         default=None,
@@ -75,6 +82,9 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), _stop)
 
+    if args.kind == "sync":
+        return _run_sync(args, db, worker_id, stop, log)
+
     try:
         engine = StockfishEngine(
             settings.stockfish_path,
@@ -93,6 +103,21 @@ def main(argv: list[str] | None = None) -> int:
 
     with engine:
         worker = Worker(db, engine, worker_id=worker_id, settings=settings)
+        try:
+            worker.run(max_jobs=args.max_jobs, until_empty=args.until_empty, stop=stop)
+        except KeyboardInterrupt:
+            log.warning("worker.interrupted", worker_id=worker_id)
+            return 130
+    return 0
+
+
+def _run_sync(args, db, worker_id: str, stop: threading.Event, log) -> int:
+    # Imported here: an analysis worker needs neither Redis nor the client.
+    from chess_coach.ingest.cli import build_client
+    from chess_coach.ingest.jobs import SyncWorker
+
+    with build_client() as client:
+        worker = SyncWorker(db, client, worker_id=worker_id, settings=get_settings())
         try:
             worker.run(max_jobs=args.max_jobs, until_empty=args.until_empty, stop=stop)
         except KeyboardInterrupt:

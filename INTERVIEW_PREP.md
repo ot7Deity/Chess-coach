@@ -47,6 +47,73 @@ exactly; a re-sync costs **2 requests**.
 
 ---
 
+<!-- M4 ENTRIES BELOW (report SQL, report and sync API). Newest first. -->
+
+## 2026-11-06 - Asking for a sync is a queued job, and a re-sync re-arms the old one `DONE`
+
+> **In plain English:** When someone types their username into the website, the website
+> must not go and download their games itself - that takes a minute and has to wait its turn
+> behind a strict speed limit, and the website should answer instantly. So the website just
+> writes down "please fetch this player" as a job, and a separate background worker does the
+> downloading. Two details matter. If the same person clicks twice, there should still be
+> only one fetch, so the job is written down once per player and reused. And when an old,
+> finished job is reused, its numbered ticket keeps counting up instead of starting again at
+> one - otherwise a long-lost worker holding ticket number one could mistake the new job for
+> its own.
+
+**A bit deeper:** The API inserts the player and a `sync-player` job and returns `202
+Accepted`. A *sync worker* (`chess-coach-worker --kind sync`) claims it, runs the M1 sync and
+then enqueues analysis for the games it found. Idempotency is an *upsert* on the job's dedupe
+key: if no job exists it is inserted; if one is queued or running nothing happens; if the old
+one finished, failed or died, it is *re-armed* back to pending. The `attempts` counter is the
+lease's *fencing token*, so re-arming extends the attempt budget instead of resetting it.
+
+**What changed:** `src/chess_coach/jobrunner.py` (the worker loop extracted from the analysis
+worker, so both job types share leases, retries and outage handling),
+`src/chess_coach/ingest/jobs.py` (`enqueue_sync`, `SyncWorker`), `--kind sync` on the worker
+CLI, a `sync-worker` compose service, and the reaper can be limited to one runner's job types.
+
+**Why the details are the way they are:**
+
+- *One job row per player, re-armed.* The dedupe key is unique for ever, so "a second sync
+  later" cannot be a second row. `INSERT ... ON CONFLICT DO UPDATE ... WHERE status IN ('done',
+  'failed', 'dead')` gives "enqueue unless one is queued or running" in one atomic statement:
+  two simultaneous clicks cannot create two syncs.
+- *Never reset the fencing token.* The obvious re-arm sets `attempts = 0`, and I nearly wrote
+  it - it looks like simple bookkeeping. That would let the next claim be attempt 1 again - the same (job, worker, attempt) triple a zombie from
+  the first run could still hold. It now sets `max_attempts = attempts + JOB_MAX_ATTEMPTS`, and
+  a test shows the old run's lease is refused after a re-arm.
+- *The sync heartbeats from inside the work, through the HTTP client.* `sync_player` has no
+  progress hook, so the worker hands it a thin wrapper around the Chess.com client that renews
+  the lease before every request. Every request is progress, so this is the same rule as the
+  analysis worker's heartbeat between positions - never a background thread.
+- *A missing account is a permanent failure.* The API never calls Chess.com, so it cannot know
+  a username is a typo. The sync records it on the player (`sync_status = 'error'`, shown by
+  the progress page) and the job goes to `failed`, not round the retry loop five times. Chess.com
+  being down (`ChessComUnavailable`) is retried with backoff.
+- *Each worker kind reaps only its own job types*, so the hook that repairs a reaped job's
+  domain status (a game back to `pending`, a player out of `syncing`) is always the right one.
+
+**Alternatives rejected:**
+- *Call Chess.com from the API request*: a minute-long request, competing with every sync
+  worker for the one-request-per-second budget, and the API stops being read-only.
+- *Insert a new sync job each time, with no dedupe key*: two clicks, two syncs; the advisory
+  lock would stop them running at once, but one would fail and retry for nothing.
+- *A separate CLI for the sync worker*: the loop, the signals and the flags are the same; only
+  the job type differs.
+
+**Talking point:** "The website's only write is 'please sync this player', and it's a job, not
+a call to Chess.com. Clicking twice is one atomic upsert, so it's still one job. When a finished
+job is re-armed I deliberately don't reset its attempt counter, because that counter is the
+fencing token for leases - resetting it would let a stale worker's old lease match the new run."
+
+**Where:** `src/chess_coach/ingest/jobs.py`, `src/chess_coach/jobrunner.py`,
+`src/chess_coach/worker.py`, `tests/test_sync_jobs.py`.
+
+<!-- end of M4 entries -->
+
+---
+
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
 <!-- end of M3 entries -->
