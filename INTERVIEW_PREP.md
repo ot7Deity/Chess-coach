@@ -168,7 +168,13 @@ impossible or recoverable, and each has a test that reproduces it.
    complete, so it was never fetched again, and its ETag meant even a re-fetch would get a
    304. *Fix:* a month with a rejected game is never frozen and its ETag is dropped, so the
    next sync downloads it in full and a parser fix recovers the game. The test fakes the
-   parser fix and checks the game arrives.
+   parser fix and checks the game arrives. *The cost, which the reviewer made me write
+   down:* until the parser accepts that game, every sync downloads that whole month again
+   (three requests instead of two, plus a full month of JSON). That is a deliberate trade -
+   a few kilobytes per sync against a game lost forever - and on the real account it costs
+   nothing, because zero of 4,550 games were rejected. The state is visible but only
+   implicitly (`etag IS NULL AND NOT is_complete`); a `games_rejected` column on `archives`
+   would make it explicit, and is the obvious next step if rejections ever appear.
 4. **A malformed reply read as an empty month.** *Cause:* `resp.json().get("games", [])`.
    *Fix:* a 200 without a `games` list raises, and the month is retried later instead of
    being frozen with zero games.

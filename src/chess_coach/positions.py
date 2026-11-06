@@ -51,17 +51,24 @@ def engine_board(board: chess.Board) -> chess.Board:
     """The board to send to the engine for `fen_hash(board)`.
 
     A cached evaluation must be a function of its key alone, and the key is
-    (fen_hash, engine_version, depth). Two things outside the key change a
-    Stockfish score at a fixed depth, and both are removed here or by the
-    caller:
+    (fen_hash, engine_version, depth). Four things outside the board change a
+    Stockfish score at a fixed depth. Each is either removed or made part of
+    the key:
 
-    * The halfmove clock. One KRK position scored +529, +359, +11 and 0 at
-      depth 12 with the clock at 0, 50, 90 and 98. This board has the clock at
-      0 and no move stack, so the engine sees exactly what the key describes.
-    * The engine's hash table, left over from earlier positions: in one
-      34-ply game, 31 positions scored differently warm than cold. The caller
-      must clear it before every position (UCI `ucinewgame`; in python-chess,
-      a fresh `game=` object per `analyse` call) and run with Threads=1.
+    * The halfmove clock - removed here. One KRK position scored +529, +359,
+      +11 and 0 at depth 12 with the clock at 0, 50, 90 and 98. This board has
+      the clock at 0 and no move stack, so the engine sees exactly what the key
+      describes.
+    * The engine's hash table, left over from earlier positions - removed by
+      the caller: in one 34-ply game, 31 positions scored differently warm than
+      cold. Clear it before every position (UCI `ucinewgame`; in python-chess,
+      a fresh `game=` object per `analyse` call).
+    * The number of search threads - removed by the caller: Threads=2 is not
+      reproducible run to run. Use Threads=1.
+    * The size of the hash table - made part of the key: even cleared, 16 MB
+      and 128 MB disagreed on 14 of 34 positions at depth 16 (up to 9 cp, one
+      different best move). The worker therefore includes it in
+      `engine_version`, e.g. 'sf_18-h128'.
 
     Found by the adversarial review, with real-engine evidence; see
     INTERVIEW_PREP.md.
