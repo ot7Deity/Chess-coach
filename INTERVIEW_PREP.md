@@ -49,6 +49,67 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-06 - The contract said two answers would always match. They didn't `DONE`
+
+> **In plain English:** The shared rulebook between the worker and the cache said: "ask the
+> engine about the same position twice and you get the same answer". My cache relied on that.
+> It wasn't true. The engine remembers what it was thinking about a moment ago, and that memory
+> nudges its next answer by a few points. The fix belongs to the side that asks the engine: wipe
+> its memory before each question, so the answer really depends only on the position. My side
+> got a smoke alarm: if two answers for one position ever disagree again, the program writes a
+> warning and counts it, instead of quietly keeping one.
+
+**A bit deeper:** A *contract* is the agreement between two parts of a system about what each
+promises. This one promised that an evaluation is a *pure function* of (position, engine
+version, depth) - same inputs, same output. Stockfish keeps a *hash table* of earlier searches
+and reuses it, and it also sees the *halfmove clock* (moves since the last capture or pawn
+move, which feeds the 50-move draw rule). Both change the score without changing the cache
+key. The cache keeps *first write wins*; what is new is *detection*.
+
+**Symptom:** None in production - there is no production yet. On paper: a cache keyed on
+something that does not fully determine the value.
+
+**How I found it:** I measured it while writing the Postgres store: ten positions at depth 14
+were identical across two cold runs, but with a warm hash table **all ten scores moved, by 2 to
+27 centipawns**. The reviewer agent then confirmed it independently with real Stockfish and
+found the second cause, the halfmove clock.
+
+**Root cause:** The key leaves out two inputs that the value depends on: the engine's leftover
+state, and the move counters that `normalize_fen` deliberately drops. It's the project's
+recurring bug once more: a cache key missing something its value depends on.
+
+**Fix:** On the producer side (M2): evaluate a history-free board (halfmove clock 0) with a
+cleared hash and one thread, so the value really is a function of the key. On the cache side
+(this change):
+- A losing `put` reads the stored row and compares score, mate distance and best move. If they
+  differ, it logs `cache.eval_conflict` with both verdicts and counts it (`eval_conflicts`;
+  Prometheus in the metrics change). The first write still wins. Averaging or overwriting
+  would hide exactly the problem this is meant to surface.
+- Nodes and timings are not compared - they legitimately differ between machines.
+- The comparison costs one primary-key `SELECT`, and only on a losing write.
+- `mate_in == 0` ("the side to move is checkmated", no best move) now has its own tests through
+  the codec, Postgres and Redis, so 0 can never turn into "no mate" or back. Both layers already
+  handled it - nothing tests truthiness - but a value with a special meaning deserves a test.
+
+**Lesson:** I wrote "Stockfish isn't bit-identical" into the cache's docstring as a reason for
+first-write-wins, and stopped there. The more useful question was "then what is my key
+actually missing?" - which pointed at the producer. When you find out a guarantee is false,
+fix it where it's made, then make any future breach loud where it lands.
+
+**Talking point:** "My cache relied on a contract saying the same position, engine and depth
+always produce the same score. I measured it: with a warm hash table, ten out of ten scores
+moved by a few centipawns. The fix was on the producer - evaluate from a cleared hash with the
+move counters reset, so the value really is a function of the key. On the cache side I kept
+first-write-wins and added a tripwire: a losing write that disagrees with the stored answer is
+logged and counted. Silent disagreement was the problem, so I made it loud instead of trying
+to paper over it."
+
+**Where:** `src/chess_coach/cache/position_cache.py` (`put`, `_check_agreement`),
+`tests/test_position_cache.py` (the determinism-rule tests and
+`test_mate_in_zero_is_not_confused_with_no_mate`), `tests/test_cache_codec.py`.
+
+---
+
 ## 2026-11-05 - One failed Redis call cost ten seconds, and two "identical" clients disagreed `DONE`
 
 > **In plain English:** I wanted to know exactly what happens when the fast store (Redis) is

@@ -23,6 +23,17 @@ def test_round_trip(evaluation):
     assert decode(encode("sf_18", 16, evaluation), "sf_18", 16) == evaluation
 
 
+def test_mate_in_zero_and_no_mate_stay_distinct():
+    """mate_in == 0 is 'the side to move is checkmated', with no best move.
+    It must not collapse into null (a score) or vice versa."""
+    mated = Evaluation(eval_cp=None, mate_in=0, best_move=None)
+    level = Evaluation(eval_cp=0, mate_in=None, best_move=None)
+    assert encode("sf_18", 16, mated) == b'[1,"sf_18",16,null,0,null,null,null]'
+    assert decode(encode("sf_18", 16, mated), "sf_18", 16) == mated
+    assert decode(encode("sf_18", 16, level), "sf_18", 16) == level
+    assert decode(encode("sf_18", 16, mated), "sf_18", 16) != level
+
+
 def test_value_is_compact():
     raw = encode("sf_18", 16, Evaluation(23, None, "e2e4", 1234567, 412))
     assert raw == b'[1,"sf_18",16,23,null,"e2e4",1234567,412]'
