@@ -104,3 +104,8 @@ def test_an_evaluation_is_a_function_of_its_cache_key(stockfish_path):
 
     assert raw[0] != raw[1], "precondition: the clock really does change the raw score"
     assert normalised[0] == normalised[1]
+
+
+def test_null_cache_batch_lookup_misses_everything():
+    keys = [fen_hash(chess.Board()), fen_hash(chess.Board("8/8/8/8/8/8/8/K6k w - - 0 1"))]
+    assert NullCache().get_many(keys, "sf_18", 16) == {}

@@ -19,6 +19,7 @@ The rules:
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -105,6 +106,13 @@ class EvalCache(Protocol):
 
     def get(self, key: bytes, engine_version: str, depth: int) -> Evaluation | None: ...
 
+    def get_many(
+        self, keys: Sequence[bytes], engine_version: str, depth: int
+    ) -> dict[bytes, Evaluation]:
+        """Hits only, keyed by fen_hash; a missing key is a miss. Lets the worker
+        look up a whole game's positions in one round trip after replaying it."""
+        ...
+
     def put(
         self, key: bytes, fen: str, engine_version: str, depth: int, evaluation: Evaluation
     ) -> None: ...
@@ -116,6 +124,11 @@ class NullCache:
 
     def get(self, key: bytes, engine_version: str, depth: int) -> Evaluation | None:
         return None
+
+    def get_many(
+        self, keys: Sequence[bytes], engine_version: str, depth: int
+    ) -> dict[bytes, Evaluation]:
+        return {}
 
     def put(
         self, key: bytes, fen: str, engine_version: str, depth: int, evaluation: Evaluation

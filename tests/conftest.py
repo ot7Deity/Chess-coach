@@ -167,7 +167,13 @@ def redis_client(redis_url: str, request: pytest.FixtureRequest) -> Iterator:
     import redis
 
     client = redis.Redis.from_url(redis_url)
-    prefix = f"test:{request.node.name}:{uuid.uuid4().hex[:8]}:"
+    # The prefix is used in a SCAN MATCH glob below. Parametrized test names
+    # contain '[...]', which a glob reads as a character class, so the cleanup
+    # matched nothing and every key leaked. Only [A-Za-z0-9_-] survive here.
+    import re
+
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", request.node.name)
+    prefix = f"test:{safe_name}:{uuid.uuid4().hex[:8]}:"
     client.key_prefix = prefix  # type: ignore[attr-defined]
     try:
         yield client
