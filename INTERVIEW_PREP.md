@@ -55,6 +55,66 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
 
+## 2026-11-05 - A claimed job is a lease with a fencing token, not just a lock `DONE`
+
+> **In plain English:** The work queue is a list of games waiting to be analysed, and
+> several workers take games off it at the same time. Two rules stop them stepping on each
+> other. First, when a worker grabs a game, the others skip straight past it instead of
+> waiting in line behind it. Second, a worker's claim on a game is like a numbered parking
+> ticket. If a worker goes silent for too long, its game is given to someone else with a
+> *new* ticket number. If the first worker wakes up later and tries to hand in its finished
+> work, its old ticket no longer matches, so its work is thrown away instead of being saved
+> on top of the new worker's.
+
+**A bit deeper:** The queue is a Postgres table. A worker claims a job with
+`SELECT ... FOR UPDATE SKIP LOCKED`: *row locking* means only one transaction can hold a row
+at a time, and *SKIP LOCKED* means other workers step over locked rows instead of blocking on
+them. A claim is a *lease* - ownership that has to be renewed (a *heartbeat*) or it expires.
+The danger with leases is the *zombie*: a worker that was presumed dead, had its job handed
+on, and then comes back. The defence is a *fencing token* - a number that goes up on every
+claim - and every write the worker makes is conditional on still holding the current number.
+
+**What changed:** `src/chess_coach/queue.py`: `enqueue` (idempotent on `jobs.dedupe_key`),
+`claim`, `heartbeat`, `complete`, `has_unfinished`, and the `Lease` / `LeaseLost` types.
+
+**Why the details are the way they are:**
+
+- *The fencing token is `attempts`, which already existed.* Every claim increments it, so
+  (job id, worker id, attempts) names one specific claim, with no new column. `locked_by`
+  alone is not enough: a worker restarted under the same id (`worker-1` in a benchmark) can
+  legitimately re-claim the job it was reaped from, and then its zombie's `locked_by` would
+  match. There is a test for exactly that case.
+- *`complete()` runs inside the transaction that writes the results, and goes first.* Its
+  `UPDATE` takes the row lock and checks the lease, so the job's results and its `done` status
+  commit together or not at all - and a reaper that got there first leaves nothing to match,
+  so a zombie writes zero rows rather than writing moves and then failing.
+- *The heartbeat is called from the work loop, not a background thread.* A background thread
+  proves the process exists. A worker stuck in a hung call would keep its lease forever.
+- *Time is the database's `now()`.* A worker with a skewed clock cannot make a lease look
+  fresh or expired - the same reasoning as the rate limiter using Redis's clock.
+- *The claim query matches the partial index* `ix_jobs_claimable (priority, run_after) WHERE
+  status = 'pending'`, so a claim walks the index in order and stops at the first row it can
+  lock, no matter how many finished jobs pile up. A test runs `EXPLAIN` with sequential scans
+  disabled to prove the planner can use it.
+- *Enqueue is a no-op on a `done` job too.* Re-running finished work should be a deliberate
+  act, not a side effect of a sync enqueueing every pending game twice.
+
+**Alternatives rejected:**
+- *Plain `FOR UPDATE`*: correct, but every idle worker queues behind whichever one holds the
+  head of the queue. A test sets `lock_timeout` so a regression to it fails instead of hanging.
+- *`pg_try_advisory_lock` per job*: locks that live on the connection, invisible in the jobs
+  table, and lost silently when a pooled connection is recycled.
+- *Fencing on `locked_by` only*: fails the restarted-under-the-same-name case above.
+
+**Talking point:** "Claiming a job safely is the easy half - `SKIP LOCKED` does it. The hard
+half is the worker you gave up on that isn't actually dead. So a claim is a lease with a
+fencing token: I reused the attempts counter, which goes up on every claim, and every write a
+worker makes is conditional on it. A zombie's completion matches zero rows, and because
+completion shares a transaction with the results, it can't half-write either. Eight threads
+racing for 200 jobs claim each exactly once."
+
+**Where:** `src/chess_coach/queue.py`, `tests/test_queue.py`.
+
 <!-- end of M2 entries -->
 
 ---
