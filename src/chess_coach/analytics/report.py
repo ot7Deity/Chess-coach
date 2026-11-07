@@ -312,17 +312,23 @@ def time_pressure(session: Session, player_id: int, time_class: str) -> TimePres
                 WINDOW w AS (PARTITION BY m.game_id ORDER BY m.ply)
             )
             SELECT
-                count(*) FILTER (WHERE start_clock < :t AND classification IS NOT NULL) AS low_moves,
                 count(*) FILTER (WHERE start_clock < :t
-                                 AND classification IN ('best', 'good')) AS low_accurate,
+                                 AND classification IS NOT NULL) AS low_moves,
+                count(*) FILTER (WHERE start_clock < :t
+                                 AND classification IN ('best', 'good')
+                                 ) AS low_accurate,
                 count(*) FILTER (WHERE start_clock < :t
                                  AND classification = 'blunder') AS low_blunders,
-                count(*) FILTER (WHERE start_clock >= :t AND classification IS NOT NULL) AS normal_moves,
                 count(*) FILTER (WHERE start_clock >= :t
-                                 AND classification IN ('best', 'good')) AS normal_accurate,
+                                 AND classification IS NOT NULL) AS normal_moves,
+                count(*) FILTER (WHERE start_clock >= :t
+                                 AND classification IN ('best', 'good')
+                                 ) AS normal_accurate,
                 count(*) FILTER (WHERE start_clock >= :t
                                  AND classification = 'blunder') AS normal_blunders,
-                count(DISTINCT game_id) FILTER (WHERE start_clock < :t AND classification IS NOT NULL) AS low_games
+                count(DISTINCT game_id) FILTER (
+                    WHERE start_clock < :t AND classification IS NOT NULL
+                ) AS low_games
             FROM all_moves
             """
         ),
