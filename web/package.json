@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start --port 3000",
     "lint": "eslint --max-warnings=0 .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "stub-api": "node scripts/stub-api.mjs",
+    "smoke-test": "node scripts/smoke-test.mjs"
   },
   "engines": {
     "node": ">=20.9.0"
