@@ -32,6 +32,11 @@
   --accent-ink: #256abf; /* 5.4:1 on white, and white-on-it */
   --accent-wash: rgba(42, 120, 214, 0.1);
   --on-accent: #ffffff;
+  /* filled buttons: white text clears 4.5:1 on both */
+  --accent-ink-fill: #256abf;
+  --accent-ink-fill-hover: #1c5cab;
+  --control-thumb: #ffffff;
+  --control-thumb-shadow: 0 1px 3px rgba(0, 0, 0, 0.12), 0 0 0 0.5px rgba(0, 0, 0, 0.04);
 
   /* data: the two poles of a diverging scale, plus a de-emphasis grey */
   --data-positive: #2a78d6;
@@ -96,6 +101,10 @@
     --accent-ink: #5598e7; /* 5.7:1 on surface */
     --accent-wash: rgba(57, 135, 229, 0.16);
     --on-accent: #ffffff;
+    --accent-ink-fill: #256abf;
+    --accent-ink-fill-hover: #1c5cab;
+    --control-thumb: #636366;
+    --control-thumb-shadow: none;
 
     --data-positive: #3987e5;
     --data-negative: #e66767;

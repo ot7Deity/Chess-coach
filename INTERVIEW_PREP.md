@@ -49,6 +49,262 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
 
+## 2026-11-06 - Bug: the page said 1,210 games analyzed, and the tile under it said 1,211 `DONE`
+
+> **In plain English:** On the bullet page, a note at the top said "1,210 games analyzed" and
+> the number right underneath said 1,211. Both were true - the computer analyzing games
+> finished one more in the half-second between the two questions the page asked. But two
+> numbers that disagree on one screen make people trust neither. Now the note quotes the
+> same answer as the numbers below it.
+
+**A bit deeper:** The overview makes two requests: progress (how many games are analyzed)
+and the report (the numbers themselves). While the backlog drains, those two are snapshots
+taken at slightly different moments. This is not a bug in either endpoint - it is a *read
+skew* between two reads that are not in one transaction - so the fix is in what the page
+chooses to show.
+
+**Symptom:** banner "1,210 of 3,690", tile "1,211 games analyzed", on the same screen.
+
+**How found:** reading a screenshot of the bullet view, where the mock simulates the queue
+draining at 1.5 games a second.
+
+**Root cause:** the banner used the progress response and the tile used the report
+response; the report was fetched about half a second later.
+
+**Fix:** once the report for the selected time control has loaded, the banner quotes
+`report.analyzed_games`, so everything below the switcher describes one snapshot. The
+progress page still polls the live number, where moving is the point.
+
+**Lesson:** when one screen combines two reads of changing data, decide which one is the
+source of truth for any number shown twice. Mocking the drain - not just a static
+"partially analyzed" fixture - is what surfaced it before a user did.
+
+**Where:** `web/src/app/players/[username]/Overview.tsx` (`tcAnalyzed`).
+
+---
+
+## 2026-11-06 - Bug: two screenshots lied, and one of them hid a real flaw `DONE`
+
+> **In plain English:** I check the website by having a program take pictures of it. Two
+> pictures looked broken: one had a blank space where the rating chart should be, and the
+> phone-sized one looked cut off on the right. The phone one turned out to be the camera's
+> fault - that browser refuses to make a window narrower than a real phone. The blank chart
+> was mostly the camera's fault too, but it pointed at something real: my chart waited one
+> beat too long before drawing itself. I fixed the camera *and* the chart.
+
+**A bit deeper:** The screenshots came from *headless* Chrome (a browser with no window,
+driven from the command line). The chart sizes itself to its container with a
+`ResizeObserver`, a browser feature that reports an element's size - but only on the next
+frame. Headless Chrome's `--virtual-time-budget` fast-forwards a fake clock and does not
+always paint frames, so the report never came.
+
+**Symptom:** bullet and daily charts blank (rapid fine); every 390 px screenshot cut off.
+
+**How found:** looking at every screenshot rather than trusting a green build. To tell "my
+bug" from "my tool's bug", I loaded a one-line page that prints `innerWidth`: asked for
+390, it said **500** - Chrome on Windows has a minimum window width, and the screenshot
+was being cropped from a 500 px layout.
+
+**Root cause:** (1) tooling: a window cannot be made narrower than 500 px, so phone width
+was never actually tested. (2) a real, minor flaw: the chart rendered nothing until the
+observer's first callback, so even in a real browser it painted one empty frame.
+
+**Fix:** screenshots now go through the DevTools protocol with device emulation
+(`Emulation.setDeviceMetricsOverride`, `setEmulatedMedia` for dark mode), and the script
+prints `scrollWidth` vs `innerWidth`, so horizontal overflow fails loudly instead of being
+eyeballed. The chart measures itself synchronously in `useLayoutEffect` before the first
+paint and lets the observer handle later resizes.
+
+**Lesson:** verify the instrument before trusting the measurement - the same lesson as the
+CI cache entry above, in a different tool. And a tooling artefact is still worth a second
+look: this one was exaggerating a real one-frame flash.
+
+**Where:** `web/src/components/charts/LineChart.tsx` (`useWidth`).
+
+---
+
+## 2026-11-06 - The overview shows partial results instead of a spinner `DONE`
+
+> **In plain English:** Grading thousands of games takes hours. Rather than making you wait
+> for all of it, the page shows everything it already knows - your record, your rating
+> graph, your openings, which only need the downloaded games - and fills in the engine's
+> numbers as it goes, with a calm note saying how far along it is. It is like a photo
+> developing in front of you rather than a blank sheet until it is done.
+
+**A bit deeper:** The report has two kinds of section. Results, rating trend and openings
+come from the games table and are complete the moment the download finishes. Blunders and
+time pressure need the engine, and cover only analyzed games - so every one of them says
+how many games it is based on, and shows "waiting for the engine" rather than a misleading
+zero when there are none.
+
+**What changed:** `web/src/app/players/[username]/` - the overview page: a time-control
+switcher driving everything below it (kept in the URL as `?tc=`, so a view can be shared
+and survives a reload), four headline numbers, and one section per question, each with an
+insight sentence, a chart, a footnote with its sample size, and a table twin.
+
+**Why the details are the way they are:**
+
+- *Default time control = the one with the most games.* For this account that is bullet
+  (3,690 games); a fixed default would open daily, which has two.
+- *Empty classes are disabled, not hidden,* so the four segments never move.
+- *Switching dims the old report instead of showing a skeleton,* and a request for an old
+  selection is cancelled (`AbortController`) so a slow answer can never overwrite a newer
+  one.
+- *Every state is designed:* not tracked yet (offer to add them), still downloading, sync
+  failed (Chess.com's reason, verbatim), no games, server down (retry), invalid username,
+  daily games (time pressure "not measured", not "0").
+- *Errors from our own server are not shown raw.* A 500 says "the server had a problem,
+  try again"; a 404's detail is ours and is shown.
+
+**Alternatives rejected:**
+- *Hide the report until analysis finishes*: hours of nothing for a new user, against the
+  design's whole point that the API serves partial results while the backlog drains.
+- *Server-rendering the report*: the API URL is public and the switcher needs a client
+  fetch anyway; server rendering would add a second data path to keep in step.
+
+**Talking point:** "The report is honest about what it knows. Results and openings are
+complete as soon as the download is; the engine-based sections show their sample size,
+grow while you watch, and say 'waiting for the engine' instead of showing a zero. The
+backend made that possible by never mixing the two - the frontend's job was not to hide
+it."
+
+**Where:** `web/src/app/players/[username]/Overview.tsx`, `ReportView.tsx`,
+`web/src/lib/use-async.ts`.
+
+---
+
+## 2026-11-06 - Four charts, drawn by hand, each answering one question `DONE`
+
+> **In plain English:** The dashboard has exactly four pictures, and each one answers one
+> question a chess player actually asks: am I getting better, which openings lose me
+> points, when in the game do I make my worst moves, and do I fall apart when the clock is
+> nearly out. Instead of installing a big ready-made chart kit, I drew them myself - a line
+> and a few bars - because a kit that can draw a hundred kinds of chart is a lot of extra
+> weight for four simple ones. Every chart also has a "show as table" button, so someone
+> who cannot see colours, or uses a screen reader, gets the same numbers.
+
+**A bit deeper:** The charts are *SVG* (shapes described in code that the browser draws
+crisply at any size) and plain HTML bars. Colours were checked by a script for contrast and
+for colour-blind readers rather than by eye. Red appears in exactly one place - rating
+*lost* on an opening - against blue for rating gained, with a grey zero line between, so
+red always means "this costs you" and never decorates.
+
+**What changed:** `web/src/components/`: a segmented control (the time-control switcher),
+stat tiles, a section frame that states its question and holds the table twin, loading /
+empty / error states, and `charts/`: a line chart with a snapping crosshair, plain bars,
+and diverging bars. `web/src/lib/format.ts` does all rounding and wording.
+
+**Why the details are the way they are:**
+
+- *No chart library.* The four forms need about 250 lines between them. The common React
+  chart libraries are 50-100 KB of JavaScript before any data, and their defaults (thick
+  bars, legends for single series, dashed grids) would all need overriding.
+- *The switcher is a radio group,* not a row of buttons: arrow keys move between options and
+  only the selected one is a tab stop, which is what screen readers expect of "pick one".
+  Time controls with no games are disabled, not hidden, so the four are always in the same
+  place.
+- *The crosshair snaps to the nearest day* by binary search, so a reader aims at a date,
+  never at a 2-pixel line, and arrow keys move it for keyboard users.
+- *While a new time control loads, the old charts dim instead of flashing to skeletons,*
+  so the page never jumps.
+- *Values are printed on every bar,* so the hover layer is a nicety, not the only way to
+  read a number.
+
+**Alternatives rejected:**
+- *Recharts / Chart.js / visx*: weight and override work for four simple forms.
+- *A donut for win/draw/loss*: three numbers read better as three numbers.
+- *One colour per opening*: identity colours for 15 openings would be unreadable; rows with
+  labels need no colour at all.
+
+**Talking point:** "Every chart on the dashboard answers one question, and if I couldn't
+name the question I didn't draw the chart. They're hand-rolled SVG and HTML - four forms
+didn't justify a 100 KB library - with the palette checked by a script for contrast and
+colour-blindness, and every chart has a table twin so no number is locked behind a hover."
+
+**Where:** `web/src/components/`, `web/src/components/charts/`, `web/src/lib/format.ts`.
+
+---
+
+## 2026-11-05 - The website and the server agreed on a contract before either was built `DONE`
+
+> **In plain English:** The website and the part of the program that answers its questions
+> are being built at the same time, by different people. So before anyone wrote code, I
+> wrote down exactly what the website will ask for and exactly what it gets back: every
+> number, what it means, and what unit it is in. It is like two teams building a bridge
+> from opposite banks - they agree on where the middle is first. While I was at it, I
+> checked one thing in the real data instead of assuming it: whether the rating stored with
+> each game is the rating *before* or *after* that game. It is after, which is what makes
+> "which openings cost me rating" possible to answer at all.
+
+**A bit deeper:** The agreement is an *API contract*: the addresses the website calls
+(*endpoints*), what goes in, and the exact shape of the data that comes back. Until the real
+server exists the website talks to a *mock* - a pretend server that returns saved sample
+data in that same shape - and one setting switches it to the real thing. The sample data is
+my real game history; the parts that need the chess engine, which has not run yet, are made
+up and labelled as made up.
+
+**What changed:** `docs/api-contract.md` (three endpoints: add a player, sync progress,
+report per time control), `web/src/lib/api-types.ts` (the same shapes in TypeScript),
+`web/src/lib/api.ts` (the only data door; `NEXT_PUBLIC_API_URL` set means the real API,
+unset means fixtures), `web/scripts/fixtures.sql` (a read-only query that produced the real
+fixtures), and `web/src/lib/fixtures/` (real ingested numbers plus a clearly marked
+`synthetic.ts`).
+
+**Why the details are the way they are:**
+
+- *One report call per time control.* Every view is scoped to exactly one, and DESIGN.md
+  says results are never mixed across them, so the API shape makes mixing impossible.
+- *The rating is the after-game rating - measured, not assumed.* Taking each rated game's
+  rating minus the previous one's, the average is +10.9 after a rapid win and -13.1 after a
+  loss; the same calculation shifted one game the other way is about zero. So a game's
+  rating change is a `LAG()` away, and "rating lost per opening" is a sum, not a guess from
+  win rate.
+- *Openings are grouped into families,* because Chess.com names are too fine-grained (111
+  names in 434 blitz games). One regular expression - cut the name after the first
+  "Opening / Defense / Game / Gambit / System / Attack" - turns "Queens Pawn Opening
+  Zukertort Variation" into "Queens Pawn Opening". It is written into the contract as SQL,
+  so the fixtures and the real API cannot group differently.
+- *Opening and colour are separate rows.* Meeting the Caro-Kann as White and playing it as
+  Black are different problems.
+- *Counts, not rates, for move-level sections.* The API sends "4,210 moves, 38 blunders",
+  and each rate has one definition, in one place.
+- *Every unit is stated once:* percentages 0-100, timestamps UTC with `Z`, dates are UTC
+  days, ratings are integers, and no field is in centipawns at all.
+- *No field is per month, on purpose.* The reviewer measured that Chess.com files its monthly
+  archives by the game's end date in US Pacific time, so about 1.6% of games sit in a
+  different month depending on the zone. A "games per month" field would quietly disagree
+  with either Chess.com or our own UTC days, so the contract has none, and says that any
+  future month field must name its zone.
+- *`null` means "not applicable or not known yet", never zero.* Time pressure is `null` for
+  daily games, where clocks run in days; a section with no analyzed games is `null` rather
+  than a misleading 0 blunders.
+- *Progress always lists all four time controls,* and analyzed + pending + failed + skipped
+  always equals games, so the UI never has to guess what a missing entry means.
+
+**Alternatives rejected:**
+- *One endpoint per report section*: four requests and four loading states for one screen,
+  and four chances to disagree about how many games were analyzed.
+- *Win rate per opening as "the cost"*: it ignores who you played. Rating change already
+  accounts for opponent strength, because Chess.com's rating formula does.
+- *Grouping openings by ECO code*: D02 covers both the London System and the Zukertort,
+  which a player thinks of as different openings.
+
+**Known limitation:** the first handful of games in each time control carry provisional
+rating swings of up to 155 points, which can dominate a small opening group. Six games per
+time control at most, so it is documented rather than special-cased.
+
+**Talking point:** "I wrote the API contract before either side existed, down to units and
+nulls, so the frontend and the backend could be built in parallel and a reviewer could
+check them against one document. The best part was a question I could have assumed: is the
+stored rating before or after the game? I measured it - the average change after a win is
++11 and after a loss -13 - and that turned 'which openings cost me rating' into a one-line
+window function instead of an estimate."
+
+**Where:** `docs/api-contract.md`, `web/src/lib/api-types.ts`, `web/src/lib/api.ts`,
+`web/src/lib/fixtures/`, `web/scripts/fixtures.sql`.
+
+---
+
 ## 2026-11-05 - The dashboard ships three runtime dependencies, every version pinned `DONE`
 
 > **In plain English:** The website is built from other people's code - a framework, a
