@@ -49,6 +49,50 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
 
+## 2026-11-06 - Bug: my win rate claimed to match Chess.com, and didn't `DONE`
+
+> **In plain English:** The report's headline said my blitz win rate was 51.04%, and the
+> contract I wrote promised it would match the number on Chess.com. Chess.com says 50.70%.
+> The difference was a handful of "just for fun" games that don't count towards your
+> rating: Chess.com leaves them out of your record, and I had left them in. A tester
+> caught it by putting the two numbers side by side. Now the headline record counts only
+> the games that count on Chess.com, and all four game types match it exactly.
+
+**A bit deeper:** Chess.com games are either *rated* (they move your rating) or *unrated*.
+Its stats page builds your win/loss/draw record from rated games only. My `summary` counted
+every standard game, so any time control with unrated games drifted from the number the
+player would check it against.
+
+**Symptom:** blitz 221 / 15 / 197 over 433 games = 51.04%, against Chess.com's 218 / 15 /
+197 over 430 = 50.70%; rapid showed 242 wins against Chess.com's 241. Bullet and daily,
+which have no unrated games, matched - which is why it looked right at a glance.
+
+**How found:** the tester reconciled the contract's own claim ("matches Chess.com's stats
+page") against the real numbers instead of taking the sentence on trust.
+
+**Root cause:** the contract defined the headline record over "standard games, rated and
+unrated" and *also* promised it matched Chess.com, and those two statements contradict each
+other whenever unrated games exist. I wrote the promise without checking it against the one
+time control where it could fail.
+
+**Fix:** `summary` gains a `games` field and its record (`games`, `wins`, `draws`,
+`losses`, `win_rate_pct`) counts rated games only. The fixture was regenerated (read-only)
+with `rated` in the filter, and now equals Chess.com in all four time controls: blitz
+218-197-15, bullet 1804-1837-49, rapid 241-153-29, daily 1-1-0 (won-lost-drawn). The rest
+of the report keeps unrated games on purpose: a blunder in a casual game is still a
+blunder. The tile now reads "Rated games" and says how many unrated games were left out.
+
+**Lesson:** a sentence like "this matches X" in a spec is a test, not a description: write
+it down as the exact numbers it must equal, and check it against the case most likely to
+break it. M1 verified its totals against Chess.com; the contract should have inherited
+that check, not just the claim.
+
+**Where:** `docs/api-contract.md` (`Summary`), `web/src/lib/api-types.ts`,
+`web/scripts/fixtures.sql`, `web/src/lib/fixtures/deitythemenace.real.json`,
+`web/src/app/players/[username]/ReportView.tsx`.
+
+---
+
 ## 2026-11-06 - Bug: a percent sign in the address crashed the player page `DONE`
 
 > **In plain English:** Web addresses use the % sign as a code for special characters. If
