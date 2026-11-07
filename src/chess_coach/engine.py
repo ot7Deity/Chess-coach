@@ -21,6 +21,12 @@ The engine version is read from the binary's own UCI `id name`, not configured.
 A configured string can disagree with the binary actually running; the binary
 cannot. It does not include the SIMD build, because every build of one release
 returns the same evaluations - only the speed differs.
+
+It *does* include the hash size ('sf_18-h128'). With the table cleared before
+every position, the hash size is the one engine setting left that changes the
+answer: measured at depth 16, 16 MB and 128 MB disagreed on one position in
+six, by 2 cp. Small, but a value that depends on an input the key does not
+name is exactly the bug the key exists to prevent, so the input goes in the key.
 """
 
 from __future__ import annotations
@@ -57,6 +63,12 @@ class EngineTimeout(EngineError):
 
 class EngineCrashed(EngineError):
     pass
+
+
+def engine_version(name: str, *, hash_mb: int) -> str:
+    """The cache's engine identifier: release plus every setting that changes
+    the evaluation. 'Stockfish 18', 128 MB -> 'sf_18-h128'."""
+    return f"{engine_version_from_name(name)}-h{hash_mb}"
 
 
 def engine_version_from_name(name: str) -> str:
@@ -97,14 +109,18 @@ class StockfishEngine:
         self._hash_mb = hash_mb
         self._timeout_sec = timeout_sec
         self.restarts = 0
-        if threads > 1:
-            log.warning(
-                "engine.nondeterministic",
-                threads=threads,
-                detail="multi-threaded search is not reproducible; cached evals will vary",
+        if threads != 1:
+            # Not a warning: multi-threaded search is non-deterministic (measured:
+            # -186 and -213 for one position on two runs), and no cache key can
+            # name "which thread finished first". Scale with processes instead.
+            raise ValueError(
+                f"engine threads must be 1 for reproducible evaluations, got {threads}"
             )
         self._engine = self._start()
-        self.version = engine_version_from_name(self._engine.id.get("name", ""))
+        # 'sf_18' - the release, for logs.
+        self.release = engine_version_from_name(self._engine.id.get("name", ""))
+        # 'sf_18-h128' - what cached evaluations are filed under.
+        self.version = engine_version(self._engine.id.get("name", ""), hash_mb=hash_mb)
 
     # --- lifecycle ----------------------------------------------------------
 

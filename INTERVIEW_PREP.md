@@ -55,6 +55,66 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
 
+## 2026-11-06 - The sixth time: the engine's memory size was a hidden input to the cache `DONE`
+
+> **In plain English:** The chess engine has a setting for how much scratch memory it may
+> use while thinking. I had assumed that only changes how *fast* it thinks, not *what* it
+> concludes. I measured it anyway, and it does change the answer - rarely and slightly (one
+> position in six, by a fiftieth of a pawn), but it does. The saved answers were filed under
+> a label that named the engine and how deep it thinks, not the memory size. So changing the
+> setting would have mixed two slightly different sets of answers under one label. The label
+> now includes the memory size. And a second setting I had only *warned* about - letting the
+> engine think on several processor cores at once - is now refused outright, because it
+> makes the answer change from run to run, and no label can fix that.
+
+**A bit deeper:** The cache key is (position, engine version, depth). With the hash table
+cleared before every search, the remaining engine setting that changes a fixed-depth result
+is the *hash size*: a smaller table evicts entries during the search and can take a slightly
+different path. The fix extends the *engine version* part of the key, rather than adding a
+column, so the positions table, the cache protocol and every caller stay as they are.
+
+**Symptom / how it was found:** not a production failure - a measurement taken while building
+the engine wrapper. At depth 16 on six positions from one game, Hash = 16 MB gave `-45` where
+64, 128 and 256 MB all gave `-43`; the other five positions agreed. I logged it as an open
+question rather than acting on it; the decision was to fold it into the key.
+
+**Root cause:** the same one as five times before in this project - a stored value depending
+on an input its key does not name. (The others: engine version and depth in `positions`; the
+CI engine cache's probe and host; the engine image's CPU; the games table's player; and the
+engine's transposition table and halfmove clock.)
+
+**Fix:** `StockfishEngine.version` is now `sf_18-h128` (release plus hash size), built by
+`engine_version(name, hash_mb=...)`; the plain release (`sf_18`) is kept as `.release` for
+logs. `ENGINE_THREADS` other than 1 is now rejected - by `Settings` and by the wrapper -
+instead of logging a warning, because multi-threaded search gave -186 and -213 for one
+position on two runs, and thread timing is not something any key can name.
+
+**Cost:** none at run time. Changing `ENGINE_HASH_MB` now starts a fresh set of cache entries
+instead of silently reusing the old ones - which is the point.
+
+**Alternatives rejected:**
+- *Pin the hash size and document it*: a rule that holds until someone tunes memory for a
+  benchmark, and then fails silently.
+- *Add a `hash_mb` column to the key*: correct, but a schema and protocol change across M2 and
+  M3 for what the version string already expresses.
+- *Ignore a 2 cp difference*: it would never change a classification today, but "never
+  matters" is a claim about every future position, and the fix is one string.
+
+**Lesson:** the third time it was caught by reasoning, this time by a measurement taken just
+to check an assumption ("hash size only affects speed"). Measuring the boring assumption is
+cheap; finding a mixed cache later is not.
+
+**Talking point:** "Six times now the bug has been the same: a stored value depends on an
+input its key doesn't name. The latest one I found by checking an assumption I was fairly
+sure of - that the engine's hash size only changes speed. It changed one score in six by 2
+centipawns. Tiny, but it means two hash sizes would share cache entries that disagree, so the
+hash size is now part of the engine version. And multi-threading went from a warning to an
+error, because thread timing is an input no key can capture."
+
+**Where:** `src/chess_coach/engine.py` (`engine_version`, `StockfishEngine.version` and
+`.release`), `src/chess_coach/config.py`, `.env.example`, `tests/test_engine.py`,
+`tests/test_config.py`.
+
 ## 2026-11-06 - The container proved the "probe at start" decision on my own laptop `DONE`
 
 > **In plain English:** Earlier I decided the chess engine must be chosen when the

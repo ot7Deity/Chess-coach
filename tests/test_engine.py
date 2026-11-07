@@ -20,6 +20,7 @@ from chess_coach.engine import (
     EngineError,
     EngineTimeout,
     StockfishEngine,
+    engine_version,
     engine_version_from_name,
 )
 from chess_coach.positions import fen_hash
@@ -39,6 +40,21 @@ DEPTH = 10
 )
 def test_engine_version_comes_from_the_uci_name(name, version):
     assert engine_version_from_name(name) == version
+
+
+@pytest.mark.parametrize(("hash_mb", "version"), [(16, "sf_18-h16"), (128, "sf_18-h128")])
+def test_the_cache_version_names_the_hash_size(hash_mb, version):
+    """Regression for the sixth "the value depends on something the key does
+    not name": 16 MB and 128 MB gave different scores for one position in six
+    (by 2 cp at depth 16), so evaluations at different hash sizes must never be
+    filed under the same version."""
+    assert engine_version("Stockfish 18", hash_mb=hash_mb) == version
+
+
+def test_more_than_one_search_thread_is_refused(tmp_path: Path):
+    """Not merely discouraged: no cache key can name thread timing."""
+    with pytest.raises(ValueError, match="threads must be 1"):
+        StockfishEngine(_fake(tmp_path, "ok"), depth=DEPTH, threads=2)
 
 
 def test_an_unknown_engine_is_refused_rather_than_given_a_made_up_version():
@@ -140,10 +156,11 @@ def stockfish(stockfish_path: Path):
 
 
 @pytest.mark.engine
-def test_the_pinned_engine_reports_sf_18(stockfish: StockfishEngine):
-    """Must match tools/stockfish.lock.json's tag and the versions the
-    positions table is keyed on - and must not mention the SIMD build."""
-    assert stockfish.version == "sf_18"
+def test_the_pinned_engine_reports_sf_18_and_its_hash_size(stockfish: StockfishEngine):
+    """The release must match tools/stockfish.lock.json's tag and must not
+    mention the SIMD build; the cache key carries the hash size as well."""
+    assert stockfish.release == "sf_18"
+    assert stockfish.version == "sf_18-h16"
 
 
 @pytest.mark.engine

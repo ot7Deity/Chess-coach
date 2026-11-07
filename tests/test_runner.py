@@ -296,7 +296,7 @@ def test_the_evaluator_asks_the_cache_first_and_fills_it_on_a_miss(stockfish):
     first = evaluate(board)
     assert len(cache.store) == 1
     (key,) = cache.store
-    assert key[1:] == ("sf_18", DEPTH)
+    assert key[1:] == ("sf_18-h16", DEPTH)
 
     sentinel = Evaluation(eval_cp=12345, mate_in=None, best_move="a2a3")
     cache.store[key] = sentinel
