@@ -129,10 +129,10 @@ def get_report(
                 if analyzed
                 else None
             ),
-            # Daily clocks run in days; "under 30 seconds" means nothing there.
+            # Daily games have no clock; time_pressure() enforces null for daily.
             time_pressure=(
-                asdict(report.time_pressure(session, pid, time_class))
-                if analyzed and time_class != "daily"
-                else None
-            ),
+                asdict(tp) if (tp := report.time_pressure(session, pid, time_class)) else None
+            )
+            if analyzed
+            else None,
         )

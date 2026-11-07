@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     job_retry_base_sec: float = Field(default=30.0, gt=0)
     job_retry_cap_sec: float = Field(default=1800.0, gt=0)
 
+    # --- API ----------------------------------------------------------------
+    cors_origins: str = "http://localhost:3000,http://localhost:3001"
+
     # --- Misc ---------------------------------------------------------------
     log_level: str = "INFO"
     env: str = "dev"
