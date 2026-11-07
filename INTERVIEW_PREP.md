@@ -55,6 +55,65 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
 
+## 2026-11-06 - Grading a move: whose point of view, a mate already given, and what the cap really does `DONE`
+
+> **In plain English:** The engine always scores a position for whoever's turn it is. So
+> after you move, its score is from your *opponent's* side, and the program has to flip it
+> to say how your move went. Flipping is just "change the sign" - except in one case:
+> checkmate. The engine writes "already checkmated" as zero, and flipping zero gives zero, so
+> "I just checkmated them" would quietly turn into "I've been checkmated". That case is now
+> handled on its own, and checkmating someone always counts as the best move. Writing the
+> tests also caught me misreading my own rule: I'd assumed capping scores at ten pawns made a
+> slip in an already-lost game count for nothing. For the example in my own notes it doesn't
+> - it shrinks a "blunder" to a "mistake". The tests now say what the rule really does.
+
+**A bit deeper:** Engine scores are *relative* (side-to-move point of view); the report needs
+them from the *mover's* point of view, which is a negation for the position after the move.
+A *mate score* is a distance ("mate in 3"), signed by who is mating, and *mate in 0* is the
+checkmate itself. Classification *clamps* both scores to +/-1000 centipawns before
+subtracting, so swings beyond the cap stop counting - but only the part beyond the cap.
+
+**What changed:** `src/chess_coach/analysis/classify.py` (`MoverScore`, `mover_before`,
+`mover_after`, `classify`, `classify_move`, `phase`) and `analysis/clock.py`
+(`parse_time_control`, `move_times`), with 51 unit tests.
+
+**The two things the tests caught:**
+
+- *Mate in 0 cannot be negated.* `mover_after` special-cases it: the opponent is to move and
+  mated, so the mover has delivered mate (`mate_in_after = 0` in mover terms), which clamps to
+  +1000. `classify_move` then calls any mating move `best` outright - otherwise, with two mates
+  in one on the board, the one the engine didn't name would be graded on arithmetic. The
+  reviewer flagged this independently; the tests cover a mating move from a lost position and
+  from a position where the engine preferred a different mate.
+- *My reading of the clamp was wrong, not the code.* The decision log's example, -900 -> -1300,
+  is a 400 cp drop raw. Clamped, it is -900 -> -1000: 100 cp, a **mistake**. I had written the
+  test expecting "good". The clamp fully erases swings that are beyond the cap on *both* sides
+  (-1100 -> -1500 is "good"), and softens ones that cross it. That is the rule the project
+  decided on, so the code stays and the test now documents it honestly.
+
+**Other details:** the engine's own move is `best` whatever the arithmetic says (the score
+after a move is a fresh, deeper search and can differ by more than noise); thresholds are
+inclusive (exactly 300 cp is a blunder); phase is endgame by material alone (non-pawn material
+<= 26 of the starting 62), opening for moves 1-10, middlegame otherwise. Move times use each
+player's own previous clock reading plus the increment, never go negative, and are `None`
+rather than guessed when a reading is missing or the game is daily.
+
+**Alternatives rejected:**
+- *Encode a delivered mate as +1 or a sentinel*: changes the meaning of `moves.mate_in_after`
+  for every consumer; an explicit branch in one function is cheaper to explain.
+- *Change the test to match my assumption by tightening the clamp*: the clamp value is a
+  recorded decision, and the raw evals are stored precisely so it can be revisited with real
+  data.
+
+**Talking point:** "Point of view is where move grading goes wrong. The engine scores for the
+side to move, so the 'after' score is the opponent's and has to be negated - except checkmate,
+which the engine writes as mate-in-zero, and negating zero is still zero. So 'I gave mate'
+would have read as 'I got mated'. And my own tests caught me misreading my own clamping rule:
+it softens a slip in a lost game from blunder to mistake, it doesn't erase it."
+
+**Where:** `src/chess_coach/analysis/classify.py`, `src/chess_coach/analysis/clock.py`,
+`tests/test_classify.py`, `tests/test_clock.py`.
+
 ## 2026-11-06 - Bug: my timeout fix made the test run hang forever, one run in four `DONE`
 
 > **In plain English:** If the chess engine freezes, my program is supposed to give up on it
