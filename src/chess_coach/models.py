@@ -389,9 +389,10 @@ class Job(Base, TimestampMixin):
     last_error: Mapped[str | None] = mapped_column(Text)
     finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
 
-    # Makes enqueueing idempotent as well as execution: 'analyze-game-<uuid>'
-    # can be enqueued twice without creating two jobs. Separate from the
-    # unique chesscom_uuid, which protects the games table rather than the queue.
+    # Makes enqueueing idempotent as well as execution: 'analyze-game:<games.id>'
+    # can be enqueued twice without creating two jobs. Keyed on games.id, not the
+    # Chess.com uuid: since migration 0002 one uuid can be two games rows (one
+    # per tracked player), and each needs its own analysis.
     dedupe_key: Mapped[str | None] = mapped_column(String(128), unique=True)
 
     __table_args__ = (

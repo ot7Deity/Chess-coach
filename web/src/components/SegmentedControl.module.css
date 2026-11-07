@@ -1,0 +1,69 @@
+.root {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(var(--count), minmax(0, 1fr));
+  padding: 3px;
+  border-radius: var(--radius-m);
+  background: var(--surface-sunken);
+  width: 100%;
+  max-width: 520px;
+}
+
+/* The white pill slides under the selected segment rather than each segment
+   painting its own background: one moving thing reads as one choice. */
+.thumb {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  width: calc((100% - 6px) / var(--count));
+  transform: translateX(calc(100% * var(--index)));
+  border-radius: calc(var(--radius-m) - 3px);
+  background: var(--control-thumb);
+  box-shadow: var(--control-thumb-shadow);
+  transition: transform var(--dur) var(--ease);
+}
+
+.thumb[data-hidden="true"] {
+  opacity: 0;
+}
+
+.segment {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  min-height: 44px;
+  padding: 6px 4px;
+  border: 0;
+  border-radius: calc(var(--radius-m) - 3px);
+  background: transparent;
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease);
+}
+
+.segment:disabled {
+  cursor: default;
+  color: var(--text-tertiary);
+}
+
+.label {
+  font-size: var(--text-s);
+  font-weight: 500;
+}
+
+.segment[aria-checked="true"] .label {
+  font-weight: 600;
+}
+
+.hint {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.segment:disabled .hint {
+  color: var(--text-tertiary);
+}

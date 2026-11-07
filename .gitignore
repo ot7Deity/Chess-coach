@@ -32,6 +32,10 @@ web/.next/
 web/out/
 web/.env*.local
 
+# Claude Code agent worktrees: separate checkouts of other branches, never
+# content of this one.
+.claude/
+
 # Editors / OS
 .vscode/
 .idea/
