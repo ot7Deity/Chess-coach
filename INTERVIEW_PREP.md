@@ -55,6 +55,140 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
 
+## 2026-11-06 - The container proved the "probe at start" decision on my own laptop `DONE`
+
+> **In plain English:** Earlier I decided the chess engine must be chosen when the
+> container starts, on the machine that runs it, not when the package is built - because the
+> fastest version crashes on processors that lack one special feature. I expected that to
+> matter on *other* machines. The first time I ran the container on my own laptop, the
+> fastest version crashed right there. My laptop's processor has the feature, but the little
+> virtual computer Docker runs containers in doesn't pass it through. The installer noticed
+> the crash, stepped down one level, and the worker started normally. If the engine had been
+> picked while building the package on this same laptop, every container would have crashed.
+
+**A bit deeper:** On Windows, Docker Desktop runs Linux containers inside a lightweight
+*virtual machine* (WSL 2). A VM can expose a subset of the host CPU's *instruction set
+extensions*. Here the host (Intel Core Ultra 7 155H) supports AVX-VNNI, the VM did not
+expose it, and the AVX-VNNI build of Stockfish died with an illegal instruction (exit -4).
+The fallback chain picked the AVX2 build.
+
+**What changed:** a `Dockerfile` (one image for the API, migrations and the worker; Stockfish
+deliberately absent), `docker/entrypoint.sh` (runs `tools/fetch_stockfish.py`, then `exec`s
+the command), and `migrate` / `api` / `worker` services in `docker-compose.yml` behind an
+`app` profile, with the engine in a named `vendor` volume.
+
+**What I ran, and what it printed** (first start, empty volume):
+
+```
+[fetch-stockfish] trying stockfish-ubuntu-x86-64-avxvnni.tar (109 MiB)
+[fetch-stockfish]   smoke test exited -4 (wrong SIMD build for this CPU)
+[fetch-stockfish] trying stockfish-ubuntu-x86-64-avx2.tar (109 MiB)
+[fetch-stockfish]   OK - Stockfish 18 (searched both evaluation networks)
+worker.start depth=8 engine=sf_18
+```
+
+The second start re-probed the binary already in the volume ("nothing to do"), and the whole
+`docker run` took 3.6 s. Then the container analysed the 90-ply test game at depth 12 in
+6.3 s against the test database: `complete`, 90 moves. The engine version is `sf_18` on the
+host's AVX-VNNI build and the container's AVX2 build alike, which is what lets their cached
+evaluations be shared.
+
+**Why the details are the way they are:**
+
+- *The `app` profile.* `docker compose up -d` is what every developer and the tests already
+  run for Postgres and Redis. Adding the app without a profile would quietly start a second
+  worker competing for the same queue as the ones on the host.
+- *`flock` around the installer.* `--scale worker=4` starts four containers at once on one
+  shared volume; without a lock, four installers would download into the same directory at
+  once. With it, the first downloads and the rest wait, then find a verified binary.
+- *Only the worker probes.* The API and migrations never touch the engine, so they set
+  `FETCH_STOCKFISH=0` and start in a second instead of waiting on a download.
+- *Dependencies are a separate layer* from the source, so a code change rebuilds in seconds;
+  uv is pinned to the version the lock file is maintained with; the app runs as a non-root
+  user; `stop_grace_period: 60s` gives SIGTERM time to finish the current game.
+
+**Alternatives rejected:** the ones in the original `DECIDED` entry (fetch at build time, bake
+the baseline build, one image per SIMD level) - and this run is the evidence for that call:
+build-time selection on this very laptop would have produced an image that crashes on this
+very laptop.
+
+**Talking point:** "I'd decided the engine build must be picked on the machine that runs it,
+because an image moves between CPUs. I assumed that mattered for other machines. The first
+container I ran on my own laptop proved it: the host CPU has AVX-VNNI, Docker's VM doesn't
+expose it, the fast build died with an illegal instruction, and the probe fell back to AVX2.
+A build-time choice would have shipped an image that crashes on the machine that built it."
+
+**Where:** `Dockerfile`, `docker/entrypoint.sh`, `docker-compose.yml`. The original decision is
+the "engine is probed at container start" entry in the pre-M1 block.
+
+## 2026-11-06 - M2: kill a worker mid-game, and the game is still analysed exactly once `DONE`
+
+> **In plain English:** This is the test the whole second milestone was aiming at. I start
+> a real worker, let it get properly into analysing a 90-move game, and then kill it
+> instantly - no warning, no chance to tidy up, like pulling the plug on a computer. Then I
+> start a second worker and tell it to finish whatever is left. It has to notice the first
+> worker has gone quiet, take over the game, analyse it from the start, and stop. At the end
+> the game has exactly 90 moves saved - not 0, not 180 - it is marked finished once, and the
+> logs show only the second worker ever finished it. It took about 8 seconds from the first
+> worker's last sign of life to a finished game, and it passed on every one of nine runs.
+
+**A bit deeper:** The test uses real *processes* (not threads pretending), a real Postgres and
+a real Stockfish. "Killed hard" means `TerminateProcess` on Windows (`SIGKILL` on Linux): the
+process gets no chance to run any cleanup code, which is what a crash, an out-of-memory kill
+or a power cut looks like. Recovery then depends only on the *lease* expiring and the
+*reaper* handing the job back - the mechanisms in the earlier entries.
+
+**What the test does, step by step** (`tests/test_kill_recovery.py`):
+
+1. Insert a 90-ply game and enqueue it. Start worker A as a subprocess at depth 12 with a
+   3-second lock timeout (so it heartbeats every second).
+2. Wait until A has claimed the job **and heartbeated at least once** - proof it is in the
+   middle of the analysis, not just past the claim - and assert no moves are written yet.
+3. Kill A. Then watch the job for 2.5 heartbeat intervals and assert its `locked_at` does not
+   move: A really is dead. (This check exists because on Windows `sys.executable` in a venv is
+   a launcher that starts the real interpreter as a child; if killing the launcher left the
+   child running, the test would say so instead of passing by accident. It doesn't.)
+4. Start worker B with `--until-empty`. B waits out A's lease, reaps it, re-claims the job as
+   attempt 2, analyses the game and exits 0.
+5. Assert: the job is `done`, by B, on attempt 2, and its `last_error` records that A's lease
+   expired; the game is `complete` with `ply_count` 90; there are exactly 90 move rows with
+   90 distinct plies running 1 to 90, all graded; A's log contains no `job.done`, B's contains
+   one `job.reaped` and one `job.done`.
+
+A second test runs three workers over eight games concurrently and asserts every job finished
+on its first attempt, every game is complete, and the move count is exactly the sum of the
+games' lengths.
+
+**Measured:** last heartbeat from A to game complete: 8.0 s, 8.1 s, 8.3 s across three runs
+(3 s of that is the lock timeout, ~2.5 s is the test's own "is A dead" wait, the rest is B
+starting and analysing 91 positions). The test passed 9 runs out of 9.
+
+**Why "exactly once" holds, in one paragraph:** a job can be *executed* more than once - that
+is what recovery means - but its *effect* is written once. A writes nothing until the end;
+its results would commit in the same transaction as `done`, and only if its lease (fenced by
+the attempt number) is still current. So a killed A leaves no trace, a stalled-then-revived A
+writes zero rows, and B's run is the only one that commits. Moves are upserted on
+(game_id, ply) underneath that, so even a hypothetical double commit could not create
+duplicate rows.
+
+**Alternatives rejected:**
+- *Test with threads and a fake "kill"*: a thread cannot be killed without running its
+  `finally` blocks, which is precisely the cleanup a real crash skips.
+- *Kill at a random moment*: it would sometimes kill before the claim or after the commit,
+  which tests nothing interesting. Waiting for the first heartbeat pins the kill inside the
+  window that matters.
+
+**Talking point:** "The acceptance test for the queue kills a real worker process with
+SIGKILL in the middle of a 90-move game, after it has heartbeated, so it's genuinely
+mid-analysis. A second worker waits out the lease, takes the job over through the reaper and
+finishes it. Then I assert 90 rows, 90 distinct plies, the game completed once, and from the
+logs, only the second worker ever completed it. Recovery took about 8 seconds with a
+3-second lease. It's 'at-least-once execution, exactly-once effect', and the test checks
+the effect, not the mechanism."
+
+**Where:** `tests/test_kill_recovery.py`, `src/chess_coach/worker.py` (the CLI the test
+launches), and the queue, worker and fencing entries below.
+
 ## 2026-11-06 - The queue's defaults lived in Python, where only Python could see them `DONE`
 
 > **In plain English:** Every job has a few settings that are normally left at a standard
