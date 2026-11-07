@@ -46,8 +46,10 @@ Requires Docker Desktop and [uv](https://docs.astral.sh/uv/).
 cp .env.example .env            # then edit CHESSCOM_CONTACT
 docker compose up -d            # postgres + redis
 uv sync --extra dev
+uv run python tools/fetch_stockfish.py         # the engine build that runs on this CPU
 uv run alembic upgrade head     # create the schema
-uv run chess-coach-sync <chess.com username>   # load a player's full history
+uv run chess-coach-sync <chess.com username>   # load a player's history, queue its games
+uv run chess-coach-worker --until-empty        # analyse the queue, then exit
 uv run uvicorn chess_coach.api.main:app --reload
 ```
 
@@ -57,10 +59,30 @@ costs two requests. For `deitythemenace` the first sync loads 4,550 games in abo
 (at the polite default of one request per second); the second makes two requests and
 downloads nothing.
 
-Compose starts the infrastructure only. The API and workers run on the host for now -
-they join the compose file in M2, once there is a worker to run and the engine binary
-can be probed on the machine that will execute it. See
-[INTERVIEW_PREP.md](INTERVIEW_PREP.md) for why it is split that way.
+A sync finishes by putting every newly loaded game on the analysis queue (one job per
+game, rapid, blitz and daily ahead of bullet). `chess-coach-worker` runs one Stockfish and
+works through that queue; start several to go faster. Each one takes a different game, and
+a worker that dies mid-game has its game picked up by another once its lease expires.
+`--worker-id`, `--max-jobs N` and `--until-empty` exist for benchmarks.
+
+### Running the app in Docker
+
+`docker compose up -d` starts the infrastructure only - Postgres and Redis, which the tests
+and host-run workers need. The app is behind the `app` profile:
+
+```bash
+docker compose --profile app up -d --build            # migrations, API on :8000, one worker
+docker compose --profile app up -d --scale worker=4   # four workers
+docker compose logs -f worker
+```
+
+The image contains no Stockfish binary. Each worker container runs the installer when it
+starts, which picks the fastest build that actually runs on that machine's CPU and stores it
+in the `vendor` volume, so the ~80 MB download happens once per machine. This is not a
+formality: on the development laptop the host CPU supports AVX-VNNI but Docker's VM does
+not pass it through, so the AVX-VNNI build crashes inside the container and the installer
+falls back to AVX2. See [INTERVIEW_PREP.md](INTERVIEW_PREP.md) for that story and the
+decision behind it.
 
 ### Tests
 

@@ -31,6 +31,7 @@ dev = [
 [project.scripts]
 chess-coach-api = "chess_coach.api.main:run"
 chess-coach-sync = "chess_coach.ingest.cli:main"
+chess-coach-worker = "chess_coach.worker:main"
 
 [build-system]
 requires = ["hatchling"]

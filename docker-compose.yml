@@ -1,14 +1,16 @@
-# Local development infrastructure: Postgres and Redis.
+# Local development: Postgres and Redis, plus the app behind a profile.
 #
-# The application processes (API, ingest worker, analysis worker) are
-# deliberately NOT here yet. Two of the three do not exist, and the Dockerfile's
-# one hard question - where the Stockfish binary comes from - is better answered
-# when it has consequences than now. See INTERVIEW_PREP.md.
+#   docker compose up -d                  Postgres and Redis only (the default)
+#   docker compose --profile app up -d    ...plus migrations, the API and a worker
+#   docker compose --profile app up -d --scale worker=4
+#   docker compose ps                     show health, not just "running"
+#   docker compose down                   stop everything, keep the data
+#   docker compose down -v                ...and delete the data
 #
-#   docker compose up -d      start Postgres and Redis, wait until healthy
-#   docker compose ps         show health, not just "running"
-#   docker compose down       stop them, keep the data
-#   docker compose down -v    stop them and delete the data
+# The app services are behind the `app` profile so that the plain
+# `docker compose up -d` everyone already runs keeps meaning "infrastructure
+# only" - the tests and host-run workers need Postgres and Redis, not a second
+# copy of the app competing for the same queue.
 #
 # Credentials are the ones in .env.example. They are development-only and
 # deliberately boring; nothing here is reachable from outside the machine.
@@ -65,6 +67,77 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # --- the app (profile: app) ----------------------------------------------
+  # One image for all three. The API and migrations never run the engine, so
+  # they skip the Stockfish installer; only the worker runs it.
+
+  migrate:
+    profiles: ["app"]
+    build: .
+    image: chess-coach:dev
+    environment: &app-env
+      DATABASE_URL: postgresql+psycopg://chess:chess@postgres:5432/chess_coach
+      REDIS_URL: redis://redis:6379/0
+      ENV: docker
+      FETCH_STOCKFISH: "0"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    profiles: ["app"]
+    image: chess-coach:dev
+    environment: *app-env
+    command: ["uvicorn", "chess_coach.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    profiles: ["app"]
+    image: chess-coach:dev
+    environment:
+      <<: *app-env
+      # The entrypoint probes THIS machine's CPU and installs the fastest
+      # Stockfish build that actually runs here, into the vendor volume. Never
+      # at build time: an image is copied to machines with different CPUs.
+      FETCH_STOCKFISH: "1"
+      ENGINE_DEPTH: ${ENGINE_DEPTH:-16}
+    command: ["chess-coach-worker"]
+    volumes:
+      # Shared by every worker replica, so the ~80 MB download happens once
+      # per machine; the entrypoint serialises the installer with flock.
+      - vendor:/app/vendor
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # SIGTERM finishes the current game before exiting; give it time to.
+    stop_grace_period: 60s
+    restart: unless-stopped
+
+  sync-worker:
+    profiles: ["app"]
+    image: chess-coach:dev
+    environment:
+      <<: *app-env
+      # Chess.com asks for a contactable User-Agent; set it in .env.
+      CHESSCOM_CONTACT: ${CHESSCOM_CONTACT:-you@example.com}
+    # sync-player jobs (queued by POST /players). No engine needed. One is
+    # enough: every sync worker shares one Redis rate limit of 1 request/s.
+    command: ["chess-coach-worker", "--kind", "sync"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    stop_grace_period: 30s
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:
+  vendor:

@@ -199,6 +199,9 @@ class Game(Base, TimestampMixin):
     analysis_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     analysis_skip_reason: Mapped[str | None] = mapped_column(Text)
     analyzed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    # Milliseconds of engine search spent analysing this game - cache misses
+    # only, so a fully cached game is 0. NULL until analysed (migration 0004).
+    engine_ms: Mapped[int | None] = mapped_column(BigInteger)
 
     player: Mapped[Player] = relationship(back_populates="games")
     moves: Mapped[list[Move]] = relationship(back_populates="game", cascade="all, delete-orphan")
@@ -353,15 +356,26 @@ class Job(Base, TimestampMixin):
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    # Server defaults as well as Python ones (migration 0003): the queue is the
+    # table other tools insert into with plain SQL - benchmarks, psql - and a
+    # Python-side default does nothing for them.
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
 
     # Lower runs first. Rapid and blitz are analysed before bullet: bullet
     # histories are large and low-information, and a new user's first report
     # should not wait behind thousands of one-minute games.
-    priority: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=100)
+    priority: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=100, server_default="100"
+    )
 
-    attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
-    max_attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=5)
+    attempts: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=0, server_default="0"
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=5, server_default="5"
+    )
 
     # Not before this time. Retry backoff is implemented by pushing this
     # forward, which keeps the whole retry policy in one column.

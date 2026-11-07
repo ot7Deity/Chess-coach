@@ -256,8 +256,7 @@ def fail(
     return row.status
 
 
-_REAP = text(
-    """
+_REAP = """
     UPDATE jobs
     SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END,
         finished_at = CASE WHEN attempts >= max_attempts THEN now() END,
@@ -275,14 +274,16 @@ _REAP = text(
         SELECT id FROM jobs
         WHERE status = 'running'
           AND locked_at < now() - :timeout_sec * interval '1 second'
+          {type_filter}
         FOR UPDATE SKIP LOCKED
     )
     RETURNING id, type, payload, status
     """
-)
 
 
-def reap_expired(session: Session, lock_timeout_sec: float) -> list[ReapedJob]:
+def reap_expired(
+    session: Session, lock_timeout_sec: float, *, types: Sequence[str] | None = None
+) -> list[ReapedJob]:
     """Hand back jobs whose worker has stopped heartbeating.
 
     The attempt still counts. A job that kills every worker that touches it
@@ -290,8 +291,16 @@ def reap_expired(session: Session, lock_timeout_sec: float) -> list[ReapedJob]:
     than take the pool down one worker at a time forever. It goes back with
     `run_after = now()` rather than a backoff: the lock timeout it just sat out
     already is one.
+
+    `types` limits it to some job types, so each kind of worker reaps its own
+    jobs and can put that job type's domain status back in step.
     """
-    rows = session.execute(_REAP, {"timeout_sec": lock_timeout_sec}).all()
+    params: dict[str, Any] = {"timeout_sec": lock_timeout_sec}
+    type_filter = ""
+    if types is not None:
+        type_filter = "AND type = ANY(:types)"
+        params["types"] = list(types)
+    rows = session.execute(text(_REAP.format(type_filter=type_filter)), params).all()
     return [ReapedJob(job_id=r.id, type=r.type, payload=r.payload, status=r.status) for r in rows]
 
 
