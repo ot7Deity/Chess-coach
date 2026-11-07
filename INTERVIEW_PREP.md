@@ -47,6 +47,67 @@ exactly; a re-sync costs **2 requests**.
 
 ---
 
+<!-- UI ENTRIES BELOW (dashboard). Newest first. -->
+
+## 2026-11-05 - The dashboard ships three runtime dependencies, every version pinned `DONE`
+
+> **In plain English:** The website is built from other people's code - a framework, a
+> library for drawing the page, a spell-checker for code. Each of those gets updated all the
+> time, and a fresh update is the one most likely to be broken. So I wrote down the exact
+> version of every piece, chose versions that had been out for a few weeks, and skipped two
+> brand-new major releases that the rest of the toolbox has not caught up with yet. It is
+> like buying a car model in its second year instead of the week it launches.
+
+**A bit deeper:** A JavaScript project lists its *dependencies* in `package.json`. Writing
+`^16.4.2` there means "16.4.2 or anything newer that claims to be compatible", so two
+machines installing on different days can get different code. An exact version plus a
+committed *lockfile* (the full list of every package underneath, with checksums) means CI,
+my laptop and the reviewer all run byte-for-byte the same thing.
+
+**What changed:** `web/` is a Next.js App Router project with three runtime dependencies
+(`next`, `react`, `react-dom`) and six dev ones (TypeScript, ESLint, the Next lint config and
+three type packages), all pinned exactly, with `package-lock.json` committed. Design tokens
+(colours, spacing, type scale, motion) live in one file. CI has a new `web` job - install,
+lint, typecheck, build - separate from the Python jobs.
+
+**Why:**
+
+- *Versions at least two weeks old.* Next.js 16.4.5 was two days old; 16.4.2 had three
+  weeks of other people finding its bugs. Patch releases of a framework fix regressions in
+  the previous patch often enough that the newest one is the riskiest.
+- *TypeScript 5.9, not 7.* TypeScript 7 is the rewrite in Go. The lint stack
+  (`typescript-eslint`) drives the compiler through its JavaScript API, so a major rewrite
+  is exactly where a linter and a compiler disagree. 5.9 is what that stack is tested on.
+- *ESLint 9, not 10,* for the same reason: `eslint-config-next` bundles React and
+  accessibility plugins that each have to support a new ESLint major separately.
+- *Tokens before components.* Light and dark mode are one block of CSS variables each, so
+  no component ever picks a colour; contrast was measured with a script (secondary text
+  5.1:1, accent text 5.4:1) instead of judged by eye.
+- *The CI job builds against the mock data layer,* so the website's checks never wait for
+  Postgres or the engine.
+
+**Alternatives rejected:**
+- *`create-next-app`*: it adds Tailwind, sample assets and a font loader this design does
+  not use. Six hand-written config files are easier to review than deleting the extras.
+- *Caret ranges plus the lockfile*: the lockfile does pin them, but the first `npm install`
+  of a new package re-resolves the ranges and quietly upgrades neighbours.
+
+**Known issue:** `npm audit` reports a moderate ReDoS in `minimatch` inside
+`typescript-eslint`. It is a lint-time dev dependency that never ships to the browser; the
+only offered fix downgrades the Next lint config a major version.
+
+**Talking point:** "The frontend has three runtime dependencies. Everything is pinned
+exactly with the lockfile committed, and I chose versions that were a few weeks old and
+skipped TypeScript 7 and ESLint 10, because the tooling around a brand-new major is where
+things break, and a dashboard has nothing to gain from being first."
+
+**Where:** `web/package.json`, `web/package-lock.json`, `web/src/app/globals.css`,
+`.github/workflows/ci.yml` (job `web`).
+
+<!-- end of UI entries -->
+
+---
+
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
 <!-- end of M3 entries -->
