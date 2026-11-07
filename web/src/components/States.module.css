@@ -43,6 +43,12 @@
   margin-top: var(--space-2);
 }
 
+/* A text-style button's padding would indent it from the copy above; pull it
+   back so its label lines up with the text. */
+.action > [data-variant="secondary"] {
+  margin-left: calc(-1 * var(--space-3));
+}
+
 .icon {
   display: inline-grid;
   place-items: center;

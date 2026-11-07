@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
+import { useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { linear, nearestIndex, niceTicks, timeTicks } from "./scale";
 import styles from "./charts.module.css";
 
@@ -24,9 +24,13 @@ const M = { top: 12, right: 44, bottom: 28, left: 40 };
 
 function useWidth(ref: React.RefObject<HTMLElement | null>): number {
   const [width, setWidth] = useState(0);
-  useEffect(() => {
+  // Measured before the first paint, not left to ResizeObserver's first callback,
+  // which arrives a frame later (and never, under a headless browser's virtual
+  // clock): without this the chart paints one empty frame first.
+  useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
+    setWidth(Math.floor(el.getBoundingClientRect().width));
     const ro = new ResizeObserver(([entry]) => setWidth(Math.floor(entry!.contentRect.width)));
     ro.observe(el);
     return () => ro.disconnect();
