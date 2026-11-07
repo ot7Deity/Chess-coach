@@ -49,6 +49,58 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
 
+## 2026-11-06 - Four charts, drawn by hand, each answering one question `DONE`
+
+> **In plain English:** The dashboard has exactly four pictures, and each one answers one
+> question a chess player actually asks: am I getting better, which openings lose me
+> points, when in the game do I make my worst moves, and do I fall apart when the clock is
+> nearly out. Instead of installing a big ready-made chart kit, I drew them myself - a line
+> and a few bars - because a kit that can draw a hundred kinds of chart is a lot of extra
+> weight for four simple ones. Every chart also has a "show as table" button, so someone
+> who cannot see colours, or uses a screen reader, gets the same numbers.
+
+**A bit deeper:** The charts are *SVG* (shapes described in code that the browser draws
+crisply at any size) and plain HTML bars. Colours were checked by a script for contrast and
+for colour-blind readers rather than by eye. Red appears in exactly one place - rating
+*lost* on an opening - against blue for rating gained, with a grey zero line between, so
+red always means "this costs you" and never decorates.
+
+**What changed:** `web/src/components/`: a segmented control (the time-control switcher),
+stat tiles, a section frame that states its question and holds the table twin, loading /
+empty / error states, and `charts/`: a line chart with a snapping crosshair, plain bars,
+and diverging bars. `web/src/lib/format.ts` does all rounding and wording.
+
+**Why the details are the way they are:**
+
+- *No chart library.* The four forms need about 250 lines between them. The common React
+  chart libraries are 50-100 KB of JavaScript before any data, and their defaults (thick
+  bars, legends for single series, dashed grids) would all need overriding.
+- *The switcher is a radio group,* not a row of buttons: arrow keys move between options and
+  only the selected one is a tab stop, which is what screen readers expect of "pick one".
+  Time controls with no games are disabled, not hidden, so the four are always in the same
+  place.
+- *The crosshair snaps to the nearest day* by binary search, so a reader aims at a date,
+  never at a 2-pixel line, and arrow keys move it for keyboard users.
+- *While a new time control loads, the old charts dim instead of flashing to skeletons,*
+  so the page never jumps.
+- *Values are printed on every bar,* so the hover layer is a nicety, not the only way to
+  read a number.
+
+**Alternatives rejected:**
+- *Recharts / Chart.js / visx*: weight and override work for four simple forms.
+- *A donut for win/draw/loss*: three numbers read better as three numbers.
+- *One colour per opening*: identity colours for 15 openings would be unreadable; rows with
+  labels need no colour at all.
+
+**Talking point:** "Every chart on the dashboard answers one question, and if I couldn't
+name the question I didn't draw the chart. They're hand-rolled SVG and HTML - four forms
+didn't justify a 100 KB library - with the palette checked by a script for contrast and
+colour-blindness, and every chart has a table twin so no number is locked behind a hover."
+
+**Where:** `web/src/components/`, `web/src/components/charts/`, `web/src/lib/format.ts`.
+
+---
+
 ## 2026-11-05 - The website and the server agreed on a contract before either was built `DONE`
 
 > **In plain English:** The website and the part of the program that answers its questions
