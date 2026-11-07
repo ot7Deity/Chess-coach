@@ -31,6 +31,13 @@ MIN_OPENING_GAMES = 5
 
 @dataclass(frozen=True)
 class Summary:
+    """The headline record: RATED standard games only.
+
+    Chess.com's stats page counts rated games and leaves unrated ones out, and
+    the record has to reconcile with it exactly. Every other section keeps
+    unrated games: a blunder in a casual game is still a blunder.
+    """
+
     games: int
     wins: int
     draws: int
@@ -66,6 +73,15 @@ def _pct(part: int, whole: int) -> float | None:
     return 100.0 * part / whole if whole else None
 
 
+def standard_games(session: Session, player_id: int, time_class: str) -> int:
+    """Standard games in the class, rated and unrated: `Report.games`, the
+    population for openings and the move-level sections."""
+    return session.execute(
+        text(f"SELECT count(*) FROM games g WHERE {_SCOPE}"),
+        {"player_id": player_id, "time_class": time_class},
+    ).scalar_one()
+
+
 def summary(session: Session, player_id: int, time_class: str) -> Summary:
     row = session.execute(
         text(
@@ -76,7 +92,7 @@ def summary(session: Session, player_id: int, time_class: str) -> Summary:
                    count(*) FILTER (WHERE g.result = 'loss') AS losses,
                    ({CURRENT_RATING_SQL.format(time_class=":time_class")}) AS current_rating
             FROM games g
-            WHERE {_SCOPE}
+            WHERE {_SCOPE} AND g.rated
             """
         ),
         {"player_id": player_id, "time_class": time_class},

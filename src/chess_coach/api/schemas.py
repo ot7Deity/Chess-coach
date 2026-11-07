@@ -46,6 +46,65 @@ class TimeClassProgress(BaseModel):
     current_rating: int | None
 
 
+class Summary(BaseModel):
+    games: int
+    wins: int
+    draws: int
+    losses: int
+    win_rate_pct: float | None
+    current_rating: int | None
+    blunders_per_game: float | None
+
+
+class RatingPoint(BaseModel):
+    date: str  # the UTC day, 'YYYY-MM-DD'
+    rating: int
+    games: int
+
+
+class OpeningResult(BaseModel):
+    opening: str
+    color: Literal["white", "black"]
+    games: int
+    wins: int
+    draws: int
+    losses: int
+    win_rate_pct: float
+    rating_change: int
+
+
+class PhaseBlunders(BaseModel):
+    phase: Literal["opening", "middlegame", "endgame"]
+    player_moves: int
+    blunders: int
+
+
+class ClockBucket(BaseModel):
+    moves: int
+    accuracy_pct: float | None
+    blunders: int
+
+
+class TimePressure(BaseModel):
+    threshold_seconds: int
+    low_clock_games: int
+    low_clock: ClockBucket
+    normal_clock: ClockBucket
+
+
+class Report(BaseModel):
+    username: str
+    time_class: TimeClass
+    generated_at: str
+    games: int
+    analyzed_games: int
+    summary: Summary
+    rating_trend: list[RatingPoint]
+    openings: list[OpeningResult]
+    blunders_by_phase: list[PhaseBlunders] | None
+    time_pressure: TimePressure | None
+
+
 class PlayerProgress(BaseModel):
     username: str
     sync_status: SyncStatus

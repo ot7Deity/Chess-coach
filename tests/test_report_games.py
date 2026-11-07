@@ -26,19 +26,25 @@ def _s(engine: Engine) -> Session:
 # --- summary ----------------------------------------------------------------
 
 
-def test_summary_counts_only_standard_games_of_this_class_and_player(clean_engine: Engine):
+def test_the_record_counts_only_rated_standard_games_of_this_class_and_player(
+    clean_engine: Engine,
+):
     me, other = add_player(clean_engine), add_player(clean_engine, "someone")
     for result in ("win", "win", "win", "draw", "loss"):
         add_game(clean_engine, me, result=result)
-    add_game(clean_engine, me, result="win", rated=False)  # unrated still counts
+    add_game(clean_engine, me, result="win", rated=False)  # unrated: not in the record
     add_game(clean_engine, me, result="win", rules="chess960")  # variant: no
     add_game(clean_engine, me, result="win", time_class="rapid")  # other class: no
     add_game(clean_engine, other, result="loss")  # other player: no
     with _s(clean_engine) as s:
         got = report.summary(s, me, "blitz")
-    assert (got.games, got.wins, got.draws, got.losses) == (6, 4, 1, 1)
-    # Draws are not half-wins, to match Chess.com's stats page.
-    assert got.win_rate_pct == pytest.approx(100 * 4 / 6)
+        total = report.standard_games(s, me, "blitz")
+    # Rated only, so it reconciles with Chess.com's stats page.
+    assert (got.games, got.wins, got.draws, got.losses) == (5, 3, 1, 1)
+    # Draws are not half-wins.
+    assert got.win_rate_pct == pytest.approx(100 * 3 / 5)
+    # The rest of the report's population includes the unrated game.
+    assert total == 6
 
 
 def test_summary_with_no_games_is_zeros_and_nulls(clean_engine: Engine):
