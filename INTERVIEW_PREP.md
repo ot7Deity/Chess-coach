@@ -55,6 +55,119 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
 
+## 2026-11-06 - The queue's defaults lived in Python, where only Python could see them `DONE`
+
+> **In plain English:** Every job has a few settings that are normally left at a standard
+> value - how urgent it is, how many tries it has had, how many it is allowed. Those standard
+> values were written in my Python code, not in the database. So anything that added a job
+> *without* going through my Python code - a speed-test script, or me typing into the
+> database by hand - got an error demanding every value spelled out. The person building the
+> speed tests spotted it. The fix moves the standard values into the database itself, where
+> every tool sees them.
+
+**A bit deeper:** SQLAlchemy's `default=` is applied by the Python library when it builds an
+`INSERT`; the database knows nothing about it. `server_default=` puts a `DEFAULT` clause on
+the column, which the database applies to every insert from anywhere. The columns are
+`NOT NULL`, so a plain-SQL insert that omitted them failed outright.
+
+**What changed:** migration `0003` adds database defaults to `jobs.status` (`'pending'`),
+`priority` (100), `attempts` (0) and `max_attempts` (5); the `Job` model declares them too,
+so the drift test keeps the two honest. A test inserts a job with only `type` and `payload`
+in raw SQL and claims it.
+
+**How it was found:** the M3 builder, writing a benchmark harness that enqueues by SQL, read
+the model and asked. My own enqueue SQL had silently worked around it by naming every column
+- which is exactly how this kind of gap survives: the first author always knows the trick.
+
+**Why it matters for this table in particular:** the jobs table is the one table other tools
+are *expected* to write to directly - it is the integration point between ingestion, the
+workers, benchmarks and, later, the API's sync jobs. A default that only one client knows
+about is part of that client, not part of the schema.
+
+**Alternatives rejected:** *document "always set these columns"* - a rule every future
+script has to remember, enforced by a NOT NULL error at run time.
+
+**Talking point:** "An ORM default is a client-side default. My queue table is written to by
+several tools, and only the ORM knew what 'priority' defaulted to - a teammate building the
+benchmark hit it from raw SQL. Moving the defaults into the schema made the database the
+single source of truth for what a new job looks like."
+
+**Where:** `migrations/versions/0003_jobs_server_defaults.py`, `src/chess_coach/models.py`
+(`Job`), `tests/test_queue.py::test_a_job_inserted_with_plain_sql_needs_only_a_type_and_a_payload`.
+
+## 2026-11-06 - The worker: nothing is written until the whole game is done `DONE`
+
+> **In plain English:** A worker takes a game off the queue, has the engine judge every
+> position in it, and saves the results. The important choice is *when* it saves. It saves
+> nothing while the engine is working, then saves the whole game - every move, the "finished"
+> mark on the game, and the "done" mark on the job - in one go. Like a bank transfer, it all
+> happens or none of it does. So if a worker is killed halfway through, there is no
+> half-finished game to tidy up: the game just goes back on the pile and someone does it
+> again from the start. While it works, the worker checks in every so often to say "still
+> on it"; if it finds out it has been replaced, it stops and throws its work away.
+
+**A bit deeper:** The write is one *database transaction*, which commits atomically. The
+lease check (`queue.complete`) is the first statement in it, so a worker whose lease was
+taken away writes zero rows. *Heartbeats* run between positions. Re-running a game is safe
+regardless, because moves are *upserted* on (game id, ply) - insert, or overwrite if present.
+
+**What changed:** `analysis/game.py` (replay the PGN onto `games.start_fen` or the normal
+start, one evaluation per position, rows for `moves`), `analysis/runner.py` (`Worker`:
+reap, claim, analyse, complete; `CachedEvaluator`, the single seam where M3's cache plugs
+in), `analysis/jobs.py` (one set-based `INSERT ... SELECT` that enqueues every pending game,
+priority by time class), and one call in `ingest/cli.py` so a sync enqueues what it found.
+
+**Why the details are the way they are:**
+
+- *One job per `games.id`, keyed `analyze-game:<id>`, payload `{"game_id": <id>}`.* Not the
+  Chess.com uuid: a game between two tracked players is two rows with two points of view,
+  and each needs its own moves.
+- *`moves.fen_hash` is the position the move was played from*, so it joins to the
+  `positions` row holding the engine's best move for that decision.
+- *Enqueueing is a sweep, not an event.* It inserts a job for every pending game without
+  one, so a crash between "games saved" and "jobs enqueued" is repaired by the next run.
+- *A game status is never moved backwards.* Every status update excludes `complete` and
+  `skipped`, so a stale job can't un-finish a game.
+- *The worker refuses a lock timeout it cannot keep.* Heartbeats happen between positions, so
+  one search must fit in the gap: `ENGINE_TIMEOUT_SEC` must be under two thirds of
+  `JOB_LOCK_TIMEOUT_SEC`, or the worker will not start.
+- *A database outage does not kill the worker.* It logs, waits a poll interval and tries
+  again; any job it held simply lapses to the reaper.
+
+**Bugs and surprises found while testing it:**
+
+- *A Postgres type error from reusing one parameter.* The enqueue SQL used `:type` both as the
+  `jobs.type` value and inside `:type || ':' || g.id` for the dedupe key. psycopg 3 binds
+  parameters server-side, so Postgres had to give `$1` one type, and deduced `varchar` from
+  one use and `text` from the other: `AmbiguousParameter: inconsistent types deduced for
+  parameter $1`. The fix is one parameter per use. Lesson: with server-side binding, a
+  parameter is a typed value, not a text substitution.
+- *python-chess does not raise on a bad move.* `read_game("1. e4 e5 2. Ke3")` returns a game
+  with two moves and the error tucked into `game.errors`. Grading that would silently drop
+  the rest of the game, so any recorded error makes it a permanent `BadGame`. A test I wrote
+  with obviously-garbage text passed through as an empty, error-free game - which is why the
+  test now uses illegal moves instead.
+- *The engine disagreed with my chess.* I wrote a test expecting 2...bxa6 (taking a hung
+  bishop) to be "best" or "good". Stockfish prefers 2...Nxa6, which keeps the pawns intact:
+  +452 vs +377 for Black at depth 16 (an inaccuracy), 126 cp at depth 8 (a mistake). The test
+  now asserts what the engine actually says.
+
+**Alternatives rejected:**
+- *Write moves as they are evaluated*: a killed worker leaves half a game, and "is this game
+  analysed?" needs a second source of truth.
+- *A heartbeat thread*: keeps a hung worker's lease alive forever.
+- *Enqueue inside the ingest transaction* (a transactional outbox): stronger, but means
+  reworking M1's upsert; the sweep gets the same eventual result with one call.
+
+**Talking point:** "The worker's guarantee is all-or-nothing per game. It computes the whole
+game, then one transaction checks it still owns the job, writes every move, marks the game
+complete and the job done. A worker killed at any point leaves either nothing or everything,
+never half, and a zombie writes zero rows. Moves are upserted on game and ply anyway, as a
+second line of defence."
+
+**Where:** `src/chess_coach/analysis/`, `src/chess_coach/ingest/cli.py` (one line),
+`tests/test_analysis_game.py`, `tests/test_runner.py`, `tests/games.py`.
+
 ## 2026-11-06 - Grading a move: whose point of view, a mate already given, and what the cap really does `DONE`
 
 > **In plain English:** The engine always scores a position for whoever's turn it is. So

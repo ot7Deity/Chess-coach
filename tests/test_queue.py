@@ -242,3 +242,15 @@ def test_has_unfinished_counts_running_jobs_too(clean_engine: Engine):
         queue.complete(s, lease)
     with Session(clean_engine) as s:
         assert not queue.has_unfinished(s, T)
+
+
+def test_a_job_inserted_with_plain_sql_needs_only_a_type_and_a_payload(clean_engine: Engine):
+    """Benchmarks and psql sessions enqueue with raw SQL. Python-side defaults
+    do nothing for them; the database's do (migration 0003)."""
+    with clean_engine.begin() as c:
+        c.execute(
+            text("INSERT INTO jobs (type, payload) VALUES ('analyze-game', '{\"game_id\": 7}')")
+        )
+    lease = _claim(clean_engine)
+    assert (lease.payload, lease.attempt, lease.max_attempts) == ({"game_id": 7}, 1, 5)
+    assert _job(clean_engine, lease.job_id).priority == 100
