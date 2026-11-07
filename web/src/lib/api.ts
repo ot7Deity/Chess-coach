@@ -27,6 +27,19 @@ export function normalizeUsername(raw: string): string | null {
   return USERNAME.test(name) ? name : null;
 }
 
+/**
+ * A route parameter as text. decodeURIComponent throws on a stray "%" (a URL
+ * like /players/a%25), which would turn a typo into a crashed page; an
+ * undecodable value is returned as-is and then fails username validation.
+ */
+export function decodeParam(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
 const mock = () => import("./fixtures/mock");
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
