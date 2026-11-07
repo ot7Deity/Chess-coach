@@ -12,8 +12,12 @@
   cursor: crosshair;
 }
 
+/* Keyboard users need to see that the chart has focus (arrow keys then move
+   the crosshair); a ring around the plot, not the browser's default box. */
 .svg:focus-visible {
-  outline: none;
+  outline: 2px solid var(--accent);
+  outline-offset: 6px;
+  border-radius: var(--radius-s);
   box-shadow: none;
 }
 

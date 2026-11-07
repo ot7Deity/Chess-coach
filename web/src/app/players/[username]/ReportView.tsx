@@ -39,12 +39,22 @@ export function ReportView({ report: r, stale }: { report: Report; stale: boolea
   return (
     <div className={styles.report} data-stale={stale || undefined} aria-busy={stale || undefined}>
       <StatRow>
+        {/* The record is rated games only, so it matches the Chess.com stats page to the game. */}
         <StatTile
-          label="Games"
-          value={formatInt(r.games)}
+          label="Rated games"
+          value={formatInt(s.games)}
           detail={`${formatInt(s.wins)} won · ${formatInt(s.draws)} drawn · ${formatInt(s.losses)} lost`}
         />
-        <StatTile label="Win rate" value={s.win_rate_pct === null ? null : formatPct(s.win_rate_pct)} missing="No games yet" />
+        <StatTile
+          label="Win rate"
+          value={s.win_rate_pct === null ? null : formatPct(s.win_rate_pct)}
+          detail={
+            r.games > s.games
+              ? `Rated games, as on Chess.com · ${formatInt(r.games - s.games)} unrated not counted`
+              : "Rated games, as on Chess.com"
+          }
+          missing="No rated games yet"
+        />
         <StatTile
           label="Rating"
           value={s.current_rating === null ? null : formatInt(s.current_rating)}

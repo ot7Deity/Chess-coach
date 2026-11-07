@@ -7,6 +7,8 @@ interface Settled<T> {
   key: string;
   data?: T;
   error?: unknown;
+  /** Epoch ms when it settled. */
+  at?: number;
 }
 
 export interface AsyncState<T> {
@@ -17,6 +19,8 @@ export interface AsyncState<T> {
   /** True while the request for the current key has not settled. */
   loading: boolean;
   reload: () => void;
+  /** When the latest request settled (epoch ms), or null before the first. */
+  settledAt: number | null;
 }
 
 /**
@@ -37,9 +41,9 @@ export function useAsync<T>(key: string | null, load: (signal: AbortSignal) => P
     if (fullKey === null) return;
     const ac = new AbortController();
     loadRef.current(ac.signal).then(
-      (data) => setSettled({ key: fullKey, data }),
+      (data) => setSettled({ key: fullKey, data, at: Date.now() }),
       (error: unknown) => {
-        if (!isAbort(error)) setSettled((prev) => ({ key: fullKey, data: prev.data, error }));
+        if (!isAbort(error)) setSettled((prev) => ({ key: fullKey, data: prev.data, error, at: Date.now() }));
       },
     );
     return () => ac.abort();
@@ -52,5 +56,6 @@ export function useAsync<T>(key: string | null, load: (signal: AbortSignal) => P
     error: current ? settled.error : undefined,
     loading: fullKey !== null && !current,
     reload,
+    settledAt: settled.at ?? null,
   };
 }
