@@ -49,6 +49,46 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
 
+## 2026-11-06 - The front page is one box and one button `DONE`
+
+> **In plain English:** The first page asks for one thing - your Chess.com username - and
+> has one button, "Analyze my games". If you type something Chess.com could never accept,
+> like a space or an exclamation mark, it tells you straight away instead of sending you
+> off to a page that fails. If you are new, it takes you to watch your games download; if
+> the app already knows you, it takes you straight to your report.
+
+**A bit deeper:** The username is checked in the browser with exactly the same rule the
+server uses (`^[a-z0-9_-]{1,50}$` after lowercasing), so the two can never disagree about
+what is valid. The page cannot check whether the account *exists* - only Chess.com knows,
+and the API deliberately never calls Chess.com - so a misspelt name is reported by the
+progress page when the download fails, with Chess.com's reason.
+
+**What changed:** `web/src/app/page.tsx`, `AddPlayerForm.tsx`.
+
+**Why:**
+
+- *Where to go next depends on the answer,* not on a guess: zero games means "show the
+  download", any games means "show the report".
+- *A 501 from the API gets its own message* ("run `chess-coach-sync` instead"), because
+  whether the API can enqueue a sync is still an open question for M4 (see the contract).
+- *"Analyze their games" links elsewhere prefill the box* (`/?u=name`), so the "we aren't
+  following this player yet" state is one click from fixing itself.
+- *On a phone the input and button stack,* so neither is squeezed to a sliver.
+
+**Alternatives rejected:** a sign-up flow (there are no accounts: Chess.com games are
+public), and autocomplete against Chess.com (the browser would have to call Chess.com,
+the one thing the architecture keeps behind the rate limiter).
+
+**Talking point:** "The landing page validates with the same pattern as the server and
+routes on the server's answer - a new player sees their download, a known one sees their
+report. It can't check that the account exists, by design, because only the rate-limited
+worker talks to Chess.com, so that error surfaces on the progress page with Chess.com's
+own reason."
+
+**Where:** `web/src/app/page.tsx`, `web/src/app/AddPlayerForm.tsx`.
+
+---
+
 ## 2026-11-06 - The progress page is calm on purpose `DONE`
 
 > **In plain English:** While the computer works through thousands of games, there is a
