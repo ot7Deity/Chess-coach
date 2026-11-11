@@ -366,6 +366,105 @@ things break, and a dashboard has nothing to gain from being first."
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-05 - My test asked the database for the wrong shape of answer `DONE`
+
+> **In plain English:** I wrote a test that saves a chess position and then reads it back to
+> check it was stored right. The saving worked. The *test* broke, because I asked for the
+> answer in one format and the database library handed it back in another - like asking a
+> librarian for "the book" and getting a photocopy of each page instead. Nothing was wrong
+> with the program; my check was written for the wrong kind of answer. I fixed the check,
+> not the program.
+
+**A bit deeper:** The project talks to the database through a library (SQLAlchemy) that has
+two levels. The high level, the *ORM*, gives you back Python objects ("a Position"). The low
+level, *Core*, gives you back plain rows of columns. My test used the low-level connection but
+wrote the query the high-level way, so the row it got back had columns called `fen` and
+`eval_cp`, not one column called `Position`.
+
+**Symptom:** `AttributeError: Could not locate column in row for column 'Position'` in the
+test helper, right after a `put` that had worked.
+
+**How I found it:** The traceback pointed at the test's own `row.Position.fen`, not at the
+cache code, and the cache's own read path (which selects named columns) passed.
+
+**Root cause:** `connection.execute(select(Position))` is a Core execution. It expands the
+entity into its columns and returns a plain `Row`; only `Session.execute` wraps rows in ORM
+objects.
+
+**Fix:** The helper reads `row.fen`, `row.eval_cp` directly.
+
+**Lesson:** When a test fails, first ask whether the test or the code is wrong. Here the
+production path was already doing the right thing - it selects explicit columns precisely so
+it never depends on which layer it runs in.
+
+**Where:** `tests/test_position_cache.py::pg_row`.
+
+---
+
+## 2026-11-05 - The cache's Postgres half: first write wins, and writes don't wait for the job `DONE`
+
+> **In plain English:** Working out what the chess engine thinks of one position takes real
+> time, so the answer is saved and reused. This piece is the saving and looking-up, in the
+> main database. Two rules matter. First, if two workers work out the same position at the
+> same moment, the first one to save wins and the second quietly does nothing, so everyone
+> later reads the same answer. Second, each answer is saved the moment it exists, not at the
+> end of the whole game - like writing each answer in the shared notebook as you go, rather
+> than at the end of the exam, so a classmate who needs it now can use it now.
+
+**A bit deeper:** The table is keyed on three things: the position, the engine version and
+the search depth, so an answer from a shallow search can never be handed to someone asking
+for a deep one. Saving uses an *upsert with "do nothing" on conflict*: the database's own
+uniqueness rule decides who was first, which is safe even when several processes write at
+the same instant, and the database reports back whether this write was the one that landed.
+Each save is its own *transaction* (an all-or-nothing unit of work) that commits immediately.
+
+**What changed:** `PositionCache` in `src/chess_coach/cache/`, implementing the `EvalCache`
+contract from `positions.py`: `get`, `put`, and a batch `get_many`.
+
+**Why the details are the way they are:**
+
+- *`INSERT ... ON CONFLICT DO NOTHING RETURNING`.* One statement, and the `RETURNING` row is
+  present only if this writer won. That one bit is what the Redis layer (next PR) needs: only
+  the winner may copy its value anywhere else.
+- *First write wins, rather than last.* Stockfish at a fixed depth is reproducible only from
+  the same starting state. I measured it: 10 positions at depth 14 gave identical results on
+  two runs with the hash table cleared before each search, but when the engine had searched
+  other positions first (as a worker always has), **all 10 scores differed** - by 2 to 27
+  centipawns, with the same best move. So two workers can disagree about one position. Either
+  answer is fine; two answers for one key are not.
+- *Its own transaction, not the job's.* An evaluation is a pure function of (position,
+  engine, depth). If the game's job fails on ply 70, the 69 evaluations before it are still
+  correct, and other workers should be able to use them now, not when the job finishes.
+- *`get_many`.* The worker replays the whole PGN before evaluating anything, so it knows all
+  ~80 positions up front. One `WHERE fen_hash IN (...)` query instead of 80, chunked at 1,000
+  keys so a pathological batch never becomes one enormous statement.
+- *`put` checks the FEN against the key.* It re-derives `fen_hash(normalize_fen(...))` from
+  the FEN it was given and refuses a mismatch, so a caller that passed `board.fen()` (with move
+  counters) or the wrong ply's FEN fails loudly instead of storing a misleading row. It uses
+  the contract's own functions, so there is still exactly one hashing scheme.
+- *Stats count distinct positions.* A threefold repetition inside one batch is one lookup, not
+  three, so the hit rate is not inflated by repetitions.
+
+**Alternatives rejected:**
+- *Last write wins (`DO UPDATE`)*: every concurrent evaluation would rewrite the row, and the
+  value a reader saw could change under it.
+- *Write evaluations in the job's transaction*: a failed job would throw away valid work, and
+  concurrent workers could not see each other's results until a whole game finished.
+- *`SELECT` then `INSERT`*: two round trips and a race between them; the constraint already
+  answers "was I first?" atomically.
+
+**Talking point:** "Two workers can evaluate the same position at the same time, and I
+measured that Stockfish at a fixed depth gives a slightly different score once its hash table
+is warm - ten out of ten positions moved by a few centipawns. So the cache needs exactly one
+winner. I let the primary key decide: `INSERT ... ON CONFLICT DO NOTHING RETURNING` tells each
+writer whether it won, in one statement. That one bit matters later, because only the winner
+is allowed to copy its value into Redis."
+
+**Where:** `src/chess_coach/cache/position_cache.py`, `tests/test_position_cache.py` (real
+Postgres, including eight threads racing on the same 25 positions).
+
+---
+
 <!-- end of M3 entries -->
 
 ---
