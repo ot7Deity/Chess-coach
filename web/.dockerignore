@@ -1,0 +1,11 @@
+# Rebuilt inside the image; copying the host's would also bring Windows-native
+# binaries (@next/swc-win32-*) into a Linux build.
+node_modules
+.next
+out
+*.tsbuildinfo
+next-env.d.ts
+AGENTS.md
+.env*
+Dockerfile
+.dockerignore
