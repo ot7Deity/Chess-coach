@@ -44,7 +44,10 @@ class Settings(BaseSettings):
     # non-deterministic - measured: the same position at depth 16 came back
     # -186 and -213 on two runs with Threads=2 - and a non-deterministic value
     # cannot be cached under (position, engine, depth). Scale with workers.
-    engine_threads: int = Field(default=1, ge=1)
+    # Enforced: the only accepted value is 1.
+    engine_threads: int = Field(default=1, ge=1, le=1)
+    # Part of the engine version the cache is keyed on ('sf_18-h128'): the
+    # hash size changes results slightly, so changing it starts a new cache.
     engine_hash_mb: int = Field(default=128, ge=1)
     # Per position. A search that runs past this is treated as a hung engine:
     # the process is killed and restarted, and the job is retried.
