@@ -372,6 +372,440 @@ things break, and a dashboard has nothing to gain from being first."
 
 <!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
 
+## 2026-11-06 - The container proved the "probe at start" decision on my own laptop `DONE`
+
+> **In plain English:** Earlier I decided the chess engine must be chosen when the
+> container starts, on the machine that runs it, not when the package is built - because the
+> fastest version crashes on processors that lack one special feature. I expected that to
+> matter on *other* machines. The first time I ran the container on my own laptop, the
+> fastest version crashed right there. My laptop's processor has the feature, but the little
+> virtual computer Docker runs containers in doesn't pass it through. The installer noticed
+> the crash, stepped down one level, and the worker started normally. If the engine had been
+> picked while building the package on this same laptop, every container would have crashed.
+
+**A bit deeper:** On Windows, Docker Desktop runs Linux containers inside a lightweight
+*virtual machine* (WSL 2). A VM can expose a subset of the host CPU's *instruction set
+extensions*. Here the host (Intel Core Ultra 7 155H) supports AVX-VNNI, the VM did not
+expose it, and the AVX-VNNI build of Stockfish died with an illegal instruction (exit -4).
+The fallback chain picked the AVX2 build.
+
+**What changed:** a `Dockerfile` (one image for the API, migrations and the worker; Stockfish
+deliberately absent), `docker/entrypoint.sh` (runs `tools/fetch_stockfish.py`, then `exec`s
+the command), and `migrate` / `api` / `worker` services in `docker-compose.yml` behind an
+`app` profile, with the engine in a named `vendor` volume.
+
+**What I ran, and what it printed** (first start, empty volume):
+
+```
+[fetch-stockfish] trying stockfish-ubuntu-x86-64-avxvnni.tar (109 MiB)
+[fetch-stockfish]   smoke test exited -4 (wrong SIMD build for this CPU)
+[fetch-stockfish] trying stockfish-ubuntu-x86-64-avx2.tar (109 MiB)
+[fetch-stockfish]   OK - Stockfish 18 (searched both evaluation networks)
+worker.start depth=8 engine=sf_18
+```
+
+The second start re-probed the binary already in the volume ("nothing to do"), and the whole
+`docker run` took 3.6 s. Then the container analysed the 90-ply test game at depth 12 in
+6.3 s against the test database: `complete`, 90 moves. The engine version is `sf_18` on the
+host's AVX-VNNI build and the container's AVX2 build alike, which is what lets their cached
+evaluations be shared.
+
+**Why the details are the way they are:**
+
+- *The `app` profile.* `docker compose up -d` is what every developer and the tests already
+  run for Postgres and Redis. Adding the app without a profile would quietly start a second
+  worker competing for the same queue as the ones on the host.
+- *`flock` around the installer.* `--scale worker=4` starts four containers at once on one
+  shared volume; without a lock, four installers would download into the same directory at
+  once. With it, the first downloads and the rest wait, then find a verified binary.
+- *Only the worker probes.* The API and migrations never touch the engine, so they set
+  `FETCH_STOCKFISH=0` and start in a second instead of waiting on a download.
+- *Dependencies are a separate layer* from the source, so a code change rebuilds in seconds;
+  uv is pinned to the version the lock file is maintained with; the app runs as a non-root
+  user; `stop_grace_period: 60s` gives SIGTERM time to finish the current game.
+
+**Alternatives rejected:** the ones in the original `DECIDED` entry (fetch at build time, bake
+the baseline build, one image per SIMD level) - and this run is the evidence for that call:
+build-time selection on this very laptop would have produced an image that crashes on this
+very laptop.
+
+**Talking point:** "I'd decided the engine build must be picked on the machine that runs it,
+because an image moves between CPUs. I assumed that mattered for other machines. The first
+container I ran on my own laptop proved it: the host CPU has AVX-VNNI, Docker's VM doesn't
+expose it, the fast build died with an illegal instruction, and the probe fell back to AVX2.
+A build-time choice would have shipped an image that crashes on the machine that built it."
+
+**Where:** `Dockerfile`, `docker/entrypoint.sh`, `docker-compose.yml`. The original decision is
+the "engine is probed at container start" entry in the pre-M1 block.
+
+## 2026-11-06 - M2: kill a worker mid-game, and the game is still analysed exactly once `DONE`
+
+> **In plain English:** This is the test the whole second milestone was aiming at. I start
+> a real worker, let it get properly into analysing a 90-move game, and then kill it
+> instantly - no warning, no chance to tidy up, like pulling the plug on a computer. Then I
+> start a second worker and tell it to finish whatever is left. It has to notice the first
+> worker has gone quiet, take over the game, analyse it from the start, and stop. At the end
+> the game has exactly 90 moves saved - not 0, not 180 - it is marked finished once, and the
+> logs show only the second worker ever finished it. It took about 8 seconds from the first
+> worker's last sign of life to a finished game, and it passed on every one of nine runs.
+
+**A bit deeper:** The test uses real *processes* (not threads pretending), a real Postgres and
+a real Stockfish. "Killed hard" means `TerminateProcess` on Windows (`SIGKILL` on Linux): the
+process gets no chance to run any cleanup code, which is what a crash, an out-of-memory kill
+or a power cut looks like. Recovery then depends only on the *lease* expiring and the
+*reaper* handing the job back - the mechanisms in the earlier entries.
+
+**What the test does, step by step** (`tests/test_kill_recovery.py`):
+
+1. Insert a 90-ply game and enqueue it. Start worker A as a subprocess at depth 12 with a
+   3-second lock timeout (so it heartbeats every second).
+2. Wait until A has claimed the job **and heartbeated at least once** - proof it is in the
+   middle of the analysis, not just past the claim - and assert no moves are written yet.
+3. Kill A. Then watch the job for 2.5 heartbeat intervals and assert its `locked_at` does not
+   move: A really is dead. (This check exists because on Windows `sys.executable` in a venv is
+   a launcher that starts the real interpreter as a child; if killing the launcher left the
+   child running, the test would say so instead of passing by accident. It doesn't.)
+4. Start worker B with `--until-empty`. B waits out A's lease, reaps it, re-claims the job as
+   attempt 2, analyses the game and exits 0.
+5. Assert: the job is `done`, by B, on attempt 2, and its `last_error` records that A's lease
+   expired; the game is `complete` with `ply_count` 90; there are exactly 90 move rows with
+   90 distinct plies running 1 to 90, all graded; A's log contains no `job.done`, B's contains
+   one `job.reaped` and one `job.done`.
+
+A second test runs three workers over eight games concurrently and asserts every job finished
+on its first attempt, every game is complete, and the move count is exactly the sum of the
+games' lengths.
+
+**Measured:** last heartbeat from A to game complete: 8.0 s, 8.1 s, 8.3 s across three runs
+(3 s of that is the lock timeout, ~2.5 s is the test's own "is A dead" wait, the rest is B
+starting and analysing 91 positions). The test passed 9 runs out of 9.
+
+**Why "exactly once" holds, in one paragraph:** a job can be *executed* more than once - that
+is what recovery means - but its *effect* is written once. A writes nothing until the end;
+its results would commit in the same transaction as `done`, and only if its lease (fenced by
+the attempt number) is still current. So a killed A leaves no trace, a stalled-then-revived A
+writes zero rows, and B's run is the only one that commits. Moves are upserted on
+(game_id, ply) underneath that, so even a hypothetical double commit could not create
+duplicate rows.
+
+**Alternatives rejected:**
+- *Test with threads and a fake "kill"*: a thread cannot be killed without running its
+  `finally` blocks, which is precisely the cleanup a real crash skips.
+- *Kill at a random moment*: it would sometimes kill before the claim or after the commit,
+  which tests nothing interesting. Waiting for the first heartbeat pins the kill inside the
+  window that matters.
+
+**Talking point:** "The acceptance test for the queue kills a real worker process with
+SIGKILL in the middle of a 90-move game, after it has heartbeated, so it's genuinely
+mid-analysis. A second worker waits out the lease, takes the job over through the reaper and
+finishes it. Then I assert 90 rows, 90 distinct plies, the game completed once, and from the
+logs, only the second worker ever completed it. Recovery took about 8 seconds with a
+3-second lease. It's 'at-least-once execution, exactly-once effect', and the test checks
+the effect, not the mechanism."
+
+**Where:** `tests/test_kill_recovery.py`, `src/chess_coach/worker.py` (the CLI the test
+launches), and the queue, worker and fencing entries below.
+
+## 2026-11-06 - The queue's defaults lived in Python, where only Python could see them `DONE`
+
+> **In plain English:** Every job has a few settings that are normally left at a standard
+> value - how urgent it is, how many tries it has had, how many it is allowed. Those standard
+> values were written in my Python code, not in the database. So anything that added a job
+> *without* going through my Python code - a speed-test script, or me typing into the
+> database by hand - got an error demanding every value spelled out. The person building the
+> speed tests spotted it. The fix moves the standard values into the database itself, where
+> every tool sees them.
+
+**A bit deeper:** SQLAlchemy's `default=` is applied by the Python library when it builds an
+`INSERT`; the database knows nothing about it. `server_default=` puts a `DEFAULT` clause on
+the column, which the database applies to every insert from anywhere. The columns are
+`NOT NULL`, so a plain-SQL insert that omitted them failed outright.
+
+**What changed:** migration `0003` adds database defaults to `jobs.status` (`'pending'`),
+`priority` (100), `attempts` (0) and `max_attempts` (5); the `Job` model declares them too,
+so the drift test keeps the two honest. A test inserts a job with only `type` and `payload`
+in raw SQL and claims it.
+
+**How it was found:** the M3 builder, writing a benchmark harness that enqueues by SQL, read
+the model and asked. My own enqueue SQL had silently worked around it by naming every column
+- which is exactly how this kind of gap survives: the first author always knows the trick.
+
+**Why it matters for this table in particular:** the jobs table is the one table other tools
+are *expected* to write to directly - it is the integration point between ingestion, the
+workers, benchmarks and, later, the API's sync jobs. A default that only one client knows
+about is part of that client, not part of the schema.
+
+**Alternatives rejected:** *document "always set these columns"* - a rule every future
+script has to remember, enforced by a NOT NULL error at run time.
+
+**Talking point:** "An ORM default is a client-side default. My queue table is written to by
+several tools, and only the ORM knew what 'priority' defaulted to - a teammate building the
+benchmark hit it from raw SQL. Moving the defaults into the schema made the database the
+single source of truth for what a new job looks like."
+
+**Where:** `migrations/versions/0003_jobs_server_defaults.py`, `src/chess_coach/models.py`
+(`Job`), `tests/test_queue.py::test_a_job_inserted_with_plain_sql_needs_only_a_type_and_a_payload`.
+
+## 2026-11-06 - The worker: nothing is written until the whole game is done `DONE`
+
+> **In plain English:** A worker takes a game off the queue, has the engine judge every
+> position in it, and saves the results. The important choice is *when* it saves. It saves
+> nothing while the engine is working, then saves the whole game - every move, the "finished"
+> mark on the game, and the "done" mark on the job - in one go. Like a bank transfer, it all
+> happens or none of it does. So if a worker is killed halfway through, there is no
+> half-finished game to tidy up: the game just goes back on the pile and someone does it
+> again from the start. While it works, the worker checks in every so often to say "still
+> on it"; if it finds out it has been replaced, it stops and throws its work away.
+
+**A bit deeper:** The write is one *database transaction*, which commits atomically. The
+lease check (`queue.complete`) is the first statement in it, so a worker whose lease was
+taken away writes zero rows. *Heartbeats* run between positions. Re-running a game is safe
+regardless, because moves are *upserted* on (game id, ply) - insert, or overwrite if present.
+
+**What changed:** `analysis/game.py` (replay the PGN onto `games.start_fen` or the normal
+start, one evaluation per position, rows for `moves`), `analysis/runner.py` (`Worker`:
+reap, claim, analyse, complete; `CachedEvaluator`, the single seam where M3's cache plugs
+in), `analysis/jobs.py` (one set-based `INSERT ... SELECT` that enqueues every pending game,
+priority by time class), and one call in `ingest/cli.py` so a sync enqueues what it found.
+
+**Why the details are the way they are:**
+
+- *One job per `games.id`, keyed `analyze-game:<id>`, payload `{"game_id": <id>}`.* Not the
+  Chess.com uuid: a game between two tracked players is two rows with two points of view,
+  and each needs its own moves.
+- *`moves.fen_hash` is the position the move was played from*, so it joins to the
+  `positions` row holding the engine's best move for that decision.
+- *Enqueueing is a sweep, not an event.* It inserts a job for every pending game without
+  one, so a crash between "games saved" and "jobs enqueued" is repaired by the next run.
+- *A game status is never moved backwards.* Every status update excludes `complete` and
+  `skipped`, so a stale job can't un-finish a game.
+- *The worker refuses a lock timeout it cannot keep.* Heartbeats happen between positions, so
+  one search must fit in the gap: `ENGINE_TIMEOUT_SEC` must be under two thirds of
+  `JOB_LOCK_TIMEOUT_SEC`, or the worker will not start.
+- *A database outage does not kill the worker.* It logs, waits a poll interval and tries
+  again; any job it held simply lapses to the reaper.
+
+**Bugs and surprises found while testing it:**
+
+- *A Postgres type error from reusing one parameter.* The enqueue SQL used `:type` both as the
+  `jobs.type` value and inside `:type || ':' || g.id` for the dedupe key. psycopg 3 binds
+  parameters server-side, so Postgres had to give `$1` one type, and deduced `varchar` from
+  one use and `text` from the other: `AmbiguousParameter: inconsistent types deduced for
+  parameter $1`. The fix is one parameter per use. Lesson: with server-side binding, a
+  parameter is a typed value, not a text substitution.
+- *python-chess does not raise on a bad move.* `read_game("1. e4 e5 2. Ke3")` returns a game
+  with two moves and the error tucked into `game.errors`. Grading that would silently drop
+  the rest of the game, so any recorded error makes it a permanent `BadGame`. A test I wrote
+  with obviously-garbage text passed through as an empty, error-free game - which is why the
+  test now uses illegal moves instead.
+- *The engine disagreed with my chess.* I wrote a test expecting 2...bxa6 (taking a hung
+  bishop) to be "best" or "good". Stockfish prefers 2...Nxa6, which keeps the pawns intact:
+  +452 vs +377 for Black at depth 16 (an inaccuracy), 126 cp at depth 8 (a mistake). The test
+  now asserts what the engine actually says.
+
+**Alternatives rejected:**
+- *Write moves as they are evaluated*: a killed worker leaves half a game, and "is this game
+  analysed?" needs a second source of truth.
+- *A heartbeat thread*: keeps a hung worker's lease alive forever.
+- *Enqueue inside the ingest transaction* (a transactional outbox): stronger, but means
+  reworking M1's upsert; the sweep gets the same eventual result with one call.
+
+**Talking point:** "The worker's guarantee is all-or-nothing per game. It computes the whole
+game, then one transaction checks it still owns the job, writes every move, marks the game
+complete and the job done. A worker killed at any point leaves either nothing or everything,
+never half, and a zombie writes zero rows. Moves are upserted on game and ply anyway, as a
+second line of defence."
+
+**Where:** `src/chess_coach/analysis/`, `src/chess_coach/ingest/cli.py` (one line),
+`tests/test_analysis_game.py`, `tests/test_runner.py`, `tests/games.py`.
+
+## 2026-11-06 - Grading a move: whose point of view, a mate already given, and what the cap really does `DONE`
+
+> **In plain English:** The engine always scores a position for whoever's turn it is. So
+> after you move, its score is from your *opponent's* side, and the program has to flip it
+> to say how your move went. Flipping is just "change the sign" - except in one case:
+> checkmate. The engine writes "already checkmated" as zero, and flipping zero gives zero, so
+> "I just checkmated them" would quietly turn into "I've been checkmated". That case is now
+> handled on its own, and checkmating someone always counts as the best move. Writing the
+> tests also caught me misreading my own rule: I'd assumed capping scores at ten pawns made a
+> slip in an already-lost game count for nothing. For the example in my own notes it doesn't
+> - it shrinks a "blunder" to a "mistake". The tests now say what the rule really does.
+
+**A bit deeper:** Engine scores are *relative* (side-to-move point of view); the report needs
+them from the *mover's* point of view, which is a negation for the position after the move.
+A *mate score* is a distance ("mate in 3"), signed by who is mating, and *mate in 0* is the
+checkmate itself. Classification *clamps* both scores to +/-1000 centipawns before
+subtracting, so swings beyond the cap stop counting - but only the part beyond the cap.
+
+**What changed:** `src/chess_coach/analysis/classify.py` (`MoverScore`, `mover_before`,
+`mover_after`, `classify`, `classify_move`, `phase`) and `analysis/clock.py`
+(`parse_time_control`, `move_times`), with 51 unit tests.
+
+**The two things the tests caught:**
+
+- *Mate in 0 cannot be negated.* `mover_after` special-cases it: the opponent is to move and
+  mated, so the mover has delivered mate (`mate_in_after = 0` in mover terms), which clamps to
+  +1000. `classify_move` then calls any mating move `best` outright - otherwise, with two mates
+  in one on the board, the one the engine didn't name would be graded on arithmetic. The
+  reviewer flagged this independently; the tests cover a mating move from a lost position and
+  from a position where the engine preferred a different mate.
+- *My reading of the clamp was wrong, not the code.* The decision log's example, -900 -> -1300,
+  is a 400 cp drop raw. Clamped, it is -900 -> -1000: 100 cp, a **mistake**. I had written the
+  test expecting "good". The clamp fully erases swings that are beyond the cap on *both* sides
+  (-1100 -> -1500 is "good"), and softens ones that cross it. That is the rule the project
+  decided on, so the code stays and the test now documents it honestly.
+
+**Other details:** the engine's own move is `best` whatever the arithmetic says (the score
+after a move is a fresh, deeper search and can differ by more than noise); thresholds are
+inclusive (exactly 300 cp is a blunder); phase is endgame by material alone (non-pawn material
+<= 26 of the starting 62), opening for moves 1-10, middlegame otherwise. Move times use each
+player's own previous clock reading plus the increment, never go negative, and are `None`
+rather than guessed when a reading is missing or the game is daily.
+
+**Alternatives rejected:**
+- *Encode a delivered mate as +1 or a sentinel*: changes the meaning of `moves.mate_in_after`
+  for every consumer; an explicit branch in one function is cheaper to explain.
+- *Change the test to match my assumption by tightening the clamp*: the clamp value is a
+  recorded decision, and the raw evals are stored precisely so it can be revisited with real
+  data.
+
+**Talking point:** "Point of view is where move grading goes wrong. The engine scores for the
+side to move, so the 'after' score is the opponent's and has to be negated - except checkmate,
+which the engine writes as mate-in-zero, and negating zero is still zero. So 'I gave mate'
+would have read as 'I got mated'. And my own tests caught me misreading my own clamping rule:
+it softens a slip in a lost game from blunder to mistake, it doesn't erase it."
+
+**Where:** `src/chess_coach/analysis/classify.py`, `src/chess_coach/analysis/clock.py`,
+`tests/test_classify.py`, `tests/test_clock.py`.
+
+## 2026-11-06 - Bug: my timeout fix made the test run hang forever, one run in four `DONE`
+
+> **In plain English:** If the chess engine freezes, my program is supposed to give up on it
+> after a set time, shut it down and start a fresh one. The test for that passed. But
+> roughly one time in four, the whole test run then never finished - it just sat there after
+> printing that every test had passed. The cause was how I shut the frozen engine down. I
+> first told the program "forget about the question you asked", then pulled the plug. Doing
+> it in that order confused the library that talks to the engine, so it never noticed the
+> engine had actually gone, and kept a helper waiting for it - forever. The program refuses
+> to exit while a helper is still waiting. The fix was to just pull the plug, and let the
+> unanswered question fail on its own.
+
+**A bit deeper:** python-chess runs each engine on a background *thread* with its own *event
+loop* (the machinery that waits on the engine's output). Python will not exit while a
+*non-daemon* thread is still running. Cancelling the pending request and then killing the
+process put the library's internal state machine into a state where the "process exited"
+notification itself crashed (`InvalidStateError`), so the background thread waited for an
+exit it would never be told about.
+
+**Symptom:** `pytest tests/test_engine.py` sometimes printed every test passing and then hung.
+Run alone, every test passed. The first full run sat for over three minutes before I killed it.
+
+**How I found it:** pytest showed nothing - the tests had finished. A loop that ran the hang,
+crash and normal scenarios eight times, with `faulthandler.dump_traceback_later`, reproduced
+it on every iteration rather than one in four: each "hang" case took 6.2 s instead of ~1.2 s,
+logged my own `engine.kill_unconfirmed` warning (the 5 s wait for the process's exit code ran
+out), printed `InvalidStateError` from python-chess's `connection_lost`, and the traceback
+dump at the end showed one leaked engine event-loop thread per timeout, plus the main thread
+parked in `threading._shutdown`. The "one in four" in pytest was just how often the leaked
+thread was still alive when the interpreter tried to exit.
+
+**Root cause:** `future.cancel()` before killing the process. Cancelling the analysis coroutine
+left python-chess's command half-torn-down; when the kill then arrived, its termination
+handler tried to set a result on a future that was already cancelled.
+
+**Fix:** don't cancel; kill the process, and let the in-flight command fail with the ordinary
+"engine terminated" error, which python-chess handles cleanly. The same eight-iteration loop
+now runs each hang case in 1.2 s with no warnings and exits. The hang test now also asserts
+that the thread count returns to where it started after the engine is closed.
+
+**Lesson:** "the test passed" and "the test run finished" are different claims - a resource
+leak shows up as the process not ending, not as a red test. And when a library gives you two
+ways to stop something, the more forceful one can be the cleaner one: killing the process
+goes through the library's well-tested crash path, while cancelling went through an
+interleaving it had never been tested for.
+
+**Talking point:** "My hung-engine timeout leaked a thread. The test was green; the test *run*
+hung one time in four. The cause was cancelling the request before killing the engine,
+which left the library unable to process the exit. I found it by looping the scenario with a
+traceback dump on a timer, which showed a leaked event-loop thread per timeout. Killing
+without cancelling fixed it, and the test now checks the thread count goes back down."
+
+**Where:** `src/chess_coach/engine.py` (`StockfishEngine.evaluate`, the comment on the
+timeout branch), `tests/test_engine.py::test_a_hung_search_is_killed_restarted_and_reported`.
+
+---
+
+## 2026-11-06 - The same position, the same depth, three different answers `DONE`
+
+> **In plain English:** The project saves the engine's opinion of each chess position so it
+> never has to work it out twice. That only makes sense if asking twice would give the same
+> answer. It didn't. The engine keeps notes from the positions it looked at before, and those
+> notes nudge its next answer - so the same position came back as +264, +266 or +269
+> depending on what it had been asked just before. The reviewer on the project also found a
+> second leak: the engine's answer depends on how many moves have passed without a capture,
+> which my saved-answer label ignores. The fix is to wipe the engine's notes before every
+> position and to show it only what the label describes. It costs about 7% in speed, and
+> now asking twice gives exactly the same answer, down to the amount of work done.
+
+**A bit deeper:** Stockfish has a *transposition table* (its "hash"): a memory of positions
+it has already searched, kept between searches to speed them up. That memory is an input to
+the result that the cache key (position, engine version, depth) does not name. So is the
+*halfmove clock* - the count towards the fifty-move draw rule - which the position
+identifier deliberately drops. And so is the number of search *threads*, because
+multi-threaded search depends on timing. A cache is only correct if the value it stores is a
+*pure function* of its key; this was the fifth time the project hit "the value depends on
+something the key doesn't name".
+
+**How it was found:** two ways, independently. While writing the engine wrapper I searched one
+position at depth 16 three times, each after a different preceding search, without clearing
+the hash: +264, +266, +269, with node counts of 596k to 1.1M. With the hash cleared first:
++273 and 45,986 nodes, three times out of three. Separately, the reviewer agent showed with
+real Stockfish that 31 of 34 positions in one game differ warm vs cold, by up to 42 cp with
+some best moves changing, and that one king-and-rook endgame scores +529 / +359 / +11 / 0 at
+halfmove clocks 0 / 50 / 90 / 98.
+
+**What changed:** `StockfishEngine.evaluate` sends `chess.Board(normalize_fen(board) + " 0 1")`
+- no move history, halfmove clock zero - with a fresh `game` object so python-chess sends
+`ucinewgame`, which clears the hash. `ENGINE_THREADS` is documented as "keep at 1" and the
+wrapper logs a warning if it is not. The engine version is read from the binary's own UCI name
+("Stockfish 18" -> `sf_18`), so it cannot disagree with the binary that actually ran.
+
+**Measured cost** (sf_18 avxvnni, one 91-position game, Threads=1, Hash=128 MB):
+
+| Depth | Hash kept between positions | Hash cleared per position | Cost |
+| --- | --- | --- | --- |
+| 16 | 25.6 s (3.56 positions/s) | 27.3 s (3.34 positions/s) | +6.6% |
+| 12 | 2.5 s (36.5 positions/s) | 5.3 s (17.1 positions/s) | +114% |
+
+The fixed cost is the clear itself: 29 ms per position at 128 MB, 10.5 ms at 16 MB. At the
+production depth of 16 it is noise; at shallow test depths it dominates.
+
+**Other measurements:** Threads=2 gave different scores on two runs of the same position at
+depth 16 (-186 vs -213, -125 vs -133). Hash size is a much weaker input: 16 MB vs 64/128/256 MB
+changed one score in six, by 2 cp.
+
+**Known cost of the fix:** with the clock zeroed, a position that is genuinely one move from a
+fifty-move draw is graded as if the clock had just reset. That is rare in real games and is
+the price of a value that can be shared between every game that reaches the position.
+
+**Alternatives rejected:**
+- *Put the halfmove clock in the key*: correct, and splits one cache entry into up to a
+  hundred for a property that changes the answer only near the end of a fifty-move run.
+- *Keep the warm hash for speed*: 6.6% faster at depth 16 and the cached numbers stop meaning
+  anything - a cache hit and a miss would return different values for the same key.
+- *Multi-threaded search per worker*: not reproducible; scale with worker processes instead.
+
+**Talking point:** "I asked Stockfish about the same position three times and got three
+answers, because its hash table carries information from earlier searches into later ones.
+For a cache keyed on position, engine and depth, that means storing one sample of a
+distribution. So the engine only ever sees what the key contains - no history, clock zeroed -
+with the hash cleared before every position and one search thread. At depth 16 that costs
+6.6%, and now the same position gives the same score and the same node count every time."
+
+**Where:** `src/chess_coach/engine.py`, `src/chess_coach/config.py` (Engine section),
+`tests/test_engine.py` (same position after different searches; same position reached by two
+move orders with different halfmove clocks).
+
 ## 2026-11-05 - Retries back off, crashes count, and hopeless jobs stop retrying `DONE`
 
 > **In plain English:** Sometimes analysing a game fails. If it failed for a passing reason
