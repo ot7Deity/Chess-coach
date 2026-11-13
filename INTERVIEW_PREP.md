@@ -49,6 +49,200 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
 
+## 2026-11-06 - Bug: my win rate claimed to match Chess.com, and didn't `DONE`
+
+> **In plain English:** The report's headline said my blitz win rate was 51.04%, and the
+> contract I wrote promised it would match the number on Chess.com. Chess.com says 50.70%.
+> The difference was a handful of "just for fun" games that don't count towards your
+> rating: Chess.com leaves them out of your record, and I had left them in. A tester
+> caught it by putting the two numbers side by side. Now the headline record counts only
+> the games that count on Chess.com, and all four game types match it exactly.
+
+**A bit deeper:** Chess.com games are either *rated* (they move your rating) or *unrated*.
+Its stats page builds your win/loss/draw record from rated games only. My `summary` counted
+every standard game, so any time control with unrated games drifted from the number the
+player would check it against.
+
+**Symptom:** blitz 221 / 15 / 197 over 433 games = 51.04%, against Chess.com's 218 / 15 /
+197 over 430 = 50.70%; rapid showed 242 wins against Chess.com's 241. Bullet and daily,
+which have no unrated games, matched - which is why it looked right at a glance.
+
+**How found:** the tester reconciled the contract's own claim ("matches Chess.com's stats
+page") against the real numbers instead of taking the sentence on trust.
+
+**Root cause:** the contract defined the headline record over "standard games, rated and
+unrated" and *also* promised it matched Chess.com, and those two statements contradict each
+other whenever unrated games exist. I wrote the promise without checking it against the one
+time control where it could fail.
+
+**Fix:** `summary` gains a `games` field and its record (`games`, `wins`, `draws`,
+`losses`, `win_rate_pct`) counts rated games only. The fixture was regenerated (read-only)
+with `rated` in the filter, and now equals Chess.com in all four time controls: blitz
+218-197-15, bullet 1804-1837-49, rapid 241-153-29, daily 1-1-0 (won-lost-drawn). The rest
+of the report keeps unrated games on purpose: a blunder in a casual game is still a
+blunder. The tile now reads "Rated games" and says how many unrated games were left out.
+
+**Lesson:** a sentence like "this matches X" in a spec is a test, not a description: write
+it down as the exact numbers it must equal, and check it against the case most likely to
+break it. M1 verified its totals against Chess.com; the contract should have inherited
+that check, not just the claim.
+
+**Where:** `docs/api-contract.md` (`Summary`), `web/src/lib/api-types.ts`,
+`web/scripts/fixtures.sql`, `web/src/lib/fixtures/deitythemenace.real.json`,
+`web/src/app/players/[username]/ReportView.tsx`.
+
+---
+
+## 2026-11-06 - Bug: a percent sign in the address crashed the player page `DONE`
+
+> **In plain English:** Web addresses use the % sign as a code for special characters. If
+> someone typed a stray % into the player's address, the page tried to decode it, choked,
+> and showed an error page instead of the friendly "that isn't a Chess.com username"
+> message. Now a broken code is simply treated as a bad username.
+
+**A bit deeper:** `decodeURIComponent` *throws* on a `%` that is not followed by two hex
+digits. The page decoded the username from the URL before validating it, so the exception
+escaped before the validation that would have handled the input politely.
+
+**Symptom:** `/players/a%25` returned a page containing `URIError: URI malformed`.
+
+**How found:** deliberately feeding the routes hostile URLs during the polish pass. `%E0%A4%A`
+was already rejected by Next.js with a 400; `%25` (an encoded percent sign) got through,
+because the framework decodes it once to `a%`, and my second decode then failed.
+
+**Root cause:** decoding a value that was already decoded, with a function that throws.
+
+**Fix:** `decodeParam()` falls back to the raw text when decoding fails; the result then
+goes through the same username check as everything else and gets the friendly message.
+
+**Lesson:** validation only protects you if nothing upstream of it can throw. Parse
+defensively, then validate, then use.
+
+**Where:** `web/src/lib/api.ts` (`decodeParam`), `web/src/app/players/[username]/page.tsx`.
+
+---
+
+## 2026-11-06 - Polish: every page checked at 320 px, in both colour schemes `DONE`
+
+> **In plain English:** The last pass was about the edges: the smallest phones, dark
+> mode, keyboard users and broken links. Every page was photographed at the width of the
+> smallest common phone, in light and dark, by a script that also measures whether
+> anything sticks out sideways - so "it fits on a phone" is checked, not hoped.
+
+**A bit deeper:** Dark mode is not an automatic colour flip: each colour has its own dark
+value, chosen and contrast-checked against the dark background. The screenshot script uses
+the browser's device emulation and reports `scrollWidth` against the viewport width, so
+horizontal scrolling shows up as a number.
+
+**What changed:** a site-wide 404 page and render-error boundary (`not-found.tsx`,
+`error.tsx`); a visible focus ring on the chart so keyboard users know the arrow keys will
+move the crosshair; player pages keyed by username, so state from one player can never be
+shown under another's name; the dev-tools badge turned off so it stops covering
+screenshots; safe decoding of usernames from the URL (previous entry).
+
+**Why:** the states are where a dashboard looks unfinished: an unknown URL, a thrown render
+error and a keyboard focus that disappears are each one visit away.
+
+**Alternatives rejected:** a manual theme toggle (the brief is `prefers-color-scheme`, and
+a toggle needs storage and a flash-of-wrong-theme fix for one setting the OS already has).
+
+**Talking point:** "Phone width and dark mode are tested by a script, not by eye: it
+emulates a 320-pixel phone in both schemes and prints the page's scroll width, so
+horizontal overflow is a failing number rather than something I might notice."
+
+**Where:** `web/src/app/not-found.tsx`, `web/src/app/error.tsx`,
+`web/src/components/charts/charts.module.css`, `web/next.config.ts`.
+
+---
+
+## 2026-11-06 - The front page is one box and one button `DONE`
+
+> **In plain English:** The first page asks for one thing - your Chess.com username - and
+> has one button, "Analyze my games". If you type something Chess.com could never accept,
+> like a space or an exclamation mark, it tells you straight away instead of sending you
+> off to a page that fails. If you are new, it takes you to watch your games download; if
+> the app already knows you, it takes you straight to your report.
+
+**A bit deeper:** The username is checked in the browser with exactly the same rule the
+server uses (`^[a-z0-9_-]{1,50}$` after lowercasing), so the two can never disagree about
+what is valid. The page cannot check whether the account *exists* - only Chess.com knows,
+and the API deliberately never calls Chess.com - so a misspelt name is reported by the
+progress page when the download fails, with Chess.com's reason.
+
+**What changed:** `web/src/app/page.tsx`, `AddPlayerForm.tsx`.
+
+**Why:**
+
+- *Where to go next depends on the answer,* not on a guess: zero games means "show the
+  download", any games means "show the report".
+- *A 501 from the API gets its own message* ("run `chess-coach-sync` instead"), because
+  whether the API can enqueue a sync is still an open question for M4 (see the contract).
+- *"Analyze their games" links elsewhere prefill the box* (`/?u=name`), so the "we aren't
+  following this player yet" state is one click from fixing itself.
+- *On a phone the input and button stack,* so neither is squeezed to a sliver.
+
+**Alternatives rejected:** a sign-up flow (there are no accounts: Chess.com games are
+public), and autocomplete against Chess.com (the browser would have to call Chess.com,
+the one thing the architecture keeps behind the rate limiter).
+
+**Talking point:** "The landing page validates with the same pattern as the server and
+routes on the server's answer - a new player sees their download, a known one sees their
+report. It can't check that the account exists, by design, because only the rate-limited
+worker talks to Chess.com, so that error surfaces on the progress page with Chess.com's
+own reason."
+
+**Where:** `web/src/app/page.tsx`, `web/src/app/AddPlayerForm.tsx`.
+
+---
+
+## 2026-11-06 - The progress page is calm on purpose `DONE`
+
+> **In plain English:** While the computer works through thousands of games, there is a
+> page that shows how far along it is. I made it deliberately boring: one big number
+> ("2,069 of 4,549 games analyzed"), a slow-moving bar, and a rough "about 6 hours left"
+> rather than a countdown to the second. A ticking clock makes people anxious and is wrong
+> anyway. And there is always a button to see the report so far, because you never have to
+> wait for 100%.
+
+**A bit deeper:** The page *polls* - asks the server for an update every five seconds -
+and stops when there is nothing left to do. It also stops while the browser tab is hidden,
+because nobody is looking and each poll is a query against the database the workers are
+busy writing to. The time estimate comes from one number the server provides (games
+analyzed in the last hour); the server does not guess, because it cannot know how many
+workers will be running.
+
+**What changed:** `web/src/app/players/[username]/progress/`.
+
+**Why the details are the way they are:**
+
+- *Vague estimates.* "About 6 hours", rounded to the nearest 5 minutes or hour. The rate
+  moves as workers come and go, and a precise number that jumps around reads as broken.
+- *The bar eases over 1.2 s,* so each poll makes it drift rather than jump.
+- *Polls continue after a failed poll,* with the last good numbers still on screen and a
+  quiet "couldn't refresh" line: a blip should not freeze the page until a manual reload.
+- *Per time control, in a fixed order,* with the queue's priority explained in one
+  sentence ("rapid and blitz go first, then bullet") so a bullet bar sitting at 30% does not
+  look stuck.
+- *Failed and skipped games are said out loud,* in a sentence, so totals that do not reach
+  100% are explained instead of looking like a bug.
+- *Progress updates are announced politely* to screen readers (`aria-live="polite"`), and
+  each bar is a real `progressbar` with its numbers.
+
+**Alternatives rejected:**
+- *Server-sent events or WebSockets*: a push channel for a number that changes a few times
+  a minute, with reconnection logic to write and test. Five-second polling of a cheap
+  `COUNT ... GROUP BY` is simpler and fast enough.
+- *A spinner until done*: hides exactly the information that makes the wait bearable.
+
+**Talking point:** "Progress is polled every five seconds, paused when the tab is hidden,
+and the ETA is deliberately vague - 'about six hours' - because worker count changes and a
+precise countdown that jumps around reads as broken. The most important element on the page
+is the button that says 'see your report so far'."
+
+**Where:** `web/src/app/players/[username]/progress/Progress.tsx`.
+
+---
+
 ## 2026-11-06 - Bug: the page said 1,210 games analyzed, and the tile under it said 1,211 `DONE`
 
 > **In plain English:** On the bullet page, a note at the top said "1,210 games analyzed" and

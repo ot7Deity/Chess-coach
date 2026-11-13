@@ -106,9 +106,9 @@ the analysis finishes.
 | `username` | string | |
 | `time_class` | TimeClass | Echoes the query. |
 | `generated_at` | timestamp | When the API computed this. |
-| `games` | integer | Standard-chess games in this class, rated and unrated. |
+| `games` | integer | Standard-chess games in this class, rated and unrated. The population for openings and every move-level section. Not the headline game count: that is `summary.games`. |
 | `analyzed_games` | integer | Of `games`, how many have `analysis_status = 'complete'`. The sample size of every move-level field. |
-| `summary` | `Summary` | Headline numbers. |
+| `summary` | `Summary` | Headline numbers. The record in it counts **rated games only**. |
 | `rating_trend` | `RatingPoint[]` | Oldest first. Empty if there are no rated games. |
 | `openings` | `OpeningResult[]` | See below. Empty if no opening reaches 5 games. |
 | `blunders_by_phase` | `PhaseBlunders[] \| null` | Null when `analyzed_games = 0`. Otherwise exactly three entries: opening, middlegame, endgame, in that order. |
@@ -118,8 +118,18 @@ the analysis finishes.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `wins`, `draws`, `losses` | integer | Sum to `games`. |
-| `win_rate_pct` | float \| null | `wins / games * 100`. Draws are not half-wins here, so the number matches the one on Chess.com's stats page. Null when `games = 0`. |
+| `games` | integer | **Rated** standard-chess games in this class (`rated AND rules = 'chess'`). |
+| `wins`, `draws`, `losses` | integer | Rated games only; they sum to `summary.games`. |
+| `win_rate_pct` | float \| null | `wins / summary.games * 100`, rated games only, draws not counted as half-wins. Null when `summary.games = 0`. |
+
+**Why rated only.** The record must reconcile exactly with the player's Chess.com stats
+page, which counts rated games and leaves unrated ones out. Counting all games did not: on
+the dev data, blitz came out 221 / 15 / 197 over 433 games (51.04%) against Chess.com's
+218 / 15 / 197 over 430 (50.70%), and rapid had 242 wins against Chess.com's 241. With
+`rated` in the filter, all four time controls match Chess.com exactly (blitz 218-197-15,
+bullet 1804-1837-49, rapid 241-153-29, daily 1-1-0, as wins-losses-draws). The rest of the
+report deliberately keeps unrated games: a blunder in a casual game is still a blunder, and
+openings are about how you play, not what was at stake.
 | `current_rating` | integer \| null | As in `TimeClassProgress`. |
 | `blunders_per_game` | float \| null | The player's own blunders (`is_player_move` and `classification = 'blunder'`) across analyzed games, divided by `analyzed_games`. Null when `analyzed_games = 0`. |
 
@@ -229,8 +239,9 @@ neither bucket.
   "games": 424,
   "analyzed_games": 424,
   "summary": {
-    "wins": 242, "draws": 29, "losses": 153,
-    "win_rate_pct": 57.075471698113205,
+    "games": 423,
+    "wins": 241, "draws": 29, "losses": 153,
+    "win_rate_pct": 56.973995271867615,
     "current_rating": 946,
     "blunders_per_game": 0.94
   },

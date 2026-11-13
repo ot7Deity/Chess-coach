@@ -62,11 +62,17 @@ export interface AddPlayerRequest {
 
 // --- GET /players/{username}/report?time_class= -----------------------------
 
+/**
+ * The headline record. RATED games only, so it reconciles exactly with the
+ * player's Chess.com stats page; the rest of the report includes unrated games.
+ */
 export interface Summary {
+  /** Rated standard-chess games in this class. wins + draws + losses = games. */
+  games: number;
   wins: number;
   draws: number;
   losses: number;
-  /** wins / games * 100; null when games = 0. */
+  /** wins / summary.games * 100, rated only; null when summary.games = 0. */
   win_rate_pct: Percent | null;
   current_rating: number | null;
   /** Player blunders / analyzed_games; null when analyzed_games = 0. */
@@ -124,7 +130,10 @@ export interface Report {
   username: string;
   time_class: TimeClass;
   generated_at: Timestamp;
-  /** Standard-chess games in this class, rated and unrated. */
+  /**
+   * Standard-chess games in this class, rated and unrated: the population for
+   * openings and move-level sections. The headline count is summary.games.
+   */
   games: number;
   /** Sample size of every move-level field. */
   analyzed_games: number;
