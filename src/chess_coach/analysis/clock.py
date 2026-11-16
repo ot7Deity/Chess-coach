@@ -7,8 +7,10 @@ time a player spent on a move is
     previous reading for that player - this reading + increment
 
 where a player's "previous reading" before their first move is the base time.
-Chess.com does not run the clock on the first move, which this reproduces: the
-first reading is base (+ increment), so the first move costs zero.
+The first move is charged like any other: on real data White's first reading
+is usually already below the base (1,018 of 1,143 no-increment bullet games),
+so the clock does run on it. Checked over 254,553 real plies: this formula
+gives no negative move times, where ignoring the increment would give 31,262.
 """
 
 from __future__ import annotations
