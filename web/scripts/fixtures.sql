@@ -41,13 +41,17 @@ progress AS (
   WHERE p.username = 'deitythemenace'
   GROUP BY g.time_class
 ),
+-- The headline record counts RATED games only, so it reconciles exactly with
+-- the player's Chess.com stats page, which leaves unrated games out.
 summary AS (
   SELECT time_class,
          count(*) AS games,
-         count(*) FILTER (WHERE result = 'win') AS wins,
-         count(*) FILTER (WHERE result = 'draw') AS draws,
-         count(*) FILTER (WHERE result = 'loss') AS losses,
-         100.0 * count(*) FILTER (WHERE result = 'win') / count(*) AS win_rate_pct,
+         count(*) FILTER (WHERE rated) AS rated_games,
+         count(*) FILTER (WHERE rated AND result = 'win') AS wins,
+         count(*) FILTER (WHERE rated AND result = 'draw') AS draws,
+         count(*) FILTER (WHERE rated AND result = 'loss') AS losses,
+         100.0 * count(*) FILTER (WHERE rated AND result = 'win')
+           / NULLIF(count(*) FILTER (WHERE rated), 0) AS win_rate_pct,
          (array_agg(player_rating ORDER BY played_at DESC)
             FILTER (WHERE rated AND player_rating IS NOT NULL))[1] AS current_rating
   FROM g GROUP BY time_class
@@ -92,6 +96,7 @@ SELECT json_build_object(
     'ingested', pr.games,
     'skipped', pr.skipped,
     'games', COALESCE(s.games, 0),
+    'rated_games', COALESCE(s.rated_games, 0),
     'wins', COALESCE(s.wins, 0),
     'draws', COALESCE(s.draws, 0),
     'losses', COALESCE(s.losses, 0),
