@@ -5,7 +5,7 @@ from __future__ import annotations
 import chess
 import pytest
 
-from chess_coach.positions import Evaluation, NullCache, fen_hash, normalize_fen
+from chess_coach.positions import Evaluation, NullCache, engine_board, fen_hash, normalize_fen
 
 
 def test_move_counters_do_not_split_a_position():
@@ -52,3 +52,60 @@ def test_null_cache_always_misses():
     key = fen_hash(chess.Board())
     cache.put(key, "fen", "sf_18", 16, Evaluation(eval_cp=20, mate_in=None, best_move="e2e4"))
     assert cache.get(key, "sf_18", 16) is None
+
+
+def test_engine_board_drops_history_and_the_halfmove_clock():
+    """Two routes to one position must give the engine identical input."""
+    a = chess.Board()
+    for san in ["Nf3", "Nf6", "Ng1", "Ng8", "e4"]:  # a detour: clock and history differ
+        a.push_san(san)
+    b = chess.Board()
+    b.push_san("e4")
+
+    assert fen_hash(a) == fen_hash(b)
+    assert engine_board(a).fen() == engine_board(b).fen()
+    assert engine_board(a).move_stack == []
+    assert engine_board(a).halfmove_clock == 0
+
+
+def test_engine_board_keeps_chess960_castling():
+    board = chess.Board("nrqnbbkr/pppppppp/8/8/8/8/PPPPPPPP/NRQNBBKR w HBhb - 0 1", chess960=True)
+    assert engine_board(board).chess960
+    assert engine_board(board).castling_rights == board.castling_rights
+
+
+@pytest.mark.engine
+def test_an_evaluation_is_a_function_of_its_cache_key(stockfish_path):
+    """The reviewer's counter-example, turned into the guarantee.
+
+    The same KRK position with the halfmove clock at 0 and at 90 scores very
+    differently when sent as-is (Stockfish scales towards the 50-move draw).
+    Through engine_board(), with a cleared hash and one thread, both routes
+    must produce the identical evaluation - which is what makes first-write-
+    wins in the cache correct.
+    """
+    import chess.engine
+
+    fresh = chess.Board("8/8/8/4k3/8/8/8/4K2R w K - 0 1")
+    stale = chess.Board("8/8/8/4k3/8/8/8/4K2R w K - 90 120")
+    assert fen_hash(fresh) == fen_hash(stale)
+
+    with chess.engine.SimpleEngine.popen_uci(str(stockfish_path)) as engine:
+        engine.configure({"Threads": 1, "Hash": 16})
+        limit = chess.engine.Limit(depth=12)
+        raw = [
+            engine.analyse(b, limit, game=object())["score"].pov(chess.WHITE)
+            for b in (fresh, stale)
+        ]
+        normalised = [
+            engine.analyse(engine_board(b), limit, game=object())["score"].pov(chess.WHITE)
+            for b in (fresh, stale)
+        ]
+
+    assert raw[0] != raw[1], "precondition: the clock really does change the raw score"
+    assert normalised[0] == normalised[1]
+
+
+def test_null_cache_batch_lookup_misses_everything():
+    keys = [fen_hash(chess.Board()), fen_hash(chess.Board("8/8/8/8/8/8/8/K6k w - - 0 1"))]
+    assert NullCache().get_many(keys, "sf_18", 16) == {}
