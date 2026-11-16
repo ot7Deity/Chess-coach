@@ -263,22 +263,35 @@ async function runTests() {
       }),
     ]);
 
-    // Overview page with deitythemenace (should load without errors from API)
+    // Overview page with deitythemenace (should load with API data)
     await testPageWithBrowser(browser, "Overview (deitythemenace)", "/players/deitythemenace", [
       async (page) => {
-        // Check that page has content (not just skeleton loaders)
+        // Check for API-supplied data: rapid games count from deitythemenace's data
         const bodyText = await page.evaluate(() => document.body.innerText);
-        const hasContent = bodyText.length > 100;
-        return { pass: hasContent, message: "Page loads with content from API" };
+        const has424Games = bodyText.includes("424"); // rapid games count from API
+        return { pass: has424Games, message: "Shows rapid games count (424) from API" };
+      },
+      async (page) => {
+        // Check for win rate from report - API-only data
+        const bodyText = await page.evaluate(() => document.body.innerText);
+        const hasWinRate = /56\.97|56\.9/.test(bodyText); // rapid win_rate_pct
+        return { pass: hasWinRate, message: "Shows win rate (56.97) from API" };
       },
     ]);
 
-    // Progress page (should load without errors)
+    // Progress page (should load with API data)
     await testPageWithBrowser(browser, "Progress page (deitythemenace)", "/players/deitythemenace/progress", [
       async (page) => {
+        // Check for game counts from API
         const bodyText = await page.evaluate(() => document.body.innerText);
-        const hasContent = bodyText.length > 100;
-        return { pass: hasContent, message: "Page loads with content from API" };
+        const hasGameCounts = /424|430|434/m.test(bodyText); // any of the rapid/blitz/bullet game counts
+        return { pass: hasGameCounts, message: "Shows game counts from API" };
+      },
+      async (page) => {
+        // Check for ratings from API
+        const bodyText = await page.evaluate(() => document.body.innerText);
+        const hasRatings = /646|1650|946/m.test(bodyText); // bullet/blitz/rapid ratings
+        return { pass: hasRatings, message: "Shows ratings from API" };
       },
     ]);
 

@@ -23,6 +23,7 @@ import http from "http";
 import url from "url";
 
 const PORT = parseInt(process.argv[2] ?? "8765", 10);
+const FORCE_500 = process.argv.includes("--force-500");
 
 // In-memory store of added players via POST /players
 const addedPlayers = new Set();
@@ -253,6 +254,10 @@ const DEMO_DATA = {
  * Get player progress by username
  */
 function getPlayerProgress(username) {
+  if (FORCE_500) {
+    return { status: 500, body: { detail: "Internal Server Error" } };
+  }
+
   const lower = username.toLowerCase().trim();
 
   if (lower === "servererror") {
@@ -309,12 +314,16 @@ function getPlayerProgress(username) {
  * Get report for a player and time control
  */
 function getReport(username, timeClass) {
+  if (FORCE_500) {
+    return { status: 500, body: { detail: "Internal Server Error" } };
+  }
+
   const lower = username.toLowerCase().trim();
   const validTimeClasses = ["bullet", "blitz", "rapid", "daily"];
 
   // Validate time_class
   if (!validTimeClasses.includes(timeClass)) {
-    return { status: 422, body: { detail: `Invalid time_class: ${timeClass}` } };
+    return { status: 422, body: { detail: [{ loc: ["query", "time_class"], msg: `Invalid value`, type: "value_error" }] } };
   }
 
   if (lower === "servererror") {
@@ -336,11 +345,15 @@ function getReport(username, timeClass) {
  * Add a player
  */
 function addPlayer(username) {
+  if (FORCE_500) {
+    return { status: 500, body: { detail: "Internal Server Error" } };
+  }
+
   const lower = username.toLowerCase().trim();
 
   // Validate username pattern
   if (!/^[a-z0-9_-]{1,50}$/.test(lower)) {
-    return { status: 422, body: { detail: "Invalid username pattern" } };
+    return { status: 422, body: { detail: [{ loc: ["body", "username"], msg: "Invalid value", type: "value_error" }] } };
   }
 
   if (lower === "servererror") {
@@ -349,12 +362,12 @@ function addPlayer(username) {
 
   addedPlayers.add(lower);
 
-  // Return progress as if just added
+  // Return progress as if just added (matches M4 API: status is "pending")
   return {
     status: 202,
     body: {
       username: lower,
-      sync_status: "syncing",
+      sync_status: "pending",
       sync_error: null,
       last_synced_at: null,
       analyzed_last_hour: 0,
@@ -417,7 +430,7 @@ async function handleRequest(req, res) {
 
     if (!timeClass) {
       res.writeHead(422, commonHeaders);
-      res.end(JSON.stringify({ detail: "Missing required parameter: time_class" }));
+      res.end(JSON.stringify({ detail: [{ loc: ["query", "time_class"], msg: "Field required", type: "missing" }] }));
       return;
     }
 
@@ -429,6 +442,12 @@ async function handleRequest(req, res) {
 
   // POST /players
   if (req.method === "POST" && pathname === "/players") {
+    if (FORCE_500) {
+      res.writeHead(500, commonHeaders);
+      res.end(JSON.stringify({ detail: "Internal Server Error" }));
+      return;
+    }
+
     let body = "";
     req.on("data", (chunk) => {
       body += chunk.toString();
@@ -439,7 +458,7 @@ async function handleRequest(req, res) {
         const username = payload.username;
         if (!username) {
           res.writeHead(422, commonHeaders);
-          res.end(JSON.stringify({ detail: "Missing field: username" }));
+          res.end(JSON.stringify({ detail: [{ loc: ["body", "username"], msg: "Field required", type: "missing" }] }));
           return;
         }
         const result = addPlayer(username);
