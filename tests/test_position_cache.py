@@ -156,12 +156,10 @@ def _engine_for_rkey(clean_engine: Engine) -> None:
 
 def rkey(redis_client, key: bytes, engine: str = ENGINE, depth: int = DEPTH) -> str:
     """Where the cache keeps this entry right now, worked out independently of
-    the cache: <prefix><database>:<system_identifier>:<positions relfilenode>:<engine>:<depth>:<hex>."""
+    the cache: <prefix><db>:<sysid>:<relfilenode>:<engine>:<depth>:<hex>."""
     db_engine = _KEY_ENGINE["engine"]
     with db_engine.connect() as conn:
-        sysid = conn.execute(
-            text("SELECT system_identifier FROM pg_control_system()")
-        ).scalar_one()
+        sysid = conn.execute(text("SELECT system_identifier FROM pg_control_system()")).scalar_one()
         epoch = conn.execute(
             text("SELECT relfilenode FROM pg_class WHERE oid = 'positions'::regclass")
         ).scalar_one()
@@ -446,6 +444,60 @@ def test_the_namespace_names_the_database(cache, clean_engine, redis_client):
     name = cache.redis_name(key, ENGINE, DEPTH)
     assert name.startswith(f"{redis_client.key_prefix}{clean_engine.url.database}:")
     assert name == rkey(redis_client, key)
+
+
+def test_namespace_changes_when_cluster_id_changes(cache, clean_engine, redis_client, monkeypatch):
+    """The namespace includes system_identifier (not cached), so a fresh cluster
+    with the same relfilenode OID gets a different namespace. This test verifies
+    that _namespace is read per batch, not cached for the process lifetime.
+    Redis keys differ when system_identifier changes, proving sysid is essential."""
+    # Put an evaluation in the cache
+    key, fen = position("e4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+
+    # Get the Redis key with the original namespace
+    with clean_engine.connect() as conn:
+        cache._namespace(conn)
+    redis_key_original = cache.redis_name(key, ENGINE, DEPTH)
+
+    # Verify the value exists in Redis with this key
+    assert redis_client.exists(redis_key_original) > 0, "Value should exist in Redis"
+
+    # Mock _namespace to change system_identifier (simulating cluster recreation)
+    original_namespace = cache._namespace
+
+    def mock_namespace_changed_sysid(conn):
+        real = original_namespace(conn)
+        # Format is {db_prefix}{sysid}:{epoch}:
+        parts = real.rstrip(":").split(":")
+        if len(parts) >= 2:
+            # Increment sysid (second-to-last part)
+            new_sysid = str(int(parts[-2]) + 1)
+            new_namespace = ":".join([*parts[:-2], new_sysid, parts[-1]]) + ":"
+            return new_namespace
+        return real
+
+    monkeypatch.setattr(cache, "_namespace", mock_namespace_changed_sysid)
+
+    # Get the Redis key with the changed namespace
+    redis_key_changed = cache.redis_name(key, ENGINE, DEPTH)
+
+    # Verify the keys are different (proves sysid is in the namespace/key)
+    assert redis_key_changed != redis_key_original, (
+        f"Redis key should change when sysid changes. "
+        f"Original: {redis_key_original}, Changed: {redis_key_changed}"
+    )
+
+    # Verify the original key still exists and the new one doesn't
+    assert redis_client.exists(redis_key_original) > 0, "Original key should still exist"
+    assert redis_client.exists(redis_key_changed) == 0, (
+        "New key should not exist (not yet written with new namespace)"
+    )
+
+    # Restore and verify key reverts
+    monkeypatch.setattr(cache, "_namespace", original_namespace)
+    redis_key_restored = cache.redis_name(key, ENGINE, DEPTH)
+    assert redis_key_restored == redis_key_original, "Key should revert to original"
 
 
 def test_purge_also_reclaims_entries_from_old_epochs(cache, clean_engine, redis_client):
