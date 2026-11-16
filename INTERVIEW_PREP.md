@@ -53,6 +53,22 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M4 ENTRIES BELOW (report SQL, report and sync API). Newest first. -->
 
+## 2026-11-16 - Bug: a merge quietly deleted 1,670 lines of documentation `DONE`
+
+> **In plain English:** While restacking the branches, a merge of m4/3 into m4/4 needed to resolve a conflict in INTERVIEW_PREP.md. I took m4/4's version without noticing it was a short stub, not the full file. The result silently dropped all the UI dashboard entries, all earlier M4 entries, and all M2 entries—1,670 lines of design decisions. The PR diff made it obvious only after the fact: a PR that should add ~40 lines showed -4,099 lines. The tester found it by looking at the line diff; tests passed because documentation has no tests.
+
+**How it was found:** The tester saw a PR diff stat showing 4,099 lines removed and asked what happened. A conflict was resolved by keeping m4/4's short version wholesale, dropping everything else.
+
+**Root cause:** When resolving a merge conflict by taking one side, I didn't verify that the conflict was truly exclusive (m4/4 had newer entries) instead of one side being incomplete (m4/4 had *only* its own entries, missing earlier ones).
+
+**Fix:** Restore from m4/3, then re-add m4/4's new entry at the top. For INTERVIEW_PREP conflicts going forward: never take one side wholesale; keep both sides' entries, with newer ones first in each section.
+
+**Lesson:** A large diff stat against the parent (not comparing two sides of a conflict) is a red flag for a merge resolution mistake. Tests don't catch documentation loss. Check the diff yourself when conflict resolution touches vital files.
+
+**Where:** This entry is the fix.
+
+---
+
 ## 2026-11-16 - Bug: re-adding a player showed 'failed' forever `DONE`
 
 > **In plain English:** The website lets you re-add a player—say, to retry a download that failed. When you did, the page showed "The download from Chess.com failed" with the old error, and it never changed even after the queued retry succeeded. The page keeps checking for new work while there's work to do, but once a sync fails the page stops checking, so it missed the retry happening in the background. The bug was in the API: it queued the retry but didn't tell the page "oh, that failed sync is now pending again."
@@ -110,6 +126,67 @@ column with and without the cache."
 **Where:** `migrations/versions/0004_games_engine_ms.py`, `src/chess_coach/analysis/runner.py`
 (`CachedEvaluator.engine_ms`, `Worker._finish`), `src/chess_coach/models.py`,
 `tests/test_runner.py::test_engine_time_is_recorded_per_game_whether_or_not_there_is_a_cache`.
+
+---
+
+## 2026-11-06 - Which openings cost me rating: a window function, checked against real data `DONE`
+
+> **In plain English:** One question the report answers is "which openings lose me rating
+> points?" Chess.com stores my rating *after* each game, not how much it changed. So the
+> change for a game is "my rating after this game, minus my rating after the game before
+> it". The "game before it" has to be the previous *rated* game of the *same* kind (blitz
+> with blitz), in time order - including games whose opening has no name, even though those
+> are left out of the openings list itself. I wrote that as a database query, tested it on
+> small made-up data where I worked out every answer by hand, and then ran it on my real
+> 4,549 games. It matched the numbers the dashboard was already built with, exactly, for
+> every time control.
+
+**A bit deeper:** A *window function* (`LAG`) looks at the previous row in an ordered set
+without collapsing rows the way `GROUP BY` does - here, the previous rated game in the same
+time class, ordered by time (and by id, so two games at the same second still have a fixed
+order). The change is computed over every game *first* and only then filtered and grouped
+by opening, because filtering first would make the "previous game" skip games and inflate
+the changes.
+
+**What changed:** `src/chess_coach/analytics/report.py` - `summary`, `rating_trend` and
+`openings`, the report sections that come from ingested games and are complete as soon as a
+sync is. `analytics/progress.py` holds the "current rating" query, shared so the progress page
+and the report can never disagree about it.
+
+**Why the details are the way they are:**
+
+- *Window first, filter second.* A game with no opening name is not an opening row, but it is
+  still the previous game for the next one's rating change. A test puts an unnamed game
+  between two Italian Games and checks the change is measured from it.
+- *Ties break on id, everywhere.* The rating change's `LAG`, "current rating" and "the last
+  game of the day" all order by `(played_at, id)`, so no two of them can disagree about which
+  game came last.
+- *The UTC day, written out.* `(played_at AT TIME ZONE 'UTC')::date`, and a test runs the query
+  in a Los Angeles session to show a 02:00 UTC game still lands on its UTC day. Chess.com's own
+  monthly archives are filed in US Pacific time, which is why the contract has no month field.
+- *Percentages are computed in Python from integer counts.* Postgres `numeric` division returns
+  20 significant digits (`51.0392609699769053`), which is not the float the contract promises.
+
+**Verified against real data:** a read-only run against the development database
+(`deitythemenace`, 4,549 standard games) compared every summary count, current rating,
+rating-trend point and opening row with the dashboard's real-data fixture: blitz 433 games /
+141 trend days / 15 opening rows, bullet 3,690 / 907 / 50, rapid 424 / 161 / 17, daily 2 / 2 / 0.
+Zero differences.
+
+**Alternatives rejected:**
+- *Compute rating change in Python*: pulls every game of a time class over the wire to do what
+  one window function does next to the data.
+- *Filter out unnamed openings before the `LAG`*: simpler SQL, wrong numbers.
+
+**Talking point:** "Chess.com gives you the rating after each game, not the change, so the
+change is a LAG over the previous rated game in the same time class. The subtle part is the
+order of operations: the window has to run over every game before you filter to games with a
+named opening, or the 'previous game' skips some and the numbers inflate. I tested it on
+hand-computed data and then against my real 4,549 games, where it matched the dashboard's
+fixture exactly."
+
+**Where:** `src/chess_coach/analytics/report.py`, `src/chess_coach/analytics/progress.py`,
+`tests/test_report_games.py`.
 
 ---
 
