@@ -10,7 +10,7 @@ import { spawn } from "child_process";
 import { existsSync, rmSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { chromium } from "@playwright/test";
+import pw from "playwright";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -250,7 +250,7 @@ async function runTests() {
 
     // Launch Playwright browser
     console.log("\nLaunching Playwright browser...");
-    browser = await chromium.launch();
+    browser = await pw.chromium.launch();
 
     // Test pages
     console.log("\n=== Running tests ===");
