@@ -446,58 +446,49 @@ def test_the_namespace_names_the_database(cache, clean_engine, redis_client):
     assert name == rkey(redis_client, key)
 
 
-def test_namespace_changes_when_cluster_id_changes(cache, clean_engine, redis_client, monkeypatch):
-    """The namespace includes system_identifier (not cached), so a fresh cluster
-    with the same relfilenode OID gets a different namespace. This test verifies
-    that _namespace is read per batch, not cached for the process lifetime.
-    Redis keys differ when system_identifier changes, proving sysid is essential."""
-    # Put an evaluation in the cache
-    key, fen = position("e4")
-    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+def test_namespace_changes_when_cluster_id_changes(cache, clean_engine):
+    """The namespace includes system_identifier (read per batch, not cached), so a
+    fresh cluster (same relfilenode, different system_identifier) gets a different
+    namespace. The real _namespace() runs under a SQLAlchemy hook that injects fake
+    cluster IDs, proving the code reads the ID on each call, not by mocking the function."""
+    from sqlalchemy import event
 
-    # Get the Redis key with the original namespace
-    with clean_engine.connect() as conn:
-        cache._namespace(conn)
-    redis_key_original = cache.redis_name(key, ENGINE, DEPTH)
+    real_query = "SELECT system_identifier FROM pg_control_system()"
 
-    # Verify the value exists in Redis with this key
-    assert redis_client.exists(redis_key_original) > 0, "Value should exist in Redis"
+    class FakeClusterId:
+        value = 111
 
-    # Mock _namespace to change system_identifier (simulating cluster recreation)
-    original_namespace = cache._namespace
+    def rewrite_sysid(conn, cursor, statement, params, context, executemany):
+        if real_query in statement:
+            statement = statement.replace(real_query, f"SELECT {int(FakeClusterId.value)}::bigint")
+        return statement, params
 
-    def mock_namespace_changed_sysid(conn):
-        real = original_namespace(conn)
-        # Format is {db_prefix}{sysid}:{epoch}:
-        parts = real.rstrip(":").split(":")
-        if len(parts) >= 2:
-            # Increment sysid (second-to-last part)
-            new_sysid = str(int(parts[-2]) + 1)
-            new_namespace = ":".join([*parts[:-2], new_sysid, parts[-1]]) + ":"
-            return new_namespace
-        return real
+    event.listen(clean_engine, "before_cursor_execute", rewrite_sysid, retval=True)
 
-    monkeypatch.setattr(cache, "_namespace", mock_namespace_changed_sysid)
+    try:
+        # Get namespace with cluster ID 111
+        with clean_engine.connect() as conn:
+            namespace_111 = cache._namespace(conn)
 
-    # Get the Redis key with the changed namespace
-    redis_key_changed = cache.redis_name(key, ENGINE, DEPTH)
+        # Get namespace with cluster ID 222
+        FakeClusterId.value = 222
+        with clean_engine.connect() as conn:
+            namespace_222 = cache._namespace(conn)
 
-    # Verify the keys are different (proves sysid is in the namespace/key)
-    assert redis_key_changed != redis_key_original, (
-        f"Redis key should change when sysid changes. "
-        f"Original: {redis_key_original}, Changed: {redis_key_changed}"
-    )
+        # Get namespace back to 111
+        FakeClusterId.value = 111
+        with clean_engine.connect() as conn:
+            namespace_111_again = cache._namespace(conn)
 
-    # Verify the original key still exists and the new one doesn't
-    assert redis_client.exists(redis_key_original) > 0, "Original key should still exist"
-    assert redis_client.exists(redis_key_changed) == 0, (
-        "New key should not exist (not yet written with new namespace)"
-    )
+        # The namespaces must be different when the cluster ID changes
+        assert namespace_111 != namespace_222, (
+            "Namespace must include the cluster ID; it must change when cluster ID changes"
+        )
+        # And must be the same when back to the original cluster ID
+        assert namespace_111 == namespace_111_again, "Namespace must revert when cluster ID reverts"
 
-    # Restore and verify key reverts
-    monkeypatch.setattr(cache, "_namespace", original_namespace)
-    redis_key_restored = cache.redis_name(key, ENGINE, DEPTH)
-    assert redis_key_restored == redis_key_original, "Key should revert to original"
+    finally:
+        event.remove(clean_engine, "before_cursor_execute", rewrite_sysid)
 
 
 def test_purge_also_reclaims_entries_from_old_epochs(cache, clean_engine, redis_client):

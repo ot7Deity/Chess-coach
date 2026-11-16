@@ -1057,6 +1057,8 @@ something the worker benchmark decides, not me."
 `purge_redis`, `redis_name`), `tests/test_position_cache.py` ("Redis never outlives
 Postgres"), `.env.example`, `bench/cache_micro.py`.
 
+**Testing note:** The first regression test (monkeypatch approach) passed despite the bug it was meant to catch, because mocking `_namespace` itself skipped the real code path. The tester caught this via mutation testing (dropping sysid, re-adding per-process cache) and replaced it with a SQLAlchemy hook that lets the real `_namespace()` run while injecting fake cluster IDs.
+
 ---
 
 ## 2026-11-06 - The benchmark's default job type matched nothing `DONE`
