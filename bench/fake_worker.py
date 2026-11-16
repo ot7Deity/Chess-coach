@@ -1,9 +1,9 @@
 """A stand-in analysis worker, so the benchmark harness can be tested before M2.
 
-    uv run python -m bench.fake_worker --worker-id w1 --exit-when-empty
+    uv run python -m bench.fake_worker --worker-id w1 --until-empty
 
 It does everything the real worker's job loop does except run Stockfish:
-claims `analyze_game` jobs with `FOR UPDATE SKIP LOCKED`, replays the PGN,
+claims `analyze-game` jobs with `FOR UPDATE SKIP LOCKED`, replays the PGN,
 looks every position up through the real `EvalCache` (batch first, then a
 re-check just before "computing" each miss), sleeps `--ms-per-eval` in place
 of a search, writes the result with `put`, writes `moves`, and marks the game
@@ -125,9 +125,9 @@ def analyse_game(engine: Engine, cache: EvalCache, game_id: int, ms_per_eval: in
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="bench.fake_worker")
     parser.add_argument("--worker-id", required=True)
-    parser.add_argument("--exit-when-empty", action="store_true")
+    parser.add_argument("--until-empty", action="store_true")
     parser.add_argument("--ms-per-eval", type=int, default=5)
-    parser.add_argument("--job-type", default="analyze_game")
+    parser.add_argument("--job-type", default="analyze-game")
     args = parser.parse_args(argv)
 
     engine = get_engine()
@@ -136,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         with engine.begin() as conn:
             job = conn.execute(_CLAIM, {"worker": args.worker_id, "type": args.job_type}).first()
         if job is None:
-            if args.exit_when_empty:
+            if args.until_empty:
                 return 0
             time.sleep(0.2)
             continue

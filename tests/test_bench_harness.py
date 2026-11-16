@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import uuid
 
 import pytest
 from bench.harness import (
+    DEFAULT_DEDUPE_KEY,
+    DEFAULT_JOB_PAYLOAD,
+    DEFAULT_JOB_TYPE,
     BenchError,
     check_database_is_disposable,
     enqueue,
@@ -52,6 +56,25 @@ def test_placeholders_are_filled_per_worker():
     ]
 
 
+def test_job_defaults_match_the_format_m2_confirmed():
+    """A wrong default doesn't fail - the workers just find nothing to claim, exit
+    on an empty queue, and the round reports 0 games. So pin it to what M2 said."""
+    assert DEFAULT_JOB_TYPE == "analyze-game"
+    assert json.loads(DEFAULT_JOB_PAYLOAD.format(game_id=42)) == {"game_id": 42}
+    assert DEFAULT_DEDUPE_KEY.format(game_id=42) == "analyze-game:42"
+
+
+def test_the_default_worker_command_is_m2s_cli():
+    from bench.throughput import DEFAULT_WORKER_CMD
+
+    assert DEFAULT_WORKER_CMD == [
+        "chess-coach-worker",
+        "--worker-id",
+        "{worker_id}",
+        "--until-empty",
+    ]
+
+
 def test_a_missing_worker_command_is_a_clear_error():
     with pytest.raises(BenchError, match="not found"):
         expand_command(["definitely-not-a-real-command-xyz"], n=1, index=0, metrics_port=0)
@@ -78,14 +101,14 @@ def test_enqueue_fills_every_not_null_column_and_replaces_its_own_jobs(clean_eng
     unique dedupe_key."""
     ids, _ = create_workload(clean_engine)
     for _ in range(2):
-        enqueue(clean_engine, ids, "analyze_game", '{{"game_id": {game_id}}}', "k:{game_id}")
+        enqueue(clean_engine, ids, "analyze-game", '{{"game_id": {game_id}}}', "k:{game_id}")
     with clean_engine.connect() as conn:
         jobs = conn.execute(
             text("SELECT type, payload, status, priority, attempts, dedupe_key FROM jobs")
         ).all()
     assert len(jobs) == len(ids)
     assert {(j.type, j.status, j.priority, j.attempts) for j in jobs} == {
-        ("analyze_game", "pending", 100, 0)
+        ("analyze-game", "pending", 100, 0)
     }
     assert sorted(j.payload["game_id"] for j in jobs) == sorted(ids)
     assert {j.dedupe_key for j in jobs} == {f"k:{i}" for i in ids}
