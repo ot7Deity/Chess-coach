@@ -64,10 +64,10 @@ def test_port_zero_disables_the_endpoint():
     assert metrics.start_metrics_server(port=0) is None
 
 
-def test_default_config_opens_port_9100_to_avoid_api_collision(monkeypatch):
-    """The default port 9100 avoids collision with API port 8000."""
+def test_default_config_disables_metrics(monkeypatch):
+    """The default is 0 (disabled) to avoid port collisions between workers."""
     monkeypatch.delenv("METRICS_PORT", raising=False)
-    assert Settings(_env_file=None).metrics_port == 9100
+    assert Settings(_env_file=None).metrics_port == 0
 
 
 def test_each_worker_serves_on_base_port_plus_its_index():

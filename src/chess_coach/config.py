@@ -68,8 +68,8 @@ class Settings(BaseSettings):
     # After a Redis failure, go Postgres-only for this long before retrying.
     position_cache_redis_retry_sec: float = Field(default=30.0, ge=0)
     # Prometheus endpoint. 0 disables it. Several workers on one host each take
-    # metrics_port + their worker index. Default 9100 avoids clash with API port 8000.
-    metrics_port: int = Field(default=9100, ge=0, le=65535)
+    # metrics_port + their worker index via the CLI --metrics-port flag.
+    metrics_port: int = Field(default=0, ge=0, le=65535)
     metrics_addr: str = "127.0.0.1"
 
     # --- Workers ------------------------------------------------------------
