@@ -76,7 +76,7 @@ def summary(session: Session, player_id: int, time_class: str) -> Summary:
                    count(*) FILTER (WHERE g.result = 'loss') AS losses,
                    ({CURRENT_RATING_SQL.format(time_class=":time_class")}) AS current_rating
             FROM games g
-            WHERE {_SCOPE}
+            WHERE {_SCOPE} AND g.rated
             """
         ),
         {"player_id": player_id, "time_class": time_class},
