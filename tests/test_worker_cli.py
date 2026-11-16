@@ -80,11 +80,14 @@ def test_a_missing_engine_binary_is_a_clear_error_not_a_traceback(
     assert "Traceback" not in proc.stdout + proc.stderr
 
 
-@pytest.mark.parametrize("position_cache,expect_rows,expect_redis", [
-    ("full", True, True),
-    ("postgres", True, False),
-    ("off", False, False),
-])
+@pytest.mark.parametrize(
+    "position_cache,expect_rows,expect_redis",
+    [
+        ("full", True, True),
+        ("postgres", True, False),
+        ("off", False, False),
+    ],
+)
 def test_position_cache_setting_controls_whether_positions_are_stored(
     clean_engine: Engine,
     database_url: str,
@@ -121,9 +124,7 @@ def test_position_cache_setting_controls_whether_positions_are_stored(
             f"POSITION_CACHE={position_cache} should write positions to Postgres"
         )
     else:
-        assert positions_count == 0, (
-            f"POSITION_CACHE={position_cache} should not write positions"
-        )
+        assert positions_count == 0, f"POSITION_CACHE={position_cache} should not write positions"
 
     # Verify Redis key count matches expectation (using the unique test prefix)
     client = redis.Redis.from_url(redis_url)
@@ -133,6 +134,4 @@ def test_position_cache_setting_controls_whether_positions_are_stored(
     if expect_redis:
         assert redis_keys, f"POSITION_CACHE={position_cache} should write to Redis"
     else:
-        assert not redis_keys, (
-            f"POSITION_CACHE={position_cache} should not write to Redis"
-        )
+        assert not redis_keys, f"POSITION_CACHE={position_cache} should not write to Redis"
