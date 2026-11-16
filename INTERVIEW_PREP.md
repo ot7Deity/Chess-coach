@@ -32,10 +32,10 @@ milestones, done in parallel on different branches, merges without conflicts.
 
 ## The 60-second pitch
 
-> "Given a Chess.com username, it pulls that player's entire game history - about 4,000 games
-> for any active player - and runs every position through Stockfish to find where they actually
-> lose rating. The interesting part isn't the chess, it's that analyzing 220,000 positions is
-> hours of CPU time, so it's a job queue feeding a pool of worker processes, with a
+> "Given any Chess.com username, it pulls that player's whole history - for my own account,
+> about 4,500 games and 220,000 positions - and runs every position through Stockfish to find
+> where they actually lose rating. The interesting part isn't the chess, it's that analyzing
+> a history that size is hours of CPU time, so it's a job queue feeding a pool of worker processes, with a
 > position-level cache in front of the engine, and an API that only ever reads finished results
 > so the site stays fast while the backlog drains."
 
@@ -1650,8 +1650,9 @@ reported success by printing after `gh pr merge`, not by checking the command's 
 
 **How it was found:** after a session restart, `git log origin/main` showed only 6 of the 18
 approved merges. `gh pr list --state merged --json baseRefName` showed the rest had
-`baseRefName` set to a sibling branch, e.g. `m2/4..m2/7` merged into `m2/3-engine-wrapper` and
-`ui/6..ui/8` into `ui/5-progress-page`.
+`baseRefName` set to the branch of the PR below them in the stack, e.g. `m2/4..m2/7` merged into
+`m2/3-engine-wrapper`, and `ui/6` and `ui/7` into `ui/5-progress-page` (`ui/8` went into
+`ui/7-polish`, which then carried it into `ui/5` nine seconds later).
 
 **The fix:** merging the three PRs that were still open at the bottom of each sub-stack (#19,
 #25, #43) carried everything into `main`, because each of those branches had absorbed the ones
