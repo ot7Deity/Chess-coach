@@ -18,3 +18,11 @@ def test_env_overrides_defaults(monkeypatch):
 
 def test_log_level_is_normalised():
     assert Settings(log_level="debug").log_level == "DEBUG"
+
+
+def test_engine_threads_other_than_one_are_rejected():
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, engine_threads=2)
