@@ -192,3 +192,63 @@ def test_a_sync_worker_does_not_reap_analysis_jobs(clean_engine: Engine):
     )
     assert worker.reap() == []
     assert _one(clean_engine, "SELECT status FROM jobs").status == "running"
+
+
+def test_a_sync_waiting_to_retry_is_not_reported_as_failed(clean_engine: Engine):
+    """When a transient Chess.com error causes a sync to fail and retry, on_failed
+    sets sync_status back to 'pending' so the progress page keeps polling."""
+    player_id = _add_player(clean_engine)
+    _enqueue(clean_engine, player_id)
+    with clean_engine.begin() as c:
+        c.execute(
+            text("UPDATE players SET sync_status = 'error', sync_error = 'ChessComUnavailable'")
+        )
+
+    # Simulate on_failed being called with status='pending' (job will retry)
+    with Session(clean_engine) as s, s.begin():
+        lease = queue.Lease(
+            job_id=1,
+            worker_id="w1",
+            attempt=1,
+            max_attempts=5,
+            payload={"player_id": player_id, "username": ME},
+            type=SYNC_JOB_TYPE,
+        )
+        worker = SyncWorker(
+            clean_engine, _fake_history().client(), worker_id="w1", settings=_settings()
+        )
+        worker.on_failed(s, lease, "pending")
+
+    # sync_status should be reset to 'pending' so progress page polls again
+    result = _one(clean_engine, "SELECT sync_status FROM players WHERE id = :id", id=player_id)
+    assert result.sync_status == "pending"
+
+
+def test_a_dead_lettered_sync_stays_failed(clean_engine: Engine):
+    """When a sync is dead-lettered (exhausted retries), on_failed leaves
+    sync_status as 'error' so the user knows it failed."""
+    player_id = _add_player(clean_engine)
+    _enqueue(clean_engine, player_id)
+    with clean_engine.begin() as c:
+        c.execute(
+            text("UPDATE players SET sync_status = 'error', sync_error = 'ChessComUnavailable'")
+        )
+
+    # Simulate on_failed being called with status='dead' (job will not retry)
+    with Session(clean_engine) as s, s.begin():
+        lease = queue.Lease(
+            job_id=1,
+            worker_id="w1",
+            attempt=5,
+            max_attempts=5,
+            payload={"player_id": player_id, "username": ME},
+            type=SYNC_JOB_TYPE,
+        )
+        worker = SyncWorker(
+            clean_engine, _fake_history().client(), worker_id="w1", settings=_settings()
+        )
+        worker.on_failed(s, lease, "dead")
+
+    # sync_status should stay 'error'
+    result = _one(clean_engine, "SELECT sync_status FROM players WHERE id = :id", id=player_id)
+    assert result.sync_status == "error"

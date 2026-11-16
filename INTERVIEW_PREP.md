@@ -53,6 +53,20 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M4 ENTRIES BELOW (report SQL, report and sync API). Newest first. -->
 
+## 2026-11-16 - Bug: a hiccup at Chess.com looked like a permanent failure `DONE`
+
+> **In plain English:** When Chess.com is briefly down, the sync fails and sets `sync_status = 'error'`. The job gets re-queued to try again, but the progress page sees `'error'` and thinks the sync is permanently stuck, so it stops polling. While it waits to retry, the page shows "The download from Chess.com failed" forever and never refreshes to see the successful retry later.
+
+**A bit deeper:** The sync worker's `handle()` sets `sync_status = 'error'` when `sync_player` raises an exception. The job goes into backoff to retry (status becomes 'pending'). But the `SyncWorker` had no `on_failed` hook to reset `sync_status` when the job is about to retry. So every retry backoff period looked like a permanent failure to the progress page, which polls only while work is pending, not while it's errored.
+
+**Root cause:** Same class as the re-POST sync_status bug: `sync_status` says what the last attempt did, not what the system will do next. The column is an artifact of the most recent event, not a prediction of what comes next.
+
+**Fix:** Add `SyncWorker.on_failed(session, lease, status)`: when `status = 'pending'` (job will retry), set `sync_status = 'pending'` so the progress page resumes polling; when `status = 'dead'` (retries exhausted), leave `sync_status = 'error'`. Keep `sync_error` so the user sees the last error.
+
+**Talking point:** "Transient Chess.com failures would look permanent because the status column held what happened, not what comes next. When the job retried, the status hook resets it to 'pending', so polling resumes while waiting."
+
+**Where:** `src/chess_coach/ingest/jobs.py` (`SyncWorker.on_failed`), `tests/test_sync_jobs.py`.
+
 ## 2026-11-16 - Bug: a merge quietly deleted 1,670 lines of documentation `DONE`
 
 > **In plain English:** While restacking the branches, a merge of m4/3 into m4/4 needed to resolve a conflict in INTERVIEW_PREP.md. I took m4/4's version without noticing it was a short stub, not the full file. The result silently dropped all the UI dashboard entries, all earlier M4 entries, and all M2 entries—1,670 lines of design decisions. The PR diff made it obvious only after the fact: a PR that should add ~40 lines showed -4,099 lines. The tester found it by looking at the line diff; tests passed because documentation has no tests.
