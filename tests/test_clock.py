@@ -33,7 +33,7 @@ def test_time_spent_uses_each_players_own_previous_reading_and_the_increment():
     # 180+2. Readings include the increment.
     clocks = [182.0, 182.0, 175.5, 170.0, 177.5]
     movers = [W, B, W, B, W]
-    # White's first move: 180 - 182 + 2 = 0 (Chess.com does not run the first move).
+    # White's first move: 180 - 182 + 2 = 0 (these synthetic readings spend nothing on it).
     # White's second: 182 - 175.5 + 2 = 8.5. Black's second: 182 - 170 + 2 = 14.
     assert move_times(clocks, movers, TimeControl(180, 2)) == [0.0, 0.0, 8.5, 14.0, 0.0]
 
