@@ -951,6 +951,26 @@ things break, and a dashboard has nothing to gain from being first."
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-16 - Default metrics disabled (METRICS_PORT=0) to avoid worker-vs-worker collision `DONE`
+
+> **In plain English:** Each worker can run a metrics server on a port so external tools can scrape stats. Early design had a default port (9100) that multiple workers would fight over, crashing the second worker. The fix: metrics are disabled by default (port 0), and the bench harness assigns each worker a unique port when needed (base + worker index).
+
+**A bit deeper:** The metrics server binds to a TCP port. If two workers start on the same machine, both try port 9100 and the second fails. The fix is port 0 (disabled) by default, so workers don't collide. The --metrics-port CLI flag and METRICS_PORT env var let you opt in. The bench harness passes worker_index to calculate a unique port for each worker: base + worker_index.
+
+**What changed:** config.py sets METRICS_PORT default to 0 (was 9100). worker.py's --metrics-port flag overrides METRICS_PORT env var. Worker.handle() gets worker_index and passes it to start_metrics_server(). Bench harness passes base port to workers with indices, so worker 0 gets base, worker 1 gets base+1, etc. Bind failure logs a warning and continues (metrics isn't critical).
+
+**Why:** A fixed port meant only one worker per machine could run metrics. Disabling by default means workers don't fight; enabling requires explicit config, so users opt in and get a port collision error message only if they misconfigure (useful signal).
+
+**Alternatives rejected:** Dynamic port allocation (OS picks an unused port) would require workers to register their ports somewhere; opt-in with shared config is simpler. Always enabling would break existing setups.
+
+**Bug avoided:** The tester ran two workers on one machine and the second crashed on bind failure. The earlier design assumption was "one worker per machine," but bench's parallelism invalidated it. Setting default to 0 and requiring explicit config per worker makes the port strategy visible in job parameters.
+
+**Talking point:** "Metrics were colliding between workers on the same machine because both tried port 9100. I changed the default to disabled (0) so workers don't fight, then the bench harness assigns base+worker_index so each worker gets a unique port when metrics are enabled."
+
+**Where:** `src/chess_coach/config.py` (default), `src/chess_coach/worker.py` (CLI flag and startup), `bench/harness.py` (worker_index assignment).
+
+---
+
 ## 2026-11-16 - Batching positions with prefetch() to load cache once per game `DONE`
 
 > **In plain English:** The worker now replays the entire game before evaluating anything, collects all the positions it will need, and loads them from the cache in one batch. This cuts database round trips and engine work by loading cache hits before the game analysis begins, while keeping engine_ms accounting correct—only misses contribute to the time cost.
