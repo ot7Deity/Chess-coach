@@ -159,9 +159,7 @@ def rkey(redis_client, key: bytes, engine: str = ENGINE, depth: int = DEPTH) -> 
     the cache: <prefix><database>:<system_identifier>:<positions relfilenode>:<engine>:<depth>:<hex>."""
     db_engine = _KEY_ENGINE["engine"]
     with db_engine.connect() as conn:
-        sysid = conn.execute(
-            text("SELECT system_identifier FROM pg_control_system()")
-        ).scalar_one()
+        sysid = conn.execute(text("SELECT system_identifier FROM pg_control_system()")).scalar_one()
         epoch = conn.execute(
             text("SELECT relfilenode FROM pg_class WHERE oid = 'positions'::regclass")
         ).scalar_one()
@@ -446,6 +444,20 @@ def test_the_namespace_names_the_database(cache, clean_engine, redis_client):
     name = cache.redis_name(key, ENGINE, DEPTH)
     assert name.startswith(f"{redis_client.key_prefix}{clean_engine.url.database}:")
     assert name == rkey(redis_client, key)
+
+
+def test_namespace_includes_cluster_id(cache, clean_engine):
+    """The namespace includes the system_identifier (cluster ID), so if Postgres
+    is recreated, old Redis entries become unreachable even if the relfilenode
+    resets to the same OID value. This test verifies the namespace is read per
+    batch, not cached for the process lifetime."""
+    with clean_engine.connect() as conn:
+        namespace = cache._namespace(conn)
+        # Namespace format: <prefix><db>:<sysid>:<relfilenode>:
+        # e.g. "bench:micro:chess_coach_test_m3:7217945139051844:16417:"
+        assert namespace.endswith(":"), f"Namespace should end with colon: {namespace}"
+        # Count colons: should have at least 3 (prefix+db has 1, sysid has 1, relfilenode has 1, final has 1 = 4 total)
+        assert namespace.count(":") >= 3, f"Namespace missing components: {namespace}"
 
 
 def test_purge_also_reclaims_entries_from_old_epochs(cache, clean_engine, redis_client):

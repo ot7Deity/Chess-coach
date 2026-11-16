@@ -87,8 +87,6 @@ _REDIS_ERRORS = (redis.RedisError, OSError)
 # The positions table's current storage file. Changes on TRUNCATE, re-creation
 # and restore; not on INSERT, UPDATE or DELETE.
 _EPOCH = text("SELECT relfilenode FROM pg_class WHERE oid = 'positions'::regclass")
-# The cluster's unique identifier. Changes only on initdb; constant per cluster.
-_SYSTEM_IDENTIFIER = text("SELECT system_identifier FROM pg_control_system()")
 
 
 def redis_key(prefix: str, key: bytes, engine_version: str, depth: int) -> str:
@@ -199,7 +197,6 @@ class PositionCache:
         self._redis_down_until = 0.0
         self._redis_healthy = redis_client is not None
         self._lock = threading.Lock()
-        self._system_identifier: str | None = None  # Lazily fetched and cached
         self._stats = CacheStats()
         metrics.CACHE_REDIS_UP.set(1 if self._redis_healthy else 0)
 
@@ -386,11 +383,18 @@ class PositionCache:
             return redis_key(self._namespace(conn), key, engine_version, depth)
 
     def _namespace(self, conn: Connection) -> str:
-        # Fetch system_identifier once per cluster lifetime and cache it
-        if self._system_identifier is None:
-            self._system_identifier = conn.execute(_SYSTEM_IDENTIFIER).scalar_one()
-        epoch = conn.execute(_EPOCH).scalar_one()
-        return f"{self._db_prefix}{self._system_identifier}:{epoch}:"
+        # Read both values per batch, not cached: a long-running process must notice
+        # if Postgres is recreated (docker compose down && volume rm && up). The
+        # relfilenode resets to the same OID value on fresh clusters, so the
+        # system_identifier (which is unique per initdb) is essential to distinguish them.
+        result = conn.execute(
+            text(
+                "SELECT (SELECT system_identifier FROM pg_control_system()), "
+                "relfilenode FROM pg_class WHERE oid = 'positions'::regclass"
+            )
+        ).one()
+        sysid, epoch = result
+        return f"{self._db_prefix}{sysid}:{epoch}:"
 
     def _postgres_get(
         self, keys: Sequence[bytes], engine_version: str, depth: int

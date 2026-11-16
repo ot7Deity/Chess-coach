@@ -65,12 +65,14 @@ exactly; a re-sync costs **2 requests**.
 the table a new one; ordinary inserts, updates and deletes don't. The Redis *namespace* - the
 part of every key before the position - is now
 `<prefix><database name>:<system_identifier>:<relfilenode>:`. The `system_identifier` is
-Postgres's unique cluster ID (readable from `pg_control_system()`, set at initdb, constant per
-cluster). Each batch reads both values (one tiny catalog query), so once the table is reset,
-every old Redis entry is unreachable at once. If Postgres is recreated from scratch (e.g.
-docker volume rm of pgdata while Redis survives), the new cluster has a different
-system_identifier, so old Redis entries become unreachable. The relfilenode resets to the same
-OID counter on fresh clusters, so the identifier is essential to distinguish them.
+Postgres's unique cluster ID (readable from `pg_control_system()`, set at initdb, unique per
+initdb). The namespace is **read per batch** (one tiny catalog query:
+`SELECT (SELECT system_identifier FROM pg_control_system()), relfilenode FROM pg_class WHERE oid = 'positions'::regclass`),
+not cached for the process lifetime, so a long-running worker that rides out a cluster
+recreation (e.g. `docker compose down && docker volume rm pgdata && up`) notices the new ID
+and uses a fresh namespace. The relfilenode resets to the same OID counter on fresh clusters,
+so without the system_identifier old Redis entries would be unreachable but *new* Postgres
+would reuse the same namespace and answer with stale data.
 
 **Symptom:** The tester's strict expected-failure test: put a position, `TRUNCATE positions`,
 `get` it - and Redis answered while Postgres had zero rows.
