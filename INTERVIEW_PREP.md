@@ -57,7 +57,7 @@ exactly; a re-sync costs **2 requests**.
 
 > **In plain English:** When Chess.com is briefly down, the sync fails and sets `sync_status = 'error'`. The job gets re-queued to try again, but the progress page sees `'error'` and thinks the sync is permanently stuck, so it stops polling. While it waits to retry, the page shows "The download from Chess.com failed" forever and never refreshes to see the successful retry later.
 
-**A bit deeper:** The sync worker's `handle()` sets `sync_status = 'error'` when `sync_player` raises an exception. The job goes into backoff to retry (status becomes 'pending'). But the `SyncWorker` had no `on_failed` hook to reset `sync_status` when the job is about to retry. So every retry backoff period looked like a permanent failure to the progress page, which polls only while work is pending, not while it's errored.
+**A bit deeper:** `sync_player` sets `sync_status = 'error'` when the download fails, and the sync worker's `handle()` re-raises so the queue can retry. The job goes into backoff to retry (status becomes 'pending'). But the `SyncWorker` had no `on_failed` hook to reset `sync_status` when the job is about to retry. So every retry backoff period looked like a permanent failure to the progress page, which polls only while work is pending, not while it's errored.
 
 **Root cause:** Same class as the re-POST sync_status bug: `sync_status` says what the last attempt did, not what the system will do next. The column is an artifact of the most recent event, not a prediction of what comes next.
 

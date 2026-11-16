@@ -163,12 +163,15 @@ class SyncWorker(JobRunner):
         if player_id is None:
             return
         if status == "pending":
-            # Job will retry: clear error status so progress page resumes polling
+            # Another process (e.g. the chess-coach-sync CLI) may be mid-sync and
+            # owns 'syncing'; same guard as add_player.
             session.execute(
-                text("UPDATE players SET sync_status = 'pending' WHERE id = :id"),
+                text(
+                    "UPDATE players SET sync_status = 'pending' "
+                    "WHERE id = :id AND sync_status <> 'syncing'"
+                ),
                 {"id": int(player_id)},
             )
-        # If status == 'dead', leave sync_status alone (stays 'error')
 
     def on_reaped(self, session: Session, job: queue.ReapedJob) -> None:
         """A sync worker died mid-sync: the player is no longer 'syncing'."""
