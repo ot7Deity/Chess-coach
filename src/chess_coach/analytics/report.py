@@ -31,6 +31,13 @@ MIN_OPENING_GAMES = 5
 
 @dataclass(frozen=True)
 class Summary:
+    """The headline record: RATED standard games only.
+
+    Chess.com's stats page counts rated games and leaves unrated ones out, and
+    the record has to reconcile with it exactly. Every other section keeps
+    unrated games: a blunder in a casual game is still a blunder.
+    """
+
     games: int
     wins: int
     draws: int
@@ -64,6 +71,15 @@ _SCOPE = "g.player_id = :player_id AND g.time_class = :time_class AND g.rules = 
 def _pct(part: int, whole: int) -> float | None:
     """0-100, unrounded, as a float - never Postgres numeric's 20 digits."""
     return 100.0 * part / whole if whole else None
+
+
+def standard_games(session: Session, player_id: int, time_class: str) -> int:
+    """Standard games in the class, rated and unrated: `Report.games`, the
+    population for openings and the move-level sections."""
+    return session.execute(
+        text(f"SELECT count(*) FROM games g WHERE {_SCOPE}"),
+        {"player_id": player_id, "time_class": time_class},
+    ).scalar_one()
 
 
 def summary(session: Session, player_id: int, time_class: str) -> Summary:
@@ -263,7 +279,7 @@ def blunders_by_phase(session: Session, player_id: int, time_class: str) -> list
     ]
 
 
-def time_pressure(session: Session, player_id: int, time_class: str) -> TimePressure:
+def time_pressure(session: Session, player_id: int, time_class: str) -> TimePressure | None:
     """The player's moves split by the clock they had when they *started* the move.
 
     `moves.clock_seconds` is the reading after a move, and the opponent's
@@ -272,30 +288,48 @@ def time_pressure(session: Session, player_id: int, time_class: str) -> TimePres
     "First move" is decided by position (row_number = 1), not by the previous
     reading being NULL: otherwise a move after a missing reading would be
     given the full base time instead of being left out of both buckets.
+
+    The LAG window runs over all player moves first (before filtering by
+    classification), so the start-of-move clock always refers to the player's
+    actual previous move in the game - unclassified moves still count as the
+    "previous" for the next classified move's timing.
+
+    Daily games have no time control (base time is NULL), so the contract
+    requires time_pressure to be always null for time_class='daily'.
     """
+    if time_class == "daily":
+        return None
     row = session.execute(
         text(
             f"""
-            WITH mine AS (
-                SELECT m.game_id, m.classification,
+            WITH all_moves AS (
+                SELECT m.game_id, m.ply, m.classification, m.clock_seconds,
                        CASE WHEN row_number() OVER w = 1 THEN {_BASE_SECONDS_SQL}
                             ELSE lag(m.clock_seconds) OVER w END AS start_clock
-                {_PLAYER_MOVES}
+                FROM moves m
+                JOIN games g ON g.id = m.game_id
+                WHERE {_SCOPE} AND g.analysis_status = 'complete' AND m.is_player_move
                 WINDOW w AS (PARTITION BY m.game_id ORDER BY m.ply)
             )
             SELECT
-                count(*) FILTER (WHERE start_clock < :t) AS low_moves,
                 count(*) FILTER (WHERE start_clock < :t
-                                 AND classification IN ('best', 'good')) AS low_accurate,
+                                 AND classification IS NOT NULL) AS low_moves,
+                count(*) FILTER (WHERE start_clock < :t
+                                 AND classification IN ('best', 'good')
+                                 ) AS low_accurate,
                 count(*) FILTER (WHERE start_clock < :t
                                  AND classification = 'blunder') AS low_blunders,
-                count(*) FILTER (WHERE start_clock >= :t) AS normal_moves,
                 count(*) FILTER (WHERE start_clock >= :t
-                                 AND classification IN ('best', 'good')) AS normal_accurate,
+                                 AND classification IS NOT NULL) AS normal_moves,
+                count(*) FILTER (WHERE start_clock >= :t
+                                 AND classification IN ('best', 'good')
+                                 ) AS normal_accurate,
                 count(*) FILTER (WHERE start_clock >= :t
                                  AND classification = 'blunder') AS normal_blunders,
-                count(DISTINCT game_id) FILTER (WHERE start_clock < :t) AS low_games
-            FROM mine
+                count(DISTINCT game_id) FILTER (
+                    WHERE start_clock < :t AND classification IS NOT NULL
+                ) AS low_games
+            FROM all_moves
             """
         ),
         {"player_id": player_id, "time_class": time_class, "t": LOW_CLOCK_SECONDS},

@@ -28,10 +28,11 @@ app = FastAPI(
     summary="Coaching reports built from a player's Chess.com history.",
 )
 
-# The dashboard in dev (3000) and the reviewer's copy (3001), per the contract.
+# CORS origins are configurable via CORS_ORIGINS env var (comma-separated list).
+# Default: the dashboard in dev (3000) and the reviewer's copy (3001).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=settings.cors_origins.split(","),
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )

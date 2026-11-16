@@ -340,6 +340,48 @@ the docstring cites the measurement instead of my guess."
 
 **Where:** `src/chess_coach/analysis/clock.py`, `tests/test_clock.py`.
 
+---
+
+## 2026-11-06 - Unknown username returns 404, CORS is environment-configurable, daily time_pressure enforced `DONE`
+
+> **In plain English:** When someone asks for a report on a username we've never seen, the API says "I don't know that person" (404). This is better than a generic error because it tells the client the name was just wrong, not that something broke. The dashboard runs on port 3000 in development and port 3001 for the reviewer, so the API needs to allow requests from both - but the allowed ports are hard-coded right now. If the dashboard moves to a different port, the API won't accept its requests and the browser will block the response silently, which is confusing to debug. Daily games have no time control, so "do I fall apart on time?" makes no sense for them - the time-pressure section has to be explicitly null, not just happen to be null.
+
+**A bit deeper:** Unknown username -> `tracked_player()` helper raises a 404 HTTPException. The allowed origins are now parsed from an environment variable at startup (`CORS_ORIGINS`, comma-separated list, default localhost:3000 and 3001) and split into the CORSMiddleware config. Daily games return `time_class='daily'`, which has NULL base time; the `time_pressure()` function checks this and returns None immediately. If a caller passes time_class='daily' directly (not through the API route), they get None instead of a wrong answer.
+
+**What changed:** `api/main.py`  -  CORS now reads from `settings.cors_origins`; `api/players.py`  -  get_report route simplified because time_pressure already returns None for daily; `config.py`  -  added `cors_origins` setting (environment variable `CORS_ORIGINS`); `analytics/report.py`  -  time_pressure() now takes time_class parameter and returns None | TimePressure.
+
+**Why the details are the way they are:**
+- *404 is the standard for "resource not found."* If the username is unrecognized, there's no player resource, so 404 is right. 422 (validation error) would mean the input format was bad, but "deitythemenace" is a valid Chess.com username format.
+- *CORS origins from environment.* Hard-coded origins make deployment inflexible: the code doesn't know where the dashboard is running. An environment variable lets ops move the dashboard without code changes. Split on comma at startup so there's only one place where the list is parsed.
+- *time_pressure() enforces daily -> None.* The function checks time_class and returns None for daily, so the endpoint automatically returns null in the response. Daily games have no clock, so time pressure makes no sense.
+
+**The test, worked by hand:** POST /players for a new name queues a sync and returns 202. GET /players/{username} returns the player's status; if the name is garbage, it returns 404. GET /players/{u}/report?time_class=daily returns time_pressure=null even if analyzed_games > 0. CORS_ORIGINS env var set to "http://example.com" means only that origin is allowed, not localhost:3000.
+
+**Talking point:** "Unknown username is a 404 because the player resource doesn't exist - not a validation error. CORS hard-coded meant the dashboard couldn't move to a new port without code changes; now it reads an environment variable at startup. Daily games have no time control, so the time_pressure section has to be explicitly null, enforced at the function level so even direct calls can't return a wrong answer."
+
+**Where:** `src/chess_coach/api/main.py`, `src/chess_coach/api/players.py`, `src/chess_coach/config.py`, `src/chess_coach/analytics/report.py`.
+
+---
+
+## 2026-11-06 - LAG window runs before classification filter: defensive against future changes `DONE`
+
+> **In plain English:** The time-pressure stat shows whether a player plays worse when low on the clock. It needs to know the clock reading at the start of each move, which is the clock after the previous move. On real data, every move in a complete game is analyzed and gets a classification. But if we ever queue incomplete games or skip some moves in analysis, a SQL mistake could compute wrong starting clocks. The defensive fix ensures that if unanalyzed moves ever appear, the clock history is correct.
+
+**A bit deeper:** A LAG window function looks at the previous row in an ordered set. If filtering for classification happens before the LAG window, it removes unanalyzed moves from the window, so the next move's LAG sees the move before that, and the computed clock is from two moves ago, not one. The code computes LAG on all moves first (no classification filter in the CTE), then filters analyzed moves only in the buckets that count them. Today this makes no difference because every move is classified. If incomplete games were added in future, the CTE order would prevent wrong clocks.
+
+**What changed:** `analytics/report.py`, `time_pressure()` function. The `WITH mine AS (...)` CTE filters only by `analysis_status='complete'` and `is_player_move`, **not** by `classification`. The LAG window runs over all of those moves. Then, in the outer `SELECT`, each bucket's counts add `AND classification IS NOT NULL` so only analyzed moves are counted, but the start-of-move clock always comes from LAG of all moves.
+
+**Why the details are the way they are:**
+- *Defensive, not a fix for an observed bug.* On real data every player move in a complete game is classified, so the LAG change makes no practical difference today. It guards against a case that cannot occur now but could if the architecture changes.
+- *LAG computed first, filter second.* The general rule for window functions: compute the window over the full input, then filter rows in the final SELECT. Filtering before the window would break it, should incomplete games ever exist.
+- *Every bucket filters by classification.* low_moves, normal_moves, low_accurate, etc., all add `AND classification IS NOT NULL` so only analyzed moves are counted in rates and blunder counts.
+
+**The test, worked by hand:** With hypothetical unanalyzed moves: a game with moves 1-5 where move 2 is unanalyzed. LAG computes move 3's start_clock from move 2 (correct), not move 1 (wrong). When we filter to classification IS NOT NULL, we count moves 1, 3, 4, 5 and move 3 keeps the right clock.
+
+**Talking point:** “On real data, every move in a complete game is classified. The LAG-first ordering is defensive: if incomplete games ever appear, it ensures clock history is correct. If we filtered for classification before LAG, an unanalyzed move would break the history.”
+
+**Where:** `src/chess_coach/analytics/report.py`, `time_pressure()` function.
+
 <!-- end of M4 entries -->
 
 ---
