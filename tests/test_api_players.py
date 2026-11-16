@@ -78,6 +78,47 @@ def test_adding_a_synced_player_again_re_queues_a_sync(client: TestClient, clean
     assert job.status == "pending"
 
 
+def test_re_adding_a_failed_player_clears_the_error_and_resets_status(
+    client: TestClient, clean_engine: Engine
+):
+    # First add: seed with an error state
+    client.post("/players", json={"username": "deitythemenace"})
+    with clean_engine.begin() as c:
+        c.execute(
+            text(
+                "UPDATE jobs SET status = 'failed', attempts = 1; "
+                "UPDATE players SET sync_status = 'error', "
+                "sync_error = 'Player not found on Chess.com'"
+            )
+        )
+    # Re-add: should clear the error and reset status to pending
+    r = client.post("/players", json={"username": "deitythemenace"})
+    assert r.status_code == 202
+    body = r.json()
+    assert body["sync_status"] == "pending"
+    assert body["sync_error"] is None
+
+
+def test_adding_while_a_sync_is_running_leaves_syncing_status(
+    client: TestClient, clean_engine: Engine
+):
+    client.post("/players", json={"username": "deitythemenace"})
+    with clean_engine.begin() as c:
+        c.execute(
+            text(
+                "UPDATE jobs SET status = 'running', locked_by = 'worker-1', "
+                "locked_at = now(); "
+                "UPDATE players SET sync_status = 'syncing'"
+            )
+        )
+    # Try to re-add while sync is running
+    r = client.post("/players", json={"username": "deitythemenace"})
+    assert r.status_code == 202
+    body = r.json()
+    # Status should still be syncing (not changed because a job was already queued/running)
+    assert body["sync_status"] == "syncing"
+
+
 @pytest.mark.parametrize("username", ["", "a b", "../etc", "x" * 51, "naïve"])
 def test_an_invalid_username_is_a_422_with_fastapis_validation_array(
     client: TestClient, clean_engine: Engine, username: str

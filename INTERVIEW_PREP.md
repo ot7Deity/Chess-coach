@@ -1,4 +1,4 @@
-﻿# Interview Prep: decision log
+# Interview Prep: decision log
 
 Every meaningful change and design decision in this project, with the reasoning, the
 alternatives that were rejected, and how to talk about it. **Newest entry first.**
@@ -47,7 +47,6 @@ exactly; a re-sync costs **2 requests**.
 
 ---
 
-<<<<<<<<< Temporary merge branch 1
 <!-- M4 ENTRIES BELOW (report SQL, report and sync API). Newest first. -->
 
 ## 2026-11-06 - Unknown username returns 404, CORS is environment-configurable, daily time_pressure enforced `DONE`
@@ -258,6 +257,5 @@ fencing token for leases - resetting it would let a stale worker's old lease mat
 <!-- end of M4 entries -->
 
 ---
-
 
 

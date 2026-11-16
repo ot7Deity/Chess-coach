@@ -77,11 +77,24 @@ def add_player(body: AddPlayerRequest, db: Engine = Depends(get_db)) -> PlayerPr
         )
         player = find_player(session, body.username)
         assert player is not None
-        enqueue_sync(
+        job_id = enqueue_sync(
             session, player.id, player.username, max_attempts=get_settings().job_max_attempts
         )
+        # If a job was queued (new or re-armed), update sync status to reflect it.
+        # If one was already queued or running, leave status alone.
+        if job_id is not None:
+            session.execute(
+                text(
+                    "UPDATE players SET sync_status = 'pending', sync_error = NULL "
+                    "WHERE id = :id AND sync_status <> 'syncing'"
+                ),
+                {"id": player.id},
+            )
     with Session(db) as session:
-        return _progress_body(session, player)
+        # Re-fetch the player to get the updated sync status
+        updated_player = find_player(session, normalize_username(body.username))
+        assert updated_player is not None
+        return _progress_body(session, updated_player)
 
 
 @router.get("/{username}", response_model=PlayerProgress)
