@@ -66,14 +66,6 @@ def test_a_sync_waiting_to_retry_is_not_reported_as_failed(clean_engine: Engine)
     assert _status(clean_engine)[0] in ("pending", "syncing")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "DISAGREEMENT: POST /players re-arms the sync job but returns (and leaves) the "
-        "previous run's sync_status, so a player whose last sync failed is shown as "
-        "failed, with polling stopped, while the new sync is queued."
-    ),
-)
 def test_re_posting_a_failed_player_reports_the_queued_sync(clean_engine: Engine):
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
     get_db = pytest.importorskip("chess_coach.api.players").get_db
