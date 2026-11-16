@@ -612,6 +612,37 @@ things break, and a dashboard has nothing to gain from being first."
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-16 - Wired the position cache into the worker `DONE`
+
+> **In plain English:** The cache is built, but nothing was using it. I plugged it into the
+> worker's startup, so now when the worker starts up, it asks "what should I use to store
+> positions?" and gets a cache (or nothing) based on the POSITION_CACHE setting, then passes it
+> to every evaluation so the same position never goes to the engine twice.
+
+**A bit deeper:** The worker's `main()` entry point calls `build_eval_cache()` with the
+configuration, getting either a real cache (Postgres + Redis), Postgres alone, or NullCache
+(nothing). It passes this to the `Worker` class, which hands it to `CachedEvaluator`, which
+uses it for every position lookup and write before the engine sees the board.
+
+**What changed:** `worker.py` imports `build_eval_cache` from `cache.__init__` and builds the
+cache before instantiating `Worker`, passing it as the `cache` parameter.
+
+**Why:** The cache contract (positions.py) lives between M3 and M2. M3 provides the factory,
+M2 uses it. Without this wiring, M2 saw an always-empty NullCache by default, so the cache
+did nothing.
+
+**Alternatives rejected:** Passing cache through Worker's internal classes (CachedEvaluator,
+analyze_game) would leak M3 all the way down; hardcoding the cache in Worker would prevent
+testing with NullCache or a mock.
+
+**Talking point:** "The cache is built by M3 but M2 didn't use it. I wired the factory into
+the worker's entry point, so the same POSITION_CACHE setting that controls the cache layer
+also controls what the worker passes to every position evaluation."
+
+**Where:** `src/chess_coach/worker.py` (import, build, pass to Worker).
+
+---
+
 ## 2026-11-06 - Redis kept answering for rows the database had thrown away `DONE`
 
 > **In plain English:** My rule was "the fast store (Redis) only ever holds copies of what's

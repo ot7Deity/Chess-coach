@@ -22,6 +22,7 @@ import threading
 
 from chess_coach.analysis.jobs import enqueue_pending
 from chess_coach.analysis.runner import Worker
+from chess_coach.cache import build_eval_cache
 from chess_coach.config import get_settings
 from chess_coach.db import get_engine
 from chess_coach.engine import StockfishEngine
@@ -92,7 +93,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     with engine:
-        worker = Worker(db, engine, worker_id=worker_id, settings=settings)
+        cache = build_eval_cache(settings, db)
+        worker = Worker(db, engine, worker_id=worker_id, settings=settings, cache=cache)
         try:
             worker.run(max_jobs=args.max_jobs, until_empty=args.until_empty, stop=stop)
         except KeyboardInterrupt:
