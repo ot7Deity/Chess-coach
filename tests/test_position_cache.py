@@ -156,13 +156,16 @@ def _engine_for_rkey(clean_engine: Engine) -> None:
 
 def rkey(redis_client, key: bytes, engine: str = ENGINE, depth: int = DEPTH) -> str:
     """Where the cache keeps this entry right now, worked out independently of
-    the cache: <prefix><database>:<positions relfilenode>:<engine>:<depth>:<hex>."""
+    the cache: <prefix><database>:<system_identifier>:<positions relfilenode>:<engine>:<depth>:<hex>."""
     db_engine = _KEY_ENGINE["engine"]
     with db_engine.connect() as conn:
+        sysid = conn.execute(
+            text("SELECT system_identifier FROM pg_control_system()")
+        ).scalar_one()
         epoch = conn.execute(
             text("SELECT relfilenode FROM pg_class WHERE oid = 'positions'::regclass")
         ).scalar_one()
-    namespace = f"{redis_client.key_prefix}{db_engine.url.database}:{epoch}:"
+    namespace = f"{redis_client.key_prefix}{db_engine.url.database}:{sysid}:{epoch}:"
     return redis_key(namespace, key, engine, depth)
 
 

@@ -63,11 +63,14 @@ exactly; a re-sync costs **2 requests**.
 **A bit deeper:** Postgres stores each table in a file identified by a number, its
 *relfilenode*. `TRUNCATE`, dropping and re-creating the table, and restoring a dump all give
 the table a new one; ordinary inserts, updates and deletes don't. The Redis *namespace* - the
-part of every key before the position - is now `<prefix><database name>:<relfilenode>:`. Each
-batch reads the relfilenode first (one tiny catalog query), so once the table is reset, every
-old Redis entry is unreachable at once, without deleting anything. The database name in the
-key also stops two databases that share one Redis (a test database and a dev one, say) from
-answering from each other's entries.
+part of every key before the position - is now
+`<prefix><database name>:<system_identifier>:<relfilenode>:`. The `system_identifier` is
+Postgres's unique cluster ID (readable from `pg_control_system()`, set at initdb, constant per
+cluster). Each batch reads both values (one tiny catalog query), so once the table is reset,
+every old Redis entry is unreachable at once. If Postgres is recreated from scratch (e.g.
+docker volume rm of pgdata while Redis survives), the new cluster has a different
+system_identifier, so old Redis entries become unreachable. The relfilenode resets to the same
+OID counter on fresh clusters, so the identifier is essential to distinguish them.
 
 **Symptom:** The tester's strict expected-failure test: put a position, `TRUNCATE positions`,
 `get` it - and Redis answered while Postgres had zero rows.
@@ -90,10 +93,16 @@ the relfilenode cost 2.0 ms. Cost was close to a tie, so correctness decided it:
   `TRUNCATE` and a recompute, Redis would still serve the old answer next to the new row.
 - *The epoch namespace* makes every pre-reset entry unreachable, so whatever Redis returns
   was copied from the current table. It covers `TRUNCATE`, re-creation, restores and other
-  databases.
-- *What it doesn't cover:* removing rows with `DELETE` keeps the relfilenode, so a hand
-  `DELETE` still needs `purge_redis()` (now scoped to this database, every epoch). That's
-  documented where the purge is.
+  databases. The system_identifier ensures it covers fresh clusters too: each initdb gets a
+  new identifier, so old Redis entries become unreachable even if the relfilenode counter
+  resets to the same OID.
+- *What it doesn't cover:* removing rows with `DELETE` keeps the relfilenode and
+  system_identifier, so a hand `DELETE` still needs `purge_redis()` (now scoped to this
+  database, every epoch). VACUUM FULL, CLUSTER and rewriting ALTERs change the relfilenode
+  and leave Redis cold (harmless - a cache miss).
+- *Timing note:* The epoch read and Redis read aren't atomic. A TRUNCATE between them can
+  serve one stale batch, but the window is tiny and reading the epoch again on the next
+  lookup fixes it.
 
 **What it costs, measured** (`bench/cache_micro.py`, same laptop, before -> after):
 
