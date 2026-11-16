@@ -980,6 +980,8 @@ also controls what the worker passes to every position evaluation."
 
 **Where:** `src/chess_coach/worker.py` (import, build, pass to Worker).
 
+**Testing note:** The CLI cache acceptance test initially passed despite Redis integration failing (mutant: `client = None`) because it counted keys from earlier test runs under the shared production prefix. Fixed by passing the redis_client fixture's unique prefix to the subprocess and counting keys under only that prefix, also adding test coverage for `POSITION_CACHE=off`.
+
 ---
 
 ## 2026-11-06 - Redis kept answering for rows the database had thrown away `DONE`

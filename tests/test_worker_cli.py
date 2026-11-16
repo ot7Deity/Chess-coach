@@ -80,16 +80,23 @@ def test_a_missing_engine_binary_is_a_clear_error_not_a_traceback(
     assert "Traceback" not in proc.stdout + proc.stderr
 
 
-@pytest.mark.parametrize("position_cache", ["full", "postgres"])
+@pytest.mark.parametrize("position_cache,expect_rows,expect_redis", [
+    ("full", True, True),
+    ("postgres", True, False),
+    ("off", False, False),
+])
 def test_position_cache_setting_controls_whether_positions_are_stored(
     clean_engine: Engine,
     database_url: str,
     stockfish_path: Path,
-    position_cache: str,
     redis_url: str,
+    redis_client,
+    position_cache: str,
+    expect_rows: bool,
+    expect_redis: bool,
 ):
-    """POSITION_CACHE=full stores positions and writes Redis; POSITION_CACHE=postgres
-    stores positions but not Redis."""
+    """POSITION_CACHE=full stores positions and writes Redis; postgres stores
+    positions but not Redis; off stores neither."""
     import redis
 
     insert_game(clean_engine, SCHOLARS_MATE, uuid="cached")
@@ -101,22 +108,31 @@ def test_position_cache_setting_controls_whether_positions_are_stored(
         "--enqueue-pending",
         "--until-empty",
         POSITION_CACHE=position_cache,
+        POSITION_CACHE_KEY_PREFIX=redis_client.key_prefix,
         REDIS_URL=redis_url,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
-    # Verify positions are stored in Postgres for both modes
+    # Verify positions row count matches expectation
     with clean_engine.connect() as c:
-        cached_positions = c.scalar(text("SELECT count(*) FROM positions"))
-    assert cached_positions > 0, (
-        f"POSITION_CACHE={position_cache} should write positions to Postgres"
-    )
+        positions_count = c.scalar(text("SELECT count(*) FROM positions"))
+    if expect_rows:
+        assert positions_count > 0, (
+            f"POSITION_CACHE={position_cache} should write positions to Postgres"
+        )
+    else:
+        assert positions_count == 0, (
+            f"POSITION_CACHE={position_cache} should not write positions"
+        )
 
-    # For full mode, verify Redis keys exist (default prefix)
-    if position_cache == "full":
-        from chess_coach.cache.position_cache import DEFAULT_KEY_PREFIX
+    # Verify Redis key count matches expectation (using the unique test prefix)
+    client = redis.Redis.from_url(redis_url)
+    redis_keys = list(client.scan_iter(match=f"{redis_client.key_prefix}*", count=1000))
+    client.close()
 
-        client = redis.Redis.from_url(redis_url)
-        redis_keys = list(client.scan_iter(match=f"{DEFAULT_KEY_PREFIX}*", count=1000))
-        client.close()
-        assert redis_keys, "POSITION_CACHE=full should write to Redis"
+    if expect_redis:
+        assert redis_keys, f"POSITION_CACHE={position_cache} should write to Redis"
+    else:
+        assert not redis_keys, (
+            f"POSITION_CACHE={position_cache} should not write to Redis"
+        )
