@@ -195,7 +195,7 @@ function startApp() {
  */
 async function testPageWithBrowser(browser, name, path, assertions) {
   console.log(`\nTesting ${name}...`);
-  const context = await browser.createBrowserContext();
+  const context = await browser.newContext();
   const page = await context.newPage();
 
   try {

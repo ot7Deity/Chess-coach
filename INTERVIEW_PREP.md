@@ -49,6 +49,64 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
 
+## 2026-11-16 - The smoke test that could never fail: fixing test robustness to actually detect API breakage `DONE`
+
+> **In plain English:** I wrote a smoke test to check if the website still works, but it
+> had a hidden bug: even if the server went down, the test would still pass. The website is
+> made with a modern framework (Next.js 16) that runs code in the browser after the page
+> loads, and my test was checking the HTML the server sent, which never makes the API call.
+> It's like testing a car by looking at it in the parking lot instead of driving it. I fixed
+> it by using a real browser (Playwright) that actually makes the API calls the page does,
+> and by making the test startup robust to Windows and different shell behaviors.
+
+**A bit deeper:** The dashboard is "use client" in Next.js: it's React code that runs in the
+browser after hydration, makes fetch calls to the API from the browser, and renders the
+response. Server-side `fetch()` from the test never hit the API, so checking the HTML
+returned by `next start` was meaningless. Playwright launches a headless Chromium browser
+that loads the page and waits for hydration, so the browser-side code actually runs and
+calls the API - a true integration test. The test also had four cascading failures on
+Windows: npm spawn issues (needed `shell: true`), next.js security warnings exiting non-zero
+even on success, the Next.js script having a hardcoded port that wasn't overrideable by
+command-line flags, and process.exit() inside try/catch skipping finally cleanup.
+
+**What changed:** `web/scripts/smoke-test.mjs` (completely rewritten to use Playwright; uses
+`npx next start --port` instead of `npm run start` to avoid script-hardcoded ports; added
+shell: true for cross-platform npm spawn; checks for .next directory to confirm build
+success even if exit code is 1; uses process.exitCode + return instead of process.exit() to
+ensure finally block cleanup), fixed rate from 1946 to 946 for realism, added
+`@playwright/test` and `playwright` to devDependencies and `npx playwright install` for
+headless browser support.
+
+**Why:**
+
+- *Real browser = real code paths.* Playwright runs the actual React code that makes the
+  API calls, so you catch API schema changes and broken fetch logic.
+- *A test that can't fail proves nothing.* The old test passed when the API was down
+  because it never called the API. This one fails if any page fails to fetch data.
+- *Windows compatibility matters.* npm on Windows needs shell: true for spawn; hardcoding
+  port in the script meant passing --port on the command line had no effect.
+- *Proper cleanup.* process.exit() inside try/catch skips finally, leaving stub and next
+  processes hanging and causing port conflicts on retries.
+
+**Alternatives rejected:**
+
+- *Mock fetch in the browser:* Would test the page logic but miss real API schema changes
+  or network paths.
+- *Check HTML response text server-side:* Doesn't run React client code, so it's not an
+  integration test.
+- *Increase port numbers to avoid conflicts:* Would hide the real issue (process cleanup).
+
+**Talking point:** "The smoke test was passing even when the API would fail. The issue was
+that the dashboard code runs in the browser with React, making fetch calls, but the test
+was checking server-side HTML. I rewrote it with Playwright to launch a real browser,
+wait for hydration, and check that actual API data appears on the page. It now fails if
+the API is broken or returns wrong data."
+
+**Where:** `web/scripts/smoke-test.mjs` (completely rewritten), `web/package.json` (added
+Playwright), `web/scripts/stub-api.mjs` (fixed realistic rating data).
+
+---
+
 ## 2026-11-06 - A lightweight stub API server for smoke testing without external dependencies `DONE`
 
 > **In plain English:** Before connecting to the real server, I want to make sure the
