@@ -8,6 +8,10 @@ const nextConfig: NextConfig = {
   // The floating dev-tools badge sits on top of the page in every development
   // screenshot; errors still surface in the terminal and the browser console.
   devIndicators: false,
+  // The Docker image sets NEXT_OUTPUT=standalone: Next traces exactly the files
+  // the server needs into .next/standalone, so the runtime image carries no
+  // node_modules tree. Left off elsewhere so `npm start` keeps working locally.
+  ...(process.env.NEXT_OUTPUT === "standalone" ? { output: "standalone" as const } : {}),
 };
 
 export default nextConfig;
