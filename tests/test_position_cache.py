@@ -485,9 +485,7 @@ def test_namespace_changes_when_cluster_id_changes(cache, clean_engine):
             "Namespace must include the cluster ID; it must change when cluster ID changes"
         )
         # And must be the same when back to the original cluster ID
-        assert namespace_111 == namespace_111_again, (
-            "Namespace must revert when cluster ID reverts"
-        )
+        assert namespace_111 == namespace_111_again, "Namespace must revert when cluster ID reverts"
 
     finally:
         event.remove(clean_engine, "before_cursor_execute", rewrite_sysid)
