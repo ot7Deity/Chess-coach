@@ -62,7 +62,7 @@ const DEMO_DATA = {
           pending: 0,
           failed: 0,
           skipped: 0,
-          current_rating: 1946,
+          current_rating: 946,
         },
         {
           time_class: "daily",
@@ -179,7 +179,7 @@ const DEMO_DATA = {
           draws: 29,
           losses: 153,
           win_rate_pct: 56.97,
-          current_rating: 1946,
+          current_rating: 946,
           blunders_per_game: 0.94,
         },
         rating_trend: [
@@ -445,7 +445,7 @@ async function handleRequest(req, res) {
         const result = addPlayer(username);
         res.writeHead(result.status, commonHeaders);
         res.end(JSON.stringify(result.body));
-      } catch (e) {
+      } catch {
         res.writeHead(400, commonHeaders);
         res.end(JSON.stringify({ detail: "Invalid JSON" }));
       }
