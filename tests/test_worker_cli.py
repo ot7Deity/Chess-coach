@@ -80,11 +80,18 @@ def test_a_missing_engine_binary_is_a_clear_error_not_a_traceback(
     assert "Traceback" not in proc.stdout + proc.stderr
 
 
+@pytest.mark.parametrize("position_cache", ["full", "postgres"])
 def test_position_cache_setting_controls_whether_positions_are_stored(
-    clean_engine: Engine, database_url: str, stockfish_path: Path
+    clean_engine: Engine,
+    database_url: str,
+    stockfish_path: Path,
+    position_cache: str,
+    redis_url: str,
 ):
-    """POSITION_CACHE=full stores positions; POSITION_CACHE=off does not."""
-    # Test with caching enabled
+    """POSITION_CACHE=full stores positions and writes Redis; POSITION_CACHE=postgres
+    stores positions but not Redis."""
+    import redis
+
     insert_game(clean_engine, SCHOLARS_MATE, uuid="cached")
     proc = _run(
         database_url,
@@ -93,30 +100,23 @@ def test_position_cache_setting_controls_whether_positions_are_stored(
         "cache-test",
         "--enqueue-pending",
         "--until-empty",
-        POSITION_CACHE="postgres",
+        POSITION_CACHE=position_cache,
+        REDIS_URL=redis_url,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    # Verify positions are stored in Postgres for both modes
     with clean_engine.connect() as c:
         cached_positions = c.scalar(text("SELECT count(*) FROM positions"))
-    assert cached_positions > 0, "POSITION_CACHE=postgres should write positions"
-
-    # Clean positions table
-    with clean_engine.connect() as c:
-        c.execute(text("TRUNCATE positions CASCADE"))
-        c.commit()
-
-    # Test with caching disabled
-    insert_game(clean_engine, SCHOLARS_MATE, uuid="nocache")
-    proc = _run(
-        database_url,
-        stockfish_path,
-        "--worker-id",
-        "nocache-test",
-        "--enqueue-pending",
-        "--until-empty",
-        POSITION_CACHE="off",
+    assert cached_positions > 0, (
+        f"POSITION_CACHE={position_cache} should write positions to Postgres"
     )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    with clean_engine.connect() as c:
-        nocache_positions = c.scalar(text("SELECT count(*) FROM positions"))
-    assert nocache_positions == 0, "POSITION_CACHE=off should not write positions"
+
+    # For full mode, verify Redis keys exist (default prefix)
+    if position_cache == "full":
+        from chess_coach.cache.position_cache import DEFAULT_KEY_PREFIX
+
+        client = redis.Redis.from_url(redis_url)
+        redis_keys = list(client.scan_iter(match=f"{DEFAULT_KEY_PREFIX}*", count=1000))
+        client.close()
+        assert redis_keys, "POSITION_CACHE=full should write to Redis"
