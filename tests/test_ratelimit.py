@@ -87,3 +87,13 @@ def test_acquire_sleeps_for_the_reservation(redis_client):
 def test_nonsense_configuration_is_rejected(redis_client, rate, burst):
     with pytest.raises(ValueError):
         _bucket(redis_client, rate_per_sec=rate, burst=burst)
+
+
+@pytest.mark.parametrize("label", ["with[brackets]", "star*", "q?"])
+def test_the_redis_fixture_cleans_up_even_for_parametrized_names(redis_client, label):
+    """The fixture's cleanup is a SCAN MATCH glob on the key prefix. A raw
+    parametrized test name ('...[with[brackets]]') is itself a glob, matched
+    nothing, and leaked every key (M3 found 24 in its Redis DB)."""
+    assert all(c.isalnum() or c in "_-:" for c in redis_client.key_prefix)
+    redis_client.set(redis_client.key_prefix + "probe", 1)
+    assert list(redis_client.scan_iter(match=redis_client.key_prefix + "*"))
