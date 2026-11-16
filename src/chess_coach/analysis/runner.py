@@ -26,7 +26,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from chess_coach import queue
-from chess_coach.analysis.game import BadGame, MoveRow, analyze_game
+from chess_coach.analysis.game import BadGame, MoveRow, analyze_game, replay
 from chess_coach.analysis.jobs import JOB_TYPE
 from chess_coach.config import Settings
 from chess_coach.engine import StockfishEngine
@@ -43,7 +43,7 @@ class CachedEvaluator:
     """Cache first, then the engine. The one place a position is evaluated.
 
     `cache` is any `positions.EvalCache`; `NullCache` (always miss) until M3's
-    cache is wired in.
+    cache is wired in. Prefetch allows batch lookups before evaluation begins.
 
     `engine_ms` counts engine time spent by *this* evaluator - misses only. A
     hit's `compute_ms` is what the engine spent when the position was first
@@ -55,12 +55,28 @@ class CachedEvaluator:
         self.engine = engine
         self.cache: EvalCache = cache if cache is not None else NullCache()
         self.engine_ms = 0
+        self._prefetch: dict[bytes, Evaluation] = {}
+
+    def prefetch(self, boards: list[chess.Board]) -> None:
+        """Batch-load all positions' evals from cache (one get_many call).
+
+        Call before evaluate() to minimize engine work. All prefetched hits are
+        served by __call__ without touching the cache again; misses are sent
+        directly to the engine.
+        """
+        keys = [fen_hash(board) for board in boards]
+        self._prefetch = self.cache.get_many(keys, self.engine.version, self.engine.depth)
 
     def __call__(self, board: chess.Board) -> Evaluation:
         key = fen_hash(board)
+        # Check prefetch first (if prefetch was called)
+        if key in self._prefetch:
+            return self._prefetch[key]
+        # Fall back to single get for missed keys
         hit = self.cache.get(key, self.engine.version, self.engine.depth)
         if hit is not None:
             return hit
+        # Miss: evaluate and cache
         evaluation = self.engine.evaluate(board)
         self.engine_ms += evaluation.compute_ms or 0
         self.cache.put(
@@ -112,6 +128,17 @@ class Worker(JobRunner):
             bound.info("job.already_analysed")
             return
         engine_ms_before = getattr(self.evaluate, "engine_ms", None)
+
+        # Prefetch all positions' evals from cache (one get_many call) before analyzing
+        try:
+            plies, final = replay(game.pgn, game.start_fen)
+            if plies:
+                boards = [p.board_before for p in plies] + [final]
+                self.evaluate.prefetch(boards)
+        except (BadGame, Exception) as e:
+            # If replay/prefetch fails, log but continue; analyze_game will handle it
+            bound.debug("prefetch_failed", error=str(e))
+
         rows = analyze_game(
             game.pgn,
             start_fen=game.start_fen,

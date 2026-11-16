@@ -965,6 +965,26 @@ things break, and a dashboard has nothing to gain from being first."
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-16 - Batching positions with prefetch() to load cache once per game `DONE`
+
+> **In plain English:** The worker now replays the entire game before evaluating anything, collects all the positions it will need, and loads them from the cache in one batch. This cuts database round trips and engine work by loading cache hits before the game analysis begins, while keeping engine_ms accounting correct—only misses contribute to the time cost.
+
+**A bit deeper:** `CachedEvaluator` now has a `prefetch(boards)` method that calls `cache.get_many()` once with all the boards' keys. The Worker.handle() replays the PGN before analyze_game(), extracts all boards, and calls `self.evaluate.prefetch(boards)`. Then analyze_game() calls __call__() normally; __call__() checks the prefetch dict first (hitting instantly), then falls back to single get() for misses, and finally the engine. Engine_ms only accumulates on misses, so a fully-cached game costs 0 engine time and a cold game costs its true time.
+
+**What changed:** CachedEvaluator.prefetch() does one get_many(). Worker.handle() imports replay(), calls it before analyze_game(), and prefetches. __call__() checks _prefetch before .get().
+
+**Why:** Calling __call__() once per board (N+1 times for N plies) meant one cache roundtrip per position—wasteful when the first game is cold and the cache is empty. Batching loads cache hits in one pass. Engine_ms stays accurate because only misses hit the engine.
+
+**Alternatives rejected:** Bypassing the evaluator inside analyze_game() (calling cache.get_many directly, then engine.evaluate for misses) would create two paths to evaluation and break engine_ms accounting. Keeping single get() means prefetch is optional (NullCache works fine).
+
+**Bug avoided:** The tester caught that an earlier design variant (caching evaluations outside the evaluator) broke lease tests and zeroed engine_ms on cached games. This design keeps __call__() as the only evaluation point, so lease heartbeats and time accounting always flow through one place.
+
+**Talking point:** "The game is replayed once up front to collect all positions, then prefetched from cache in one batch, then analyzed—so a repeated game benefits from one cache load, and engine time is accurate because the evaluator's __call__() is still the only path to the engine."
+
+**Where:** `src/chess_coach/analysis/runner.py`, CachedEvaluator and Worker.handle().
+
+---
+
 ## 2026-11-16 - Wired the position cache into the worker `DONE`
 
 > **In plain English:** The cache is built, but nothing was using it. I plugged it into the
