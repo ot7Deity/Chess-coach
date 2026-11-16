@@ -11,7 +11,8 @@ Implements `chess_coach.positions.EvalCache`. The rules it keeps:
 * **The first write wins, and only the winner writes Redis.** `INSERT ... ON
   CONFLICT DO NOTHING RETURNING` tells the writer whether it won. At a fixed
   depth Stockfish is reproducible only from the same state (measured: with a
-  warm hash table, 10/10 scores moved by 2-27 cp at depth 14), so the producer
+  warm hash table, 10/10 scores and 5/10 best moves changed at depth 14 -
+  `bench/engine_determinism.py`), so the producer
   evaluates a history-free board with a cleared hash. Should two writes still
   disagree, Redis must not end up holding the loser's value while Postgres
   holds the winner's - so the loser writes nothing anywhere, and the
