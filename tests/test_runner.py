@@ -360,6 +360,6 @@ def test_batched_evaluation_avoids_engine_calls_for_shared_positions(stockfish):
 
     assert result_start is start_eval, "batched should return cached evaluation"
     assert result_1 is eval_1, "batched should return cached evaluation"
-    assert (
-        counting_engine.call_count == 0
-    ), "batched evaluator should not call engine for cached positions"
+    assert counting_engine.call_count == 0, (
+        "batched evaluator should not call engine for cached positions"
+    )

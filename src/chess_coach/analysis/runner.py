@@ -29,7 +29,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from chess_coach import queue
+from chess_coach import metrics, queue
 from chess_coach.analysis.game import BadGame, MoveRow, analyze_game, replay
 from chess_coach.analysis.jobs import JOB_TYPE
 from chess_coach.config import Settings
@@ -61,6 +61,8 @@ class CachedEvaluator:
         if hit is not None:
             return hit
         evaluation = self.engine.evaluate(board)
+        # Record engine call: either use compute_ms from engine output, or 0 if unavailable
+        metrics.record_engine_eval(evaluation.compute_ms / 1000 if evaluation.compute_ms else 0)
         self.cache.put(
             key, normalize_fen(board), self.engine.version, self.engine.depth, evaluation
         )
@@ -220,6 +222,7 @@ class Worker:
                 raise BadGame(f"payload has no game id: {lease.payload!r}")
             game = self._start(lease, game_id)
             if game is None:
+                metrics.GAMES_ANALYZED.labels(outcome="skipped").inc()
                 bound.info("job.already_analysed")
                 return
             # Batch lookup: replay the game first to collect all fen_hashes,
@@ -241,6 +244,7 @@ class Worker:
                     on_position=_Heartbeat(self.db, lease, self.heartbeat_interval),
                 )
             self._finish(lease, game_id, rows)
+            metrics.GAMES_ANALYZED.labels(outcome="complete").inc()
         except LeaseLost:
             # Reaped while working - presumably by someone who thought we were
             # dead. The job is theirs now; nothing was written.
@@ -248,10 +252,12 @@ class Worker:
             return
         except BadGame as exc:
             bound.error("job.bad_game", error=str(exc))
+            metrics.GAMES_ANALYZED.labels(outcome="error").inc()
             self._fail(lease, game_id, exc, permanent=True)
             return
         except Exception as exc:
             bound.exception("job.error", error=f"{type(exc).__name__}: {exc}")
+            metrics.GAMES_ANALYZED.labels(outcome="error").inc()
             self._fail(lease, game_id, exc, permanent=False)
             return
         bound.info("job.done", plies=len(rows), seconds=round(time.monotonic() - started, 2))

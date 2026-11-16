@@ -612,6 +612,40 @@ things break, and a dashboard has nothing to gain from being first."
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-16 - Hooked M3's Prometheus metrics into the worker `DONE`
+
+> **In plain English:** The analysis worker now records numbers that Prometheus can scrape: how
+> many games it finished, how many times it called the chess engine, and how much wall-clock
+> time the engine used. It also exposes a `/metrics` HTTP endpoint on port 8000 (or the
+> configured METRICS_PORT) so a monitoring system can collect those numbers from every worker
+> and graph them.
+
+**A bit deeper:** The worker's main() now starts `start_metrics_server()`, which runs a tiny HTTP
+server on a background thread and listens for GET /metrics. The analysis loop records each game
+outcome (complete, skipped, or error) using `GAMES_ANALYZED.labels(outcome=...)`, and the cache
+(M3) records its own hits/misses. CachedEvaluator now records each call to the engine with
+`record_engine_eval()`.
+
+**What changed:** Worker.main() calls `start_metrics_server()` and cleans it up in a finally
+block. CachedEvaluator records engine calls with `record_engine_eval(seconds)`. The analysis
+loop records game outcomes with `GAMES_ANALYZED.labels(outcome=...inc()`.
+
+**Why:** A worker pool needs observability: are the workers busy or idle? Are they cache-hitting
+or constantly calling the engine? Is one stuck? Prometheus scrapes /metrics from each worker and
+can graph how many games/second the pool is processing, the cache hit rate, and engine load.
+
+**Alternatives rejected:** Logging these as text lines (messier than metrics for time series);
+storing metrics only in the database (slower than a local registry, requires querying later).
+
+**Talking point:** "The workers now expose Prometheus metrics on /metrics - games analyzed by
+outcome, engine calls and time, and the cache's hits and misses - so a monitoring system can
+see the pool's throughput, cache hit rate, and engine load in real time."
+
+**Where:** `src/chess_coach/worker.py` (import, start_metrics_server, cleanup),
+`src/chess_coach/analysis/runner.py` (record game outcomes, record engine calls).
+
+---
+
 ## 2026-11-16 - Batched position lookup in per-game analysis `DONE`
 
 > **In plain English:** The worker now replays each game before it starts analyzing, writing
