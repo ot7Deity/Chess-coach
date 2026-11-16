@@ -402,6 +402,118 @@ the docstring cites the measurement instead of my guess."
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
 
+## 2026-11-16 - The smoke test that could never fail: fixing test robustness to actually detect API breakage `DONE`
+
+> **In plain English:** I wrote a smoke test to check if the website still works, but it
+> had a hidden bug: even if the server went down, the test would still pass. The website is
+> made with a modern framework (Next.js 16) that runs code in the browser after the page
+> loads, and my test was checking the HTML the server sent, which never makes the API call.
+> It's like testing a car by looking at it in the parking lot instead of driving it. I fixed
+> it by using a real browser (Playwright) that actually makes the API calls the page does,
+> and by making the test startup robust to Windows and different shell behaviors.
+
+**A bit deeper:** The dashboard is "use client" in Next.js: it's React code that runs in the
+browser after hydration, makes fetch calls to the API from the browser, and renders the
+response. Server-side `fetch()` from the test never hit the API, so checking the HTML
+returned by `next start` was meaningless. Playwright launches a headless Chromium browser
+that loads the page and waits for hydration, so the browser-side code actually runs and
+calls the API - a true integration test. The test also had four cascading failures on
+Windows: npm spawn issues (needed `shell: true`), next.js security warnings exiting non-zero
+even on success, the Next.js script having a hardcoded port that wasn't overrideable by
+command-line flags, and process.exit() inside try/catch skipping finally cleanup.
+
+**What changed:** `web/scripts/smoke-test.mjs` (completely rewritten to use Playwright; uses
+`npx next start --port` instead of `npm run start` to avoid script-hardcoded ports; added
+shell: true for cross-platform npm spawn; checks for .next directory to confirm build
+success even if exit code is 1; uses process.exitCode + return instead of process.exit() to
+ensure finally block cleanup), fixed rate from 1946 to 946 for realism, added
+`@playwright/test` and `playwright` to devDependencies and `npx playwright install` for
+headless browser support.
+
+**Why:**
+
+- *Real browser = real code paths.* Playwright runs the actual React code that makes the
+  API calls, so you catch API schema changes and broken fetch logic.
+- *A test that can't fail proves nothing.* The old test passed when the API was down
+  because it never called the API. This one fails if any page fails to fetch data.
+- *Windows compatibility matters.* npm on Windows needs shell: true for spawn; hardcoding
+  port in the script meant passing --port on the command line had no effect.
+- *Proper cleanup.* process.exit() inside try/catch skips finally, leaving stub and next
+  processes hanging and causing port conflicts on retries.
+
+**Alternatives rejected:**
+
+- *Mock fetch in the browser:* Would test the page logic but miss real API schema changes
+  or network paths.
+- *Check HTML response text server-side:* Doesn't run React client code, so it's not an
+  integration test.
+- *Increase port numbers to avoid conflicts:* Would hide the real issue (process cleanup).
+
+**Talking point:** "The smoke test was passing even when the API would fail. The issue was
+that the dashboard code runs in the browser with React, making fetch calls, but the test
+was checking server-side HTML. I rewrote it with Playwright to launch a real browser,
+wait for hydration, and check that actual API data appears on the page. It now fails if
+the API is broken or returns wrong data."
+
+**Where:** `web/scripts/smoke-test.mjs` (completely rewritten), `web/package.json` (added
+Playwright), `web/scripts/stub-api.mjs` (fixed realistic rating data).
+
+---
+
+## 2026-11-06 - A lightweight stub API server for smoke testing without external dependencies `DONE`
+
+> **In plain English:** Before connecting to the real server, I want to make sure the
+> website works and doesn't crash. A smoke test is a quick check that every page loads and
+> shows the right content. Testing requires a server to call, but the real one might be
+> down or busy. Instead of complicated mocking, I wrote a tiny API server that lives
+> alongside the code and serves the exact same responses the real server does, for testing.
+> No extra packages needed: it's just Node.js built-in code.
+
+**A bit deeper:** The dashboard calls an API that it can't control in a test. Traditionally
+you would either mock it inside the test (which doesn't catch bugs in how the page calls the
+API) or spin up a real server (slow and fragile). A stub server - a minimal working server
+that knows the contract - lets you test the real code paths without dependencies. This one
+listens on localhost, serves the same contract as the real API, and can be built and run
+with no `npm install` needed, so it stays lightweight.
+
+**What changed:** `web/scripts/stub-api.mjs` (HTTP server on a configurable port, serving
+contract-conformant JSON for GET `/players/{username}`, GET
+`/players/{username}/report?time_class=...`, and POST `/players`, with CORS headers and
+demo players including error cases), `web/scripts/smoke-test.mjs` (builds the app with the
+stub as `NEXT_PUBLIC_API_URL`, starts `next start`, and checks that landing, progress,
+overview, and 404 pages all load and contain expected text), and npm scripts `stub-api` and
+`smoke-test`.
+
+**Why:**
+
+- *No external dependencies.* Uses only Node.js built-in `http` module, so it ships with
+  the code and requires no setup steps.
+- *Contract-conformant.* Implements exactly the endpoints and responses from
+  `docs/api-contract.md`, so you're testing against the real contract, not a guess.
+- *Demo players match the fixtures.* `deitythemenace` serves sample data from
+  `deitythemenace.real.json`, and `newplayer`, `nosuchplayer`, `servererror` test state
+  transitions and error pages.
+- *Smoke test builds and runs the app.* Catches breakage in the build itself, not just the
+  code logic, and tests real page loads with `next start` (not a dev server quirk).
+
+**Alternatives rejected:**
+
+- *Jest / React Testing Library mocks:* would test the component logic but miss how the
+  network layer actually works. A stub server tests the whole stack.
+- *Hardcoded fetch mocks in the test:* they slip out of sync with the real API contract
+  and don't catch schema changes.
+- *Depend on the real M4 API running locally:* adds setup friction and makes tests fail
+  when M4 is being worked on.
+
+**Talking point:** "For integration tests, I wrote a stub API server that speaks the exact
+contract the real one does, so I can test the whole page without mocking or external
+setup. It's just Node.js built-ins and serves the contract's JSON, error cases included."
+
+**Where:** `web/scripts/stub-api.mjs`, `web/scripts/smoke-test.mjs`, `web/package.json`
+(npm scripts).
+
+---
+
 ## 2026-11-06 - The dashboard's container bakes in the API address, on purpose and loudly `DONE`
 
 > **In plain English:** The website now has its own container, so it can be started next
