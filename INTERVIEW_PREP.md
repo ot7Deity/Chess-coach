@@ -32,14 +32,18 @@ milestones, done in parallel on different branches, merges without conflicts.
 
 ## The 60-second pitch
 
-> "It pulls my whole Chess.com history - about 4,000 games - and runs every position through
-> Stockfish to find where I actually lose rating. The interesting part isn't the chess, it's
-> that analyzing 220,000 positions is hours of CPU time, so it's a job queue feeding a pool
-> of worker processes, with a position-level cache in front of the engine, and an API that
-> only ever reads finished results so the site stays fast while the backlog drains."
+> "Given a Chess.com username, it pulls that player's entire game history - about 4,000 games
+> for any active player - and runs every position through Stockfish to find where they actually
+> lose rating. The interesting part isn't the chess, it's that analyzing 220,000 positions is
+> hours of CPU time, so it's a job queue feeding a pool of worker processes, with a
+> position-level cache in front of the engine, and an API that only ever reads finished results
+> so the site stays fast while the backlog drains."
 
 Numbers to fill in as they are measured: games analyzed, cache hit rate, games/minute at
 1/2/4/8 workers, engine seconds saved by the cache.
+
+The app works for any Chess.com username; `deitythemenace` (the author's account) is the
+acceptance-test account because its totals can be checked against Chess.com's own profile.
 
 Measured so far: **4,550 games** ingested for `deitythemenace` across 53 months in 55 seconds
 at one request per second; win/loss/draw per time control matches Chess.com's own totals
@@ -1622,6 +1626,50 @@ shared bucket and every worker backs off together."
 `tests/test_chesscom_client.py`.
 
 <!-- end of M1 entries -->
+
+---
+
+<!-- PROCESS ENTRIES BELOW (how the work is merged and reviewed). Newest first. -->
+
+## 2026-11-12 - Merging a stack of PRs too fast merged them into each other, not into main `DONE`
+
+> **In plain English:** Big features here are split into a chain of small changes, each one
+> built on top of the one before, so each is easy to check. When the checker approved a whole
+> chain, I merged them one after another as fast as a script could go. GitHub only re-points
+> the next change at the main copy of the code a moment *after* the one below it lands. My
+> script didn't wait for that moment, so most of the changes were merged into the change
+> below them instead of into the main copy. On top of that, the script printed "Merged" for
+> every one, even the ones GitHub refused. Nothing was lost, but the main copy was
+> missing most of the work I thought was in it, for several days.
+
+**A bit deeper:** In a *stacked* set of pull requests, PR 2's target branch is PR 1's branch.
+When PR 1 merges and its branch is auto-deleted, GitHub retargets PR 2 onto `main`. That
+retarget is asynchronous. Merging PR 2 before it happens merges it into PR 1's (now dead)
+branch, and the commits only reach `main` if some later PR carries them there. The loop also
+reported success by printing after `gh pr merge`, not by checking the command's exit code.
+
+**How it was found:** after a session restart, `git log origin/main` showed only 6 of the 18
+approved merges. `gh pr list --state merged --json baseRefName` showed the rest had
+`baseRefName` set to a sibling branch, e.g. `m2/4..m2/7` merged into `m2/3-engine-wrapper` and
+`ui/6..ui/8` into `ui/5-progress-page`.
+
+**The fix:** merging the three PRs that were still open at the bottom of each sub-stack (#19,
+#25, #43) carried everything into `main`, because each of those branches had absorbed the ones
+merged into it. A commit-by-commit check (`git merge-base --is-ancestor`) confirmed every
+reviewed commit is now on `main`; the only thing missing is one empty merge commit whose
+content arrived through the next PR. From now on: merge one PR, check the exit code and
+`gh pr view --json state`, wait until the next PR shows `base=main` and `CLEAN`, then merge it.
+
+**Talking point:** "My merge script had two bugs, and both are about trusting output instead of
+checking state. It didn't wait for GitHub to retarget each stacked PR onto main, so PRs merged
+into each other. And it printed 'Merged' unconditionally, so I believed it. I found it by
+comparing what I thought had merged with `git log` on main. The recovery was cheap because
+merge commits keep history intact - nothing had to be redone - but the lesson is that a
+success message you print yourself proves nothing."
+
+**Where:** repository history (`git log origin/main --merges`); PRs #19, #25, #43.
+
+<!-- end of process entries -->
 
 ---
 
