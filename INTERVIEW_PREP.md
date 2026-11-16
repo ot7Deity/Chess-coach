@@ -951,6 +951,100 @@ things break, and a dashboard has nothing to gain from being first."
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-06 - Redis kept answering for rows the database had thrown away `DONE`
+
+> **In plain English:** My rule was "the fast store (Redis) only ever holds copies of what's
+> in the main database". The tester broke it in one line: wipe the main database's table, and
+> Redis still has all its copies, so it keeps handing out answers the database no longer has.
+> Worse, because the worker got an answer, it never saves one - so the database stays empty
+> for that position. It's like a shop that clears its shelves for new stock, while the front
+> counter keeps selling from a box of the old stock. The fix stamps every copy with which
+> "edition" of the shelf it came from. When the shelf is cleared, the edition changes, and
+> the old copies simply stop matching.
+
+**A bit deeper:** Postgres stores each table in a file identified by a number, its
+*relfilenode*. `TRUNCATE`, dropping and re-creating the table, and restoring a dump all give
+the table a new one; ordinary inserts, updates and deletes don't. The Redis *namespace* - the
+part of every key before the position - is now
+`<prefix><database name>:<system_identifier>:<relfilenode>:`. The `system_identifier` is
+Postgres's unique cluster ID (readable from `pg_control_system()`, set at initdb, unique per
+initdb). The namespace is **read per batch** (one tiny catalog query:
+`SELECT (SELECT system_identifier FROM pg_control_system()), relfilenode FROM pg_class WHERE oid = 'positions'::regclass`),
+not cached for the process lifetime, so a long-running worker that rides out a cluster
+recreation (e.g. `docker compose down && docker volume rm pgdata && up`) notices the new ID
+and uses a fresh namespace. The relfilenode resets to the same OID counter on fresh clusters,
+so without the system_identifier old Redis entries would be unreachable but *new* Postgres
+would reuse the same namespace and answer with stale data.
+
+**Symptom:** The tester's strict expected-failure test: put a position, `TRUNCATE positions`,
+`get` it - and Redis answered while Postgres had zero rows.
+
+**How I found it:** I didn't; the adversarial tester did, by attacking the exact sentence in
+my docstring ("Redis can only disagree by *lacking* an entry"). My tests checked the two
+layers agree while both are written *through the cache*. Nothing tested a reset of Postgres
+that went around it.
+
+**Root cause:** The guarantee only covered writes made through the cache. Anything that
+removed rows from Postgres directly left Redis's copies orphaned but still reachable - the
+cache key didn't say *which* table its value came from. It's this project's recurring bug
+once more: a cache key missing an input its value depends on. This time the missing input
+was the identity of the source table itself.
+
+**The decision: confirm each Redis hit in Postgres, or change the namespace?** I measured
+both (one round trip each on this machine): confirming a game's 80 hits cost 2.6 ms; reading
+the relfilenode cost 2.0 ms. Cost was close to a tie, so correctness decided it:
+- *Confirming* only proves a row **exists**, not that it holds the **same value**. After a
+  `TRUNCATE` and a recompute, Redis would still serve the old answer next to the new row.
+- *The epoch namespace* makes every pre-reset entry unreachable, so whatever Redis returns
+  was copied from the current table. It covers `TRUNCATE`, re-creation, restores and other
+  databases. The system_identifier ensures it covers fresh clusters too: each initdb gets a
+  new identifier, so old Redis entries become unreachable even if the relfilenode counter
+  resets to the same OID.
+- *What it doesn't cover:* removing rows with `DELETE` keeps the relfilenode and
+  system_identifier, so a hand `DELETE` still needs `purge_redis()` (now scoped to this
+  database, every epoch). VACUUM FULL, CLUSTER and rewriting ALTERs change the relfilenode
+  and leave Redis cold (harmless - a cache miss).
+- *Timing note:* The epoch read and Redis read aren't atomic. A TRUNCATE between them can
+  serve one stale batch, but the window is tiny and reading the epoch again on the next
+  lookup fixes it.
+
+**What it costs, measured** (`bench/cache_micro.py`, same laptop, before -> after):
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| One `get` served by Redis | 0.53 ms | 2.45 ms |
+| A game's 80 positions, one `get_many`, Redis | 3.04 ms | 5.76 ms |
+| A game's 80 positions, one `get_many`, Postgres only | 6.53 ms | 5.90 ms |
+| Redis memory per entry (benchmark key) | 208 B | 256 B |
+
+**That last comparison is the honest headline: with the check, a batched Redis read is no
+faster than Postgres alone on this setup.** Each batch now pays a Postgres round trip either
+way, and on a laptop with Postgres one hop away, that round trip *is* the cost. I kept the
+correct version anyway, because a fast cache that serves answers the database has thrown away
+is a bug, not a feature. Whether Redis earns its place is now a system-level question: the
+1/2/4/8 worker benchmark runs with `POSITION_CACHE=full` and `postgres`, and the numbers
+decide. If Redis has to win back its speed, the next step would be reading the epoch at most
+every few seconds instead of every batch: a bounded staleness window after a `TRUNCATE`, as
+an explicit setting, not a default.
+
+**Lesson:** A guarantee written in a docstring is a hypothesis until something outside the
+happy path tests it - here, someone changing the database behind the cache's back. And when a
+fix costs the feature its advantage, say so in numbers. Don't keep the feature on faith.
+
+**Talking point:** "A tester broke my 'Redis only ever copies Postgres' rule with a TRUNCATE:
+Redis kept serving positions the table no longer had, and the worker then never wrote them
+back. I measured two fixes - confirming every hit, or putting the table's storage identifier
+in the Redis namespace - and they cost about the same round trip, but only the namespace makes
+stale values unreachable rather than just checking a row exists. The honest consequence: on my
+laptop a batched Redis read is now no faster than Postgres alone, so whether Redis stays is
+something the worker benchmark decides, not me."
+
+**Where:** `src/chess_coach/cache/position_cache.py` (`_namespace`, `get_many`, `put`,
+`purge_redis`, `redis_name`), `tests/test_position_cache.py` ("Redis never outlives
+Postgres"), `.env.example`, `bench/cache_micro.py`.
+
+---
+
 ## 2026-11-06 - The benchmark's default job type matched nothing `DONE`
 
 > **In plain English:** The benchmark puts a pile of jobs in the queue and then lets the
@@ -1557,7 +1651,8 @@ Redis reads, sends what Redis lacked to Postgres in one query, and pipelines the
   refreshes in one command, so it costs no extra round trip. Default 7 days; `0` disables.
 - *Keys:* `<prefix><engine_version>:<depth>:<sha256 hex>`. Hex so they are readable in
   `redis-cli`; a versioned prefix (`chess_coach:pos:v1:`) so the whole Redis copy can be
-  orphaned at once without touching Postgres.
+  orphaned at once without touching Postgres. (Later extended with the database name and the
+  table's epoch - see "Redis kept answering for rows the database had thrown away".)
 - *A bad Redis value is a miss.* Undecodable, wrong type, or for a different search: counted,
   logged, and overwritten by the backfill.
 - *Three round trips per game, not 160.* Measured by counting pipelines and SQL statements in

@@ -119,7 +119,9 @@ def test_enqueue_fills_every_not_null_column_and_replaces_its_own_jobs(clean_eng
 def test_reset_makes_the_workload_cold_again(clean_engine: Engine, redis_client):
     ids, _ = create_workload(clean_engine)
     prefix = f"benchreset:{uuid.uuid4().hex[:8]}:"
-    redis_client.set(prefix + "sf_18:16:" + "ab" * 32, b"x")
+    # Under this database's namespace (any epoch), which is what a purge clears.
+    db = clean_engine.url.database
+    redis_client.set(f"{prefix}{db}:12345:sf_18:16:" + "ab" * 32, b"x")
     redis_client.set(prefix.rstrip(":") + "-other", b"keep")
     with clean_engine.begin() as conn:
         conn.execute(text("UPDATE games SET analysis_status = 'complete', analyzed_at = now()"))
@@ -142,7 +144,10 @@ def test_reset_makes_the_workload_cold_again(clean_engine: Engine, redis_client)
         assert list(redis_client.scan_iter(match=prefix + "*")) == []
         assert redis_client.exists(prefix.rstrip(":") + "-other")
     finally:
-        redis_client.delete(prefix.rstrip(":") + "-other")
+        # Everything this test created, even if an assertion failed midway.
+        leftovers = list(redis_client.scan_iter(match=prefix.rstrip(":") + "*"))
+        if leftovers:
+            redis_client.delete(*leftovers)
 
 
 @pg

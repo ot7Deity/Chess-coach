@@ -107,7 +107,7 @@ def main() -> int:
             full.put(key, fen, version, depth, EVAL)
 
         results["put_ms"] = median_ms(put_one, 200)
-        name = f"{prefix}{version}:{depth}:{one.hex()}"
+        name = full.redis_name(one, version, depth)
         results["redis_bytes_per_entry"] = float(client.memory_usage(name, samples=0) or 0)
 
         with socket.socket() as s:
