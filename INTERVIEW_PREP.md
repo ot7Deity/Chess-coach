@@ -49,6 +49,58 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
 
+## 2026-11-06 - The dashboard's container bakes in the API address, on purpose and loudly `DONE`
+
+> **In plain English:** The website now has its own container, so it can be started next
+> to the rest of the app with one command. One setting - where the website should look for
+> the server - has a catch: it is written into the website when the container is *built*,
+> not when it is *started*, and it has to be the address your own browser can reach, not
+> the nickname the containers use for each other. Get either wrong and the page would
+> quietly show sample data or an error. So the build now refuses to run without that
+> address, and the instructions say exactly which address to use.
+
+**A bit deeper:** Next.js copies any `NEXT_PUBLIC_*` variable into the JavaScript it sends
+to the browser while it builds, so changing it at `docker run` does nothing. And the
+dashboard calls the API *from the browser*: inside Docker's network the API is
+`http://api:8000`, but a browser on the laptop cannot resolve `api`; it needs
+`http://localhost:8000`. That second point is the classic mistake in a compose setup.
+
+**What changed:** `web/Dockerfile` (three stages: `npm ci`, `next build` with standalone
+output, and a runtime stage that copies only the traced server and static files and runs
+as the unprivileged `node` user, with a health check), `web/.dockerignore`, and
+`next.config.ts` turning on standalone output only when the image asks for it.
+
+**Why:**
+
+- *Fail the build without the address.* An empty value would not error: it would build
+  the sample-data dashboard, which looks like a working site showing someone else's games.
+  `WEB_FIXTURES=1` builds that on purpose.
+- *Standalone output.* Next traces the files the server actually uses, so the runtime
+  image has no full `node_modules`, no source and no build tools.
+- *`.dockerignore` excludes `node_modules`.* The host's copy was installed on Windows and
+  contains Windows-native compiler binaries; the Linux build must install its own.
+- *Standalone only in Docker,* so `npm start` keeps working on a laptop.
+- *CORS ties the port:* the API allows `http://localhost:3000`, so compose maps the
+  dashboard to host port 3000. Moving it means adding the new origin to the API.
+
+**Alternatives rejected:**
+- *Runtime config* (a `/config.js` served by the container, or a server-side proxy): it
+  would let one image serve any API, but it adds a moving part to a dashboard that runs in
+  exactly one place. Revisit if the dashboard is ever deployed to more than one
+  environment from one image.
+- *Proxy the API through Next (`/api/*` rewrites)*: it hides CORS, but makes the dashboard
+  server a hop on every request, and the API is meant to be called directly.
+
+**Talking point:** "In Next.js, `NEXT_PUBLIC_` variables are build-time constants inlined
+into the browser bundle, so the image is built with the API's browser-visible address -
+`localhost:8000`, not the compose service name, which a browser can't resolve. The build
+fails without it, because the alternative failure is silent: a dashboard happily showing
+sample data."
+
+**Where:** `web/Dockerfile`, `web/.dockerignore`, `web/next.config.ts`.
+
+---
+
 ## 2026-11-06 - Bug: my win rate claimed to match Chess.com, and didn't `DONE`
 
 > **In plain English:** The report's headline said my blitz win rate was 51.04%, and the
