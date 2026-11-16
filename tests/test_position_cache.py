@@ -587,3 +587,55 @@ def test_build_eval_cache_follows_the_setting(clean_engine, redis_url):
 
     with pytest.raises(ValueError):
         Settings(position_cache="redis")
+
+
+# --- the contract's determinism rule ---------------------------------------------
+
+
+def test_a_losing_write_with_the_same_answer_is_not_a_conflict(cache):
+    key, fen = position("e4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    # Same verdict; nodes and timing legitimately differ between runs.
+    cache.put(key, fen, ENGINE, DEPTH, Evaluation(31, None, "e7e5", nodes=5, compute_ms=9))
+    assert cache.stats.eval_conflicts == 0
+
+
+@pytest.mark.parametrize(
+    "offered",
+    [
+        Evaluation(eval_cp=32, mate_in=None, best_move="e7e5"),  # score moved
+        Evaluation(eval_cp=31, mate_in=None, best_move="c7c5"),  # best move moved
+        Evaluation(eval_cp=None, mate_in=3, best_move="e7e5"),  # became a mate
+    ],
+)
+def test_a_losing_write_with_a_different_answer_is_counted_and_logged(cache, offered):
+    """M2 evaluates a history-free board with a cleared hash, which makes the
+    result a pure function of the key. If that rule is ever broken, the first
+    write still wins, but the disagreement is visible instead of silent."""
+    key, fen = position("e4")
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)
+    cache.put(key, fen, ENGINE, DEPTH, offered)
+    assert cache.stats.eval_conflicts == 1
+    assert cache.get(key, ENGINE, DEPTH) == EVAL  # still first-write-wins
+
+
+def test_mate_in_zero_is_not_confused_with_no_mate(cache, redis_client, clean_engine):
+    """mate_in == 0 means the side to move is checkmated (best_move None). A
+    truthiness check anywhere would turn it into NULL, or NULL into 0."""
+    board = chess.Board()
+    for san in ("f3", "e5", "g4", "Qh4#"):
+        board.push_san(san)
+    assert board.is_checkmate()
+    key, fen = fen_hash(board), normalize_fen(board)
+    mated = Evaluation(eval_cp=None, mate_in=0, best_move=None, nodes=1, compute_ms=1)
+
+    cache.put(key, fen, ENGINE, DEPTH, mated)
+    row = pg_row(clean_engine, key)
+    assert (row.eval_cp, row.mate_in, row.best_move) == (None, 0, None)
+    assert decode(redis_client.get(rkey(redis_client, key)), ENGINE, DEPTH) == mated
+    assert cache.get(key, ENGINE, DEPTH) == mated  # from Redis
+    redis_client.delete(rkey(redis_client, key))
+    assert cache.get(key, ENGINE, DEPTH) == mated  # from Postgres
+
+    cache.put(key, fen, ENGINE, DEPTH, Evaluation(eval_cp=0, mate_in=None, best_move=None))
+    assert cache.stats.eval_conflicts == 1  # 0 cp is not "mated"

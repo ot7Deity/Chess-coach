@@ -9,14 +9,13 @@ Implements `chess_coach.positions.EvalCache`. The rules it keeps:
   Postgres read, after which it is backfilled.
 
 * **The first write wins, and only the winner writes Redis.** `INSERT ... ON
-  CONFLICT DO NOTHING RETURNING` tells the writer whether it won. Two workers
-  that evaluate the same position concurrently can produce slightly different
-  numbers: at a fixed depth Stockfish is reproducible only from a cleared hash
-  table, and a worker's is always warm from the previous positions (measured:
-  10/10 scores moved by 2-27 cp at depth 14). If both wrote Redis, Redis could
-  end up holding the loser's value while Postgres holds the winner's; writing
-  Redis before Postgres would have the same flaw. The loser's write is a no-op
-  everywhere.
+  CONFLICT DO NOTHING RETURNING` tells the writer whether it won. At a fixed
+  depth Stockfish is reproducible only from the same state (measured: with a
+  warm hash table, 10/10 scores moved by 2-27 cp at depth 14), so the producer
+  evaluates a history-free board with a cleared hash. Should two writes still
+  disagree, Redis must not end up holding the loser's value while Postgres
+  holds the winner's - so the loser writes nothing anywhere, and the
+  disagreement is counted (`eval_conflicts`) and logged rather than hidden.
 
 * **The key is (fen_hash, engine_version, depth), in both layers.** The Redis
   key embeds all three, and the Redis value repeats engine version and depth so
@@ -128,6 +127,8 @@ class CacheStats:
     writes_existing: int = 0
     redis_errors: int = 0
     corrupt_values: int = 0
+    # Losing writes whose verdict differed from the stored one; should be 0.
+    eval_conflicts: int = 0
 
     @property
     def hits(self) -> int:
@@ -204,8 +205,19 @@ class PositionCache:
             .on_conflict_do_nothing(index_elements=["fen_hash", "engine_version", "depth"])
             .returning(Position.fen_hash)
         )
+        stored = None
         with self._engine.begin() as conn:
             inserted = conn.execute(stmt).first() is not None
+            if not inserted:
+                # A separate statement, so under READ COMMITTED it sees the
+                # winning row even if that committed after the INSERT began.
+                stored = conn.execute(
+                    select(Position.eval_cp, Position.mate_in, Position.best_move).where(
+                        Position.fen_hash == key,
+                        Position.engine_version == engine_version,
+                        Position.depth == depth,
+                    )
+                ).one_or_none()
 
         with self._lock:
             if inserted:
@@ -214,6 +226,35 @@ class PositionCache:
                 self._stats.writes_existing += 1
         if inserted:
             self._redis_set({key: evaluation}, engine_version, depth)
+        elif stored is not None:
+            self._check_agreement(stored, fen, engine_version, depth, evaluation)
+
+    def _check_agreement(
+        self, stored, fen: str, engine_version: str, depth: int, offered: Evaluation
+    ) -> None:
+        """Make a violation of the contract's determinism rule visible.
+
+        The producer evaluates a history-free board with a cleared hash table
+        and one thread, which makes an evaluation a pure function of the key.
+        A losing write that disagrees with the stored row means that rule broke
+        somewhere. The first write still wins - averaging or overwriting would
+        hide the problem - but it is counted and logged. Nodes and timings are
+        not compared; they legitimately differ between machines.
+        """
+        theirs = (stored.eval_cp, stored.mate_in, stored.best_move)
+        ours = (offered.eval_cp, offered.mate_in, offered.best_move)
+        if theirs == ours:
+            return
+        with self._lock:
+            self._stats.eval_conflicts += 1
+        log.warning(
+            "cache.eval_conflict",
+            fen=fen,
+            engine_version=engine_version,
+            depth=depth,
+            stored={"eval_cp": theirs[0], "mate_in": theirs[1], "best_move": theirs[2]},
+            offered={"eval_cp": ours[0], "mate_in": ours[1], "best_move": ours[2]},
+        )
 
     # --- batch ----------------------------------------------------------------
 
