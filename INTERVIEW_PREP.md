@@ -971,17 +971,24 @@ things break, and a dashboard has nothing to gain from being first."
 
 ## 2026-11-16 - Wired metrics recording into the analysis pipeline `DONE`
 
-> **In plain English:** Prometheus metrics were defined but not recorded - the pipeline didn't tell the metrics system when work happened. I wired the recording into the actual evaluation and game-completion paths, so now engine time, positions evaluated, and games analyzed show up in /metrics.
+> **In plain English:** Prometheus metrics were defined but not recorded - the pipeline didn't tell the metrics system when work happened. I wired the recording into the actual evaluation, game-completion, and job-handling paths, so now engine time, positions evaluated, games analyzed, and job outcomes show up in /metrics.
 
-**A bit deeper:** `CachedEvaluator.__call__()` now records `ENGINE_SECONDS` and `POSITIONS_EVALUATED` when it actually sends a position to Stockfish (cache miss). `Worker._finish()` records `GAMES_ANALYZED` with outcome="complete" after a successful game commit. The metrics framework is in place with a Prometheus /metrics endpoint on each worker process.
+**Metrics recorded (exact list):**
+- `ENGINE_SECONDS` (counter): incremented by compute_ms/1000 on cache misses
+- `POSITIONS_EVALUATED` (counter): incremented by 1 on cache misses
+- `GAMES_ANALYZED` (counter with outcome label): "complete" incremented after game commit
+- `JOB_CLAIM_SECONDS` (histogram): observed on every claim query
+- `JOB_DURATION_SECONDS` (histogram with job_type/outcome labels): observed on job completion
+- `JOBS_RETRIED` (counter with job_type label): incremented when job fails and retries
+- `JOBS_DEAD` (counter with job_type label): incremented when job exhausts max_attempts
 
-**What changed:** `CachedEvaluator.__call__()` calls `metrics.ENGINE_SECONDS.inc()` and `metrics.POSITIONS_EVALUATED.inc()` on cache misses, computed_ms converted to seconds. `Worker._finish()` calls `metrics.GAMES_ANALYZED.labels(outcome="complete").inc()` after the commit.
+**What changed:** `CachedEvaluator.__call__()` records ENGINE_SECONDS and POSITIONS_EVALUATED on misses. `Worker._finish()` records GAMES_ANALYZED. `JobRunner._claim()` observes JOB_CLAIM_SECONDS. `JobRunner.process()` observes JOB_DURATION_SECONDS with outcome label (done/retry/dead). `JobRunner._fail()` increments JOBS_RETRIED or JOBS_DEAD based on permanence.
 
-**Why:** Metrics must be recorded at the actual event: when the engine runs (not on cache hits), when a game finishes. Recording elsewhere or later means dashboards can't see real-time progress. This provides visibility into worker behavior: cache effectiveness, engine load, and job throughput.
+**Why:** Metrics must be recorded at the actual event: engine runs, games complete, jobs succeed/fail. Recording elsewhere means dashboards can't see real-time progress. Provides visibility into worker behavior: cache effectiveness, engine load, job outcomes, and job latency.
 
-**Talking point:** "Engine time and games analyzed weren't showing up in Prometheus because the metrics were defined but nothing recorded them. I wired recording into the cache misses and game completion, so dashboards can now track work in real time."
+**Talking point:** "Metrics were defined but nothing recorded them. I wired recording into the cache misses, game completion, and job handling, so dashboards now track work in real time and we can measure worker performance."
 
-**Where:** `src/chess_coach/analysis/runner.py` (CachedEvaluator and Worker._finish), `src/chess_coach/metrics.py` (counter definitions).
+**Where:** `src/chess_coach/analysis/runner.py`, `src/chess_coach/jobrunner.py`, `tests/test_worker_metrics.py`.
 
 ---
 

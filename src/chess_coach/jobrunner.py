@@ -27,7 +27,7 @@ from sqlalchemy import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from chess_coach import queue
+from chess_coach import metrics, queue
 from chess_coach.config import Settings
 from chess_coach.logging import get_logger
 from chess_coach.queue import Lease, LeaseLost
@@ -140,8 +140,13 @@ class JobRunner:
         return processed
 
     def _claim(self) -> Lease | None:
+        started = time.monotonic()
         with Session(self.db) as session, session.begin():
-            return queue.claim(session, self.worker_id, self.job_types)
+            lease = queue.claim(session, self.worker_id, self.job_types)
+        # Record claim time regardless of success (found work or not)
+        claim_seconds = time.monotonic() - started
+        metrics.JOB_CLAIM_SECONDS.observe(claim_seconds)
+        return lease
 
     def _unfinished(self) -> bool:
         with Session(self.db) as session:
@@ -168,20 +173,30 @@ class JobRunner:
     def process(self, lease: Lease) -> None:
         bound = log.bind(job_id=lease.job_id, type=lease.type, attempt=lease.attempt)
         started = time.monotonic()
+        outcome = None
         try:
             self.handle(lease)
+            outcome = "done"
         except LeaseLost:
             # Reaped while working - presumably by someone who thought we were
             # dead. The job is theirs now; whatever we computed is discarded.
             bound.warning("job.lease_lost", seconds=round(time.monotonic() - started, 2))
+            return
         except PermanentJobError as exc:
             bound.error("job.bad_input", error=str(exc))
-            self._fail(lease, exc, permanent=True)
+            outcome = self._fail(lease, exc, permanent=True)
         except Exception as exc:
             bound.exception("job.error", error=f"{type(exc).__name__}: {exc}")
-            self._fail(lease, exc, permanent=False)
+            outcome = self._fail(lease, exc, permanent=False)
 
-    def _fail(self, lease: Lease, exc: BaseException, *, permanent: bool) -> None:
+        # Record job duration
+        if outcome:
+            duration_seconds = time.monotonic() - started
+            metrics.JOB_DURATION_SECONDS.labels(
+                job_type=lease.type, outcome=outcome
+            ).observe(duration_seconds)
+
+    def _fail(self, lease: Lease, exc: BaseException, *, permanent: bool) -> str | None:
         delay = queue.retry_delay(
             lease.attempt,
             base_sec=self.settings.job_retry_base_sec,
@@ -197,8 +212,17 @@ class JobRunner:
                     permanent=permanent,
                 )
                 self.on_failed(session, lease, status)
+            # Record job outcome
+            if permanent:
+                metrics.JOBS_DEAD.labels(job_type=lease.type).inc()
+                return "dead"
+            else:
+                metrics.JOBS_RETRIED.labels(job_type=lease.type).inc()
+                return "retry"
         except LeaseLost:
             log.warning("job.lease_lost", job_id=lease.job_id, during="fail")
+            return None
         except OperationalError as exc2:
             # The lease will lapse and the reaper will retry the job.
             log.warning("job.fail_unrecorded", job_id=lease.job_id, error=str(exc2))
+            return None
