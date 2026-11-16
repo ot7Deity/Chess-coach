@@ -53,6 +53,25 @@ class Settings(BaseSettings):
     # the process is killed and restarted, and the job is retried.
     engine_timeout_sec: float = Field(default=30.0, gt=0)
 
+    # --- Position cache / metrics -------------------------------------------
+    # Which layers the analysis worker's EvalCache uses: 'full' is Redis in
+    # front of Postgres, 'postgres' skips Redis, 'off' is NullCache (the
+    # "without cache" side of the engine-seconds-saved benchmark).
+    position_cache: str = Field(default="full", pattern="^(full|postgres|off)$")
+    # Bump the version segment to orphan every Redis entry at once (Postgres is
+    # unaffected; Redis refills from it).
+    position_cache_key_prefix: str = "chess_coach:pos:v1:"
+    # Sliding expiry, refreshed on every hit. 0 disables expiry.
+    position_cache_ttl_sec: int = Field(default=7 * 24 * 3600, ge=0)
+    # Redis answers in well under a millisecond; anything near this is an outage.
+    position_cache_redis_timeout_sec: float = Field(default=0.25, gt=0)
+    # After a Redis failure, go Postgres-only for this long before retrying.
+    position_cache_redis_retry_sec: float = Field(default=30.0, ge=0)
+    # Prometheus endpoint. 0 disables it. Several workers on one host each take
+    # metrics_port + their worker index.
+    metrics_port: int = Field(default=0, ge=0, le=65535)
+    metrics_addr: str = "127.0.0.1"
+
     # --- Workers ------------------------------------------------------------
     worker_poll_interval_sec: float = Field(default=1.0, gt=0)
     job_max_attempts: int = Field(default=5, ge=1)
