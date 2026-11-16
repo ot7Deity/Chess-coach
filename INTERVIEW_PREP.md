@@ -1,4 +1,4 @@
-# Interview Prep: decision log
+﻿# Interview Prep: decision log
 
 Every meaningful change and design decision in this project, with the reasoning, the
 alternatives that were rejected, and how to talk about it. **Newest entry first.**
@@ -63,7 +63,7 @@ exactly; a re-sync costs **2 requests**.
 - *CORS origins from environment.* Hard-coded origins make deployment inflexible: the code doesn't know where the dashboard is running. An environment variable lets ops move the dashboard without code changes. Split on comma at startup so there's only one place where the list is parsed.
 - *time_pressure() enforces daily â†’ None.* The route already checks time_class != 'daily' before calling time_pressure(), but the function itself shouldn't return a misleading answer if called directly. Explicit null at function level is a contract guarantee, not just a route-level accident.
 
-**The test, worked by hand:** POST /players/{username} for a new name queues a sync and returns 202. GET /players/{username} returns the player's status; if the name is garbage, it returns 404. GET /players/{u}/report?time_class=daily returns time_pressure=null even if analyzed_games > 0. CORS_ORIGINS env var set to "http://example.com" means only that origin is allowed, not localhost:3000.
+**The test, worked by hand:** POST /players for a new name queues a sync and returns 202. GET /players/{username} returns the player's status; if the name is garbage, it returns 404. GET /players/{u}/report?time_class=daily returns time_pressure=null even if analyzed_games > 0. CORS_ORIGINS env var set to "http://example.com" means only that origin is allowed, not localhost:3000.
 
 **Talking point:** "Unknown username is a 404 because the player resource doesn't existâ€”not a validation error. CORS hard-coded meant the dashboard couldn't move to a new port without code changes; now it reads an environment variable at startup. Daily games have no time control, so the time_pressure section has to be explicitly null, enforced at the function level so even direct calls can't return a wrong answer."
 
