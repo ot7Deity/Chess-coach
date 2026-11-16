@@ -105,7 +105,7 @@ def test_no_analysed_games_means_empty_sections(clean_engine: Engine):
     assert pressure.normal_clock == report.ClockBucket(0, None, 0)
 
 
-def test_a_daily_games_first_move_has_no_base_time(clean_engine: Engine):
+def test_a_daily_games_time_pressure_is_not_measured(clean_engine: Engine):
     me = add_player(clean_engine)
     g = add_game(
         clean_engine, me, analysis_status="complete", time_class="daily", time_control="1/86400"
@@ -113,4 +113,4 @@ def test_a_daily_games_first_move_has_no_base_time(clean_engine: Engine):
     add_moves(clean_engine, g, [_mine(86400.0, "good")])
     with Session(clean_engine) as s:
         got = report.time_pressure(s, me, "daily")
-    assert got.low_clock.moves == got.normal_clock.moves == 0
+    assert got is None
