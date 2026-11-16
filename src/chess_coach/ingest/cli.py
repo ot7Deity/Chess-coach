@@ -13,6 +13,7 @@ import sys
 
 import redis
 
+from chess_coach.analysis.jobs import enqueue_pending
 from chess_coach.chesscom import ChessComClient, ChessComError
 from chess_coach.config import get_settings
 from chess_coach.db import get_engine
@@ -57,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
             except (ChessComError, SyncInProgress, ValueError) as exc:
                 failures += 1
                 log.error("sync.failed", username=username, error=f"{type(exc).__name__}: {exc}")
+    enqueue_pending(engine)
     return 1 if failures else 0
 
 
