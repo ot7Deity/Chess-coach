@@ -16,6 +16,7 @@ from collections.abc import Iterator
 import chess
 import pytest
 import redis
+from prometheus_client import REGISTRY
 from sqlalchemy import Engine, event, select, text
 
 from chess_coach.cache import PositionCache, build_eval_cache, cache_redis_client, redis_key
@@ -639,3 +640,54 @@ def test_mate_in_zero_is_not_confused_with_no_mate(cache, redis_client, clean_en
 
     cache.put(key, fen, ENGINE, DEPTH, Evaluation(eval_cp=0, mate_in=None, best_move=None))
     assert cache.stats.eval_conflicts == 1  # 0 cp is not "mated"
+
+
+# --- Prometheus ----------------------------------------------------------------
+
+
+def _sample(name: str, **labels: str) -> float:
+    return REGISTRY.get_sample_value(name, labels) or 0.0
+
+
+def test_prometheus_counters_follow_the_cache(cache):
+    names = [
+        ("chess_coach_cache_lookups_total", {"result": "hit", "layer": "redis"}),
+        ("chess_coach_cache_lookups_total", {"result": "hit", "layer": "postgres"}),
+        ("chess_coach_cache_lookups_total", {"result": "miss", "layer": "none"}),
+        ("chess_coach_engine_seconds_saved_total", {}),
+        ("chess_coach_cache_writes_total", {"outcome": "inserted"}),
+        ("chess_coach_cache_writes_total", {"outcome": "existing"}),
+        ("chess_coach_cache_eval_conflicts_total", {}),
+    ]
+    before = [_sample(n, **labels) for n, labels in names]
+
+    key, fen = position("e4")
+    cache.get(key, ENGINE, DEPTH)  # miss
+    cache.put(key, fen, ENGINE, DEPTH, EVAL)  # inserted
+    cache.get(key, ENGINE, DEPTH)  # redis hit, 0.25 s saved
+    cache.purge_redis()
+    cache.get(key, ENGINE, DEPTH)  # postgres hit, 0.25 s saved
+    cache.put(key, fen, ENGINE, DEPTH, OTHER)  # existing, and a conflict
+
+    after = [_sample(n, **labels) for n, labels in names]
+    deltas = [a - b for a, b in zip(after, before, strict=True)]
+    assert deltas == pytest.approx([1, 1, 1, 0.5, 1, 1, 1])
+
+
+def test_the_redis_up_gauge_tracks_the_breaker(make_cache, redis_client):
+    switch = CountingRedis(redis_client)
+    clock = FakeClock()
+    cache = make_cache(switch, clock=clock)
+    key, _ = position("e4")
+    assert _sample("chess_coach_cache_redis_up") == 1
+    errors = _sample("chess_coach_cache_redis_errors_total", op="get")
+
+    switch.down = True
+    cache.get(key, ENGINE, DEPTH)
+    assert _sample("chess_coach_cache_redis_up") == 0
+    assert _sample("chess_coach_cache_redis_errors_total", op="get") - errors == 1
+
+    switch.down = False
+    clock.now += 60
+    cache.get(key, ENGINE, DEPTH)
+    assert _sample("chess_coach_cache_redis_up") == 1
