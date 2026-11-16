@@ -16,12 +16,13 @@ import chess.pgn
 
 from chess_coach.analysis.classify import classify_move, mover_after, mover_before, phase
 from chess_coach.analysis.clock import move_times, parse_time_control
+from chess_coach.jobrunner import PermanentJobError
 from chess_coach.positions import Evaluation, fen_hash
 
 Evaluator = Callable[[chess.Board], Evaluation]
 
 
-class BadGame(ValueError):
+class BadGame(PermanentJobError):
     """The stored game cannot be replayed. Permanent: retrying will not fix it."""
 
 

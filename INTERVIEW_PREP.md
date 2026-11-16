@@ -32,18 +32,357 @@ milestones, done in parallel on different branches, merges without conflicts.
 
 ## The 60-second pitch
 
-> "It pulls my whole Chess.com history - about 4,000 games - and runs every position through
-> Stockfish to find where I actually lose rating. The interesting part isn't the chess, it's
-> that analyzing 220,000 positions is hours of CPU time, so it's a job queue feeding a pool
-> of worker processes, with a position-level cache in front of the engine, and an API that
-> only ever reads finished results so the site stays fast while the backlog drains."
+> "Given any Chess.com username, it pulls that player's whole history - for my own account,
+> about 4,500 games and 220,000 positions - and runs every position through Stockfish to find
+> where they actually lose rating. The interesting part isn't the chess, it's that analyzing
+> a history that size is hours of CPU time, so it's a job queue feeding a pool of worker processes, with a
+> position-level cache in front of the engine, and an API that only ever reads finished results
+> so the site stays fast while the backlog drains."
 
 Numbers to fill in as they are measured: games analyzed, cache hit rate, games/minute at
 1/2/4/8 workers, engine seconds saved by the cache.
 
+The app works for any Chess.com username; `deitythemenace` (the author's account) is the
+acceptance-test account because its totals can be checked against Chess.com's own profile.
+
 Measured so far: **4,550 games** ingested for `deitythemenace` across 53 months in 55 seconds
 at one request per second; win/loss/draw per time control matches Chess.com's own totals
 exactly; a re-sync costs **2 requests**.
+
+---
+
+<!-- M4 ENTRIES BELOW (report SQL, report and sync API). Newest first. -->
+
+## 2026-11-16 - Bug: a merge quietly deleted 1,670 lines of documentation `DONE`
+
+> **In plain English:** While restacking the branches, a merge of m4/3 into m4/4 needed to resolve a conflict in INTERVIEW_PREP.md. I took m4/4's version without noticing it was a short stub, not the full file. The result silently dropped all the UI dashboard entries, all earlier M4 entries, and all M2 entries—1,670 lines of design decisions. The PR diff made it obvious only after the fact: a PR that should add ~40 lines showed -4,099 lines. The tester found it by looking at the line diff; tests passed because documentation has no tests.
+
+**How it was found:** The tester saw a PR diff stat showing 4,099 lines removed and asked what happened. A conflict was resolved by keeping m4/4's short version wholesale, dropping everything else.
+
+**Root cause:** When resolving a merge conflict by taking one side, I didn't verify that the conflict was truly exclusive (m4/4 had newer entries) instead of one side being incomplete (m4/4 had *only* its own entries, missing earlier ones).
+
+**Fix:** Restore from m4/3, then re-add m4/4's new entry at the top. For INTERVIEW_PREP conflicts going forward: never take one side wholesale; keep both sides' entries, with newer ones first in each section.
+
+**Lesson:** A large diff stat against the parent (not comparing two sides of a conflict) is a red flag for a merge resolution mistake. Tests don't catch documentation loss. Check the diff yourself when conflict resolution touches vital files.
+
+**Where:** This entry is the fix.
+
+---
+
+## 2026-11-16 - Bug: re-adding a player showed 'failed' forever `DONE`
+
+> **In plain English:** The website lets you re-add a player—say, to retry a download that failed. When you did, the page showed "The download from Chess.com failed" with the old error, and it never changed even after the queued retry succeeded. The page keeps checking for new work while there's work to do, but once a sync fails the page stops checking, so it missed the retry happening in the background. The bug was in the API: it queued the retry but didn't tell the page "oh, that failed sync is now pending again."
+
+**A bit deeper:** A sync worker claims a job, tries to fetch from Chess.com, and if it fails sets `players.sync_status = 'error'` and the error message. When you POST the same username again, the API calls `enqueue_sync` to re-arm the old job back to `pending`. But the response's `sync_status` was still `error` because the endpoint returned it from memory without refreshing from the database. The page saw "error" and stopped polling. A tester caught it by reading `Progress.tsx`'s polling rule against the API response spec and seeing they could diverge.
+
+**How it was found:** The tester read Progress.tsx and noticed its polling rule: "poll while there's work, stop once work is done." Then checked what the API says in both cases: (1) sync failed, page stops; (2) POST to retry, then GET — does the page see the job is pending again? The API still said "error", so the page would never poll again even though the work restarted.
+
+**Root cause:** The fix lives in the API, not the UI, because another browser tab's GET would still see the stale error forever. The endpoint had to update `sync_status` and `sync_error` in the same transaction as the job re-arm.
+
+**Fix:** In `add_player`, after `enqueue_sync` returns a job id (meaning a job was re-armed): `UPDATE players SET sync_status = 'pending', sync_error = NULL WHERE id = :id AND sync_status <> 'syncing'`. The last condition prevents clobbering an in-progress sync if one is already running. If `enqueue_sync` returns None (a job was already queued or running), leave `sync_status` alone; the sync worker owns it.
+
+**Talking point:** "The API queued a retry of a failed sync but didn't update sync_status, so the response still said 'error'. The UI's polling rule (stop when work is done) was correct; the API's response was stale. The fix is atomic: when the API re-arms a job, it atomically updates status in the same transaction, so a GET after the POST always sees the queued work."
+
+**Where:** `src/chess_coach/api/players.py` (`add_player`), `tests/test_api_players.py`.
+
+---
+
+## 2026-11-06 - Bug: with the cache switched off, engine time was recorded nowhere `DONE`
+
+> **In plain English:** One of the numbers this project exists to produce is "how much
+> engine time does the cache save?" That needs two measurements: the time with the cache,
+> and the time without. The only place engine time was being saved was the cache itself -
+> so when the cache was switched off to measure the "without" side, the time had nowhere to
+> go. It's like measuring how much a coupon saves you, when the only receipt is printed by
+> the coupon. Now each game records how long the engine worked on it, regardless of whether
+> a cache is in use.
+
+**A bit deeper:** `positions.compute_ms` is written when a position is stored in the
+position cache. With `NullCache` (the cache disabled, the baseline of the benchmark) nothing
+is stored, so the engine's work left no trace in the database. The fix records it on the
+unit the benchmark measures - the game - in the worker, which sees every engine call.
+
+**Symptom / how it was found:** the M3 builder, wiring the cache into my worker, could not
+compute DESIGN.md's "engine seconds with cache vs without" from the database: the "without"
+run had no engine time anywhere.
+
+**Root cause:** a measurement owned by an optional component. I had treated
+`positions.compute_ms` as "where engine time lives", but it is really "the cost of a cached
+entry", which only exists if there is a cache.
+
+**Fix:** migration `0004` adds `games.engine_ms` (NULL until analysed). `CachedEvaluator`
+counts engine time on **misses only** and the worker writes the game's total in the same
+transaction that completes it. Counting misses only is the important detail: a cache hit's
+`compute_ms` is what the engine spent when the position was *first* evaluated, maybe in
+another game, so adding it would make a fully cached game look as expensive as an uncached
+one. A test analyses the 90-ply game with an empty cache (engine_ms > 0, and equal to the
+sum over the positions stored) and again with every position cached (engine_ms = 0).
+
+**Talking point:** "The cache-savings number needs a baseline with the cache off, and my only
+record of engine time was written by the cache - so the baseline was invisible. Now each game
+records its own engine time, counting cache misses only, and the saving is a SUM over one
+column with and without the cache."
+
+**Where:** `migrations/versions/0004_games_engine_ms.py`, `src/chess_coach/analysis/runner.py`
+(`CachedEvaluator.engine_ms`, `Worker._finish`), `src/chess_coach/models.py`,
+`tests/test_runner.py::test_engine_time_is_recorded_per_game_whether_or_not_there_is_a_cache`.
+
+---
+
+## 2026-11-06 - "Under 30 seconds" means the clock when you *started* the move `DONE`
+
+> **In plain English:** The report asks "do I fall apart when my clock runs low?", so it
+> needs to know how much time a player had when they started each move. The saved clock
+> reading is from *after* the move, so the right number is the reading from the player's
+> previous move - their opponent's thinking doesn't use up their clock. For a player's very
+> first move there is no previous reading, so it's the starting time. The trap was telling
+> "this is the first move" apart from "the previous reading is missing". If I'd treated both
+> the same, a move after a missing reading would be counted as if the player had their full
+> starting time - a confident, wrong answer. Now the first move is found by its position in
+> the game, and a move after a gap is simply left out.
+
+**A bit deeper:** The start-of-move clock is `LAG(clock_seconds)` over the player's own moves
+in a game, ordered by ply. `LAG` returns NULL both for the first row and for a row whose
+previous value is NULL, so `COALESCE(lag(...), base_time)` - the obvious way to write "or the
+base time for the first move" - silently conflates the two. Using `row_number() = 1` to pick
+the base time keeps "unknown" as unknown.
+
+**What changed:** `analytics/report.py`: `move_summary` (`analyzed_games`, the player's own
+`blunders_per_game`), `blunders_by_phase` (always three rows, counts not rates) and
+`time_pressure` (two buckets split at 30 s, accuracy as best+good over moves, and the number of
+analysed games with at least one low-clock move).
+
+**Why the details are the way they are:**
+- *Only analysed games, only the player's own classified moves.* The opponent's blunders, games
+  still in the queue and other time classes are all excluded; a test fills each of those with
+  blunders and checks none are counted.
+- *Counts, not rates, by phase*, so there is exactly one definition of each rate and it lives
+  in the UI: per game (the three phases sum to the headline) and per 100 moves.
+- *The base time is parsed in SQL from `time_control`*; a daily control (`1/86400`) has none,
+  so a daily game's first move is in neither bucket - and the endpoint returns no time-pressure
+  section for daily at all.
+
+**The test, worked by hand:** two analysed games. The white game's starting clocks are 180
+(base), 182, 40, 25 and 10 seconds, so its last two moves are "low". The black game's first
+move starts on the base time even though its own reading is missing, its second move follows
+that missing reading and is excluded, and its third starts on 20 s. Result: 4 normal moves
+(50% accurate, 1 blunder), 3 low-clock moves (66.7%, 1 blunder), 2 low-clock games.
+
+**Talking point:** "The time-pressure stat needs the clock when a move was *started*, which is
+the player's previous reading. The bug I designed out was the obvious SQL: LAG, coalesced to
+the base time. LAG is NULL for the first move *and* after a missing reading, so the coalesce
+would hand a move with unknown timing the full starting clock. Picking the first move by
+row_number keeps unknown as unknown."
+
+**Where:** `src/chess_coach/analytics/report.py`, `tests/test_report_moves.py`.
+
+---
+
+## 2026-11-06 - Which openings cost me rating: a window function, checked against real data `DONE`
+
+> **In plain English:** One question the report answers is "which openings lose me rating
+> points?" Chess.com stores my rating *after* each game, not how much it changed. So the
+> change for a game is "my rating after this game, minus my rating after the game before
+> it". The "game before it" has to be the previous *rated* game of the *same* kind (blitz
+> with blitz), in time order - including games whose opening has no name, even though those
+> are left out of the openings list itself. I wrote that as a database query, tested it on
+> small made-up data where I worked out every answer by hand, and then ran it on my real
+> 4,549 games. It matched the numbers the dashboard was already built with, exactly, for
+> every time control.
+
+**A bit deeper:** A *window function* (`LAG`) looks at the previous row in an ordered set
+without collapsing rows the way `GROUP BY` does - here, the previous rated game in the same
+time class, ordered by time (and by id, so two games at the same second still have a fixed
+order). The change is computed over every game *first* and only then filtered and grouped
+by opening, because filtering first would make the "previous game" skip games and inflate
+the changes.
+
+**What changed:** `src/chess_coach/analytics/report.py` - `summary`, `rating_trend` and
+`openings`, the report sections that come from ingested games and are complete as soon as a
+sync is. `analytics/progress.py` holds the "current rating" query, shared so the progress page
+and the report can never disagree about it.
+
+**Why the details are the way they are:**
+
+- *Window first, filter second.* A game with no opening name is not an opening row, but it is
+  still the previous game for the next one's rating change. A test puts an unnamed game
+  between two Italian Games and checks the change is measured from it.
+- *Ties break on id, everywhere.* The rating change's `LAG`, "current rating" and "the last
+  game of the day" all order by `(played_at, id)`, so no two of them can disagree about which
+  game came last.
+- *The UTC day, written out.* `(played_at AT TIME ZONE 'UTC')::date`, and a test runs the query
+  in a Los Angeles session to show a 02:00 UTC game still lands on its UTC day. Chess.com's own
+  monthly archives are filed in US Pacific time, which is why the contract has no month field.
+- *Percentages are computed in Python from integer counts.* Postgres `numeric` division returns
+  20 significant digits (`51.0392609699769053`), which is not the float the contract promises.
+
+**Verified against real data:** a read-only run against the development database
+(`deitythemenace`, 4,549 standard games) compared every summary count, current rating,
+rating-trend point and opening row with the dashboard's real-data fixture: blitz 433 games /
+141 trend days / 15 opening rows, bullet 3,690 / 907 / 50, rapid 424 / 161 / 17, daily 2 / 2 / 0.
+Zero differences.
+
+**Alternatives rejected:**
+- *Compute rating change in Python*: pulls every game of a time class over the wire to do what
+  one window function does next to the data.
+- *Filter out unnamed openings before the `LAG`*: simpler SQL, wrong numbers.
+
+**Talking point:** "Chess.com gives you the rating after each game, not the change, so the
+change is a LAG over the previous rated game in the same time class. The subtle part is the
+order of operations: the window has to run over every game before you filter to games with a
+named opening, or the 'previous game' skips some and the numbers inflate. I tested it on
+hand-computed data and then against my real 4,549 games, where it matched the dashboard's
+fixture exactly."
+
+**Where:** `src/chess_coach/analytics/report.py`, `src/chess_coach/analytics/progress.py`,
+`tests/test_report_games.py`.
+
+---
+
+## 2026-11-06 - Asking for a sync is a queued job, and a re-sync re-arms the old one `DONE`
+
+> **In plain English:** When someone types their username into the website, the website
+> must not go and download their games itself - that takes a minute and has to wait its turn
+> behind a strict speed limit, and the website should answer instantly. So the website just
+> writes down "please fetch this player" as a job, and a separate background worker does the
+> downloading. Two details matter. If the same person clicks twice, there should still be
+> only one fetch, so the job is written down once per player and reused. And when an old,
+> finished job is reused, its numbered ticket keeps counting up instead of starting again at
+> one - otherwise a long-lost worker holding ticket number one could mistake the new job for
+> its own.
+
+**A bit deeper:** The API inserts the player and a `sync-player` job and returns `202
+Accepted`. A *sync worker* (`chess-coach-worker --kind sync`) claims it, runs the M1 sync and
+then enqueues analysis for the games it found. Idempotency is an *upsert* on the job's dedupe
+key: if no job exists it is inserted; if one is queued or running nothing happens; if the old
+one finished, failed or died, it is *re-armed* back to pending. The `attempts` counter is the
+lease's *fencing token*, so re-arming extends the attempt budget instead of resetting it.
+
+**What changed:** `src/chess_coach/jobrunner.py` (the worker loop extracted from the analysis
+worker, so both job types share leases, retries and outage handling),
+`src/chess_coach/ingest/jobs.py` (`enqueue_sync`, `SyncWorker`), `--kind sync` on the worker
+CLI, a `sync-worker` compose service, and the reaper can be limited to one runner's job types.
+
+**Why the details are the way they are:**
+
+- *One job row per player, re-armed.* The dedupe key is unique for ever, so "a second sync
+  later" cannot be a second row. `INSERT ... ON CONFLICT DO UPDATE ... WHERE status IN ('done',
+  'failed', 'dead')` gives "enqueue unless one is queued or running" in one atomic statement:
+  two simultaneous clicks cannot create two syncs.
+- *Never reset the fencing token.* The obvious re-arm sets `attempts = 0`, and I nearly wrote
+  it - it looks like simple bookkeeping. That would let the next claim be attempt 1 again - the same (job, worker, attempt) triple a zombie from
+  the first run could still hold. It now sets `max_attempts = attempts + JOB_MAX_ATTEMPTS`, and
+  a test shows the old run's lease is refused after a re-arm.
+- *The sync heartbeats from inside the work, through the HTTP client.* `sync_player` has no
+  progress hook, so the worker hands it a thin wrapper around the Chess.com client that renews
+  the lease before every request. Every request is progress, so this is the same rule as the
+  analysis worker's heartbeat between positions - never a background thread.
+- *A missing account is a permanent failure.* The API never calls Chess.com, so it cannot know
+  a username is a typo. The sync records it on the player (`sync_status = 'error'`, shown by
+  the progress page) and the job goes to `failed`, not round the retry loop five times. Chess.com
+  being down (`ChessComUnavailable`) is retried with backoff.
+- *Each worker kind reaps only its own job types*, so the hook that repairs a reaped job's
+  domain status (a game back to `pending`, a player out of `syncing`) is always the right one.
+
+**Alternatives rejected:**
+- *Call Chess.com from the API request*: a minute-long request, competing with every sync
+  worker for the one-request-per-second budget, and the API stops being read-only.
+- *Insert a new sync job each time, with no dedupe key*: two clicks, two syncs; the advisory
+  lock would stop them running at once, but one would fail and retry for nothing.
+- *A separate CLI for the sync worker*: the loop, the signals and the flags are the same; only
+  the job type differs.
+
+**Talking point:** "The website's only write is 'please sync this player', and it's a job, not
+a call to Chess.com. Clicking twice is one atomic upsert, so it's still one job. When a finished
+job is re-armed I deliberately don't reset its attempt counter, because that counter is the
+fencing token for leases - resetting it would let a stale worker's old lease match the new run."
+
+**Where:** `src/chess_coach/ingest/jobs.py`, `src/chess_coach/jobrunner.py`,
+`src/chess_coach/worker.py`, `tests/test_sync_jobs.py`.
+
+---
+
+## 2026-11-06 - My explanation was wrong, the code was right, and real data showed it `DONE`
+
+> **In plain English:** To work out how long a player spent on each move, my code takes
+> their clock before the move, subtracts their clock after it, and adds back the bonus
+> seconds the game gives per move. Next to that code I wrote an explanation: "the clock
+> doesn't run on your first move, so the first move always costs zero". The project's tester
+> checked my formula against every move of my 4,550 real games, and found the formula was
+> right - but my explanation was not. In most games the clock *is* running on the first move.
+> The formula never relied on that claim, so it gave the right answers anyway. I deleted the
+> wrong sentence. A wrong comment is a trap for the next person who reads it.
+
+**A bit deeper:** A *code comment* is a claim that no test checks. Mine claimed a fact about
+Chess.com's clocks that I had inferred from one synthetic example. The formula (previous
+reading - this reading + increment, with the base time as the "previous reading" for a
+player's first move) is correct whether or not the first move is free, so the false claim
+never caused a wrong number - which is exactly why nothing caught it.
+
+**Measured, by the tester, read-only over the 4,550 real games (254,553 plies):**
+- The formula produces **0** negative move times. Treating `%clk` as if it excluded the
+  increment would have produced **31,262** - so the readings really do include the increment.
+- White's first reading is already **below** the base time in **1,018 of 1,143** bullet games
+  without increment, so the first move is not free.
+
+**Fix:** the docstring in `analysis/clock.py` now states what was measured instead of the
+false claim, and a test comment that repeated it was corrected. No code changed.
+
+**Lesson:** I had tested the formula and explained it with a guess. Tests check behaviour;
+nothing checks prose. When a comment states a fact about someone else's system, it should
+be a fact somebody measured, and say so.
+
+**Talking point:** "A reviewer ran my move-time formula over a quarter of a million real moves.
+The formula was right - zero negative times, versus 31,000 if I'd misread the clock format -
+but the comment explaining it claimed the first move is free, and in 1,018 of 1,143 games it
+isn't. The code never depended on the claim, so nothing failed. I fixed the comment, and now
+the docstring cites the measurement instead of my guess."
+
+**Where:** `src/chess_coach/analysis/clock.py`, `tests/test_clock.py`.
+
+---
+
+## 2026-11-06 - Unknown username returns 404, CORS is environment-configurable, daily time_pressure enforced `DONE`
+
+> **In plain English:** When someone asks for a report on a username we've never seen, the API says "I don't know that person" (404). This is better than a generic error because it tells the client the name was just wrong, not that something broke. The dashboard runs on port 3000 in development and port 3001 for the reviewer, so the API needs to allow requests from both - but the allowed ports are hard-coded right now. If the dashboard moves to a different port, the API won't accept its requests and the browser will block the response silently, which is confusing to debug. Daily games have no time control, so "do I fall apart on time?" makes no sense for them - the time-pressure section has to be explicitly null, not just happen to be null.
+
+**A bit deeper:** Unknown username -> `tracked_player()` helper raises a 404 HTTPException. The allowed origins are now parsed from an environment variable at startup (`CORS_ORIGINS`, comma-separated list, default localhost:3000 and 3001) and split into the CORSMiddleware config. Daily games return `time_class='daily'`, which has NULL base time; the `time_pressure()` function checks this and returns None immediately. If a caller passes time_class='daily' directly (not through the API route), they get None instead of a wrong answer.
+
+**What changed:** `api/main.py`  -  CORS now reads from `settings.cors_origins`; `api/players.py`  -  get_report route simplified because time_pressure already returns None for daily; `config.py`  -  added `cors_origins` setting (environment variable `CORS_ORIGINS`); `analytics/report.py`  -  time_pressure() now takes time_class parameter and returns None | TimePressure.
+
+**Why the details are the way they are:**
+- *404 is the standard for "resource not found."* If the username is unrecognized, there's no player resource, so 404 is right. 422 (validation error) would mean the input format was bad, but "deitythemenace" is a valid Chess.com username format.
+- *CORS origins from environment.* Hard-coded origins make deployment inflexible: the code doesn't know where the dashboard is running. An environment variable lets ops move the dashboard without code changes. Split on comma at startup so there's only one place where the list is parsed.
+- *time_pressure() enforces daily -> None.* The function checks time_class and returns None for daily, so the endpoint automatically returns null in the response. Daily games have no clock, so time pressure makes no sense.
+
+**The test, worked by hand:** POST /players for a new name queues a sync and returns 202. GET /players/{username} returns the player's status; if the name is garbage, it returns 404. GET /players/{u}/report?time_class=daily returns time_pressure=null even if analyzed_games > 0. CORS_ORIGINS env var set to "http://example.com" means only that origin is allowed, not localhost:3000.
+
+**Talking point:** "Unknown username is a 404 because the player resource doesn't exist - not a validation error. CORS hard-coded meant the dashboard couldn't move to a new port without code changes; now it reads an environment variable at startup. Daily games have no time control, so the time_pressure section has to be explicitly null, enforced at the function level so even direct calls can't return a wrong answer."
+
+**Where:** `src/chess_coach/api/main.py`, `src/chess_coach/api/players.py`, `src/chess_coach/config.py`, `src/chess_coach/analytics/report.py`.
+
+---
+
+## 2026-11-06 - LAG window runs before classification filter: defensive against future changes `DONE`
+
+> **In plain English:** The time-pressure stat shows whether a player plays worse when low on the clock. It needs to know the clock reading at the start of each move, which is the clock after the previous move. On real data, every move in a complete game is analyzed and gets a classification. But if we ever queue incomplete games or skip some moves in analysis, a SQL mistake could compute wrong starting clocks. The defensive fix ensures that if unanalyzed moves ever appear, the clock history is correct.
+
+**A bit deeper:** A LAG window function looks at the previous row in an ordered set. If filtering for classification happens before the LAG window, it removes unanalyzed moves from the window, so the next move's LAG sees the move before that, and the computed clock is from two moves ago, not one. The code computes LAG on all moves first (no classification filter in the CTE), then filters analyzed moves only in the buckets that count them. Today this makes no difference because every move is classified. If incomplete games were added in future, the CTE order would prevent wrong clocks.
+
+**What changed:** `analytics/report.py`, `time_pressure()` function. The `WITH mine AS (...)` CTE filters only by `analysis_status='complete'` and `is_player_move`, **not** by `classification`. The LAG window runs over all of those moves. Then, in the outer `SELECT`, each bucket's counts add `AND classification IS NOT NULL` so only analyzed moves are counted, but the start-of-move clock always comes from LAG of all moves.
+
+**Why the details are the way they are:**
+- *Defensive, not a fix for an observed bug.* On real data every player move in a complete game is classified, so the LAG change makes no practical difference today. It guards against a case that cannot occur now but could if the architecture changes.
+- *LAG computed first, filter second.* The general rule for window functions: compute the window over the full input, then filter rows in the final SELECT. Filtering before the window would break it, should incomplete games ever exist.
+- *Every bucket filters by classification.* low_moves, normal_moves, low_accurate, etc., all add `AND classification IS NOT NULL` so only analyzed moves are counted in rates and blunder counts.
+
+**The test, worked by hand:** With hypothetical unanalyzed moves: a game with moves 1-5 where move 2 is unanalyzed. LAG computes move 3's start_clock from move 2 (correct), not move 1 (wrong). When we filter to classification IS NOT NULL, we count moves 1, 3, 4, 5 and move 3 keeps the right clock.
+
+**Talking point:** “On real data, every move in a complete game is classified. The LAG-first ordering is defensive: if incomplete games ever appear, it ensures clock history is correct. If we filtered for classification before LAG, an unanalyzed move would break the history.”
+
+**Where:** `src/chess_coach/analytics/report.py`, `time_pressure()` function.
+
+<!-- end of M4 entries -->
 
 ---
 
@@ -724,6 +1063,48 @@ things break, and a dashboard has nothing to gain from being first."
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-06 - The benchmark's default job type matched nothing `DONE`
+
+> **In plain English:** The benchmark puts a pile of jobs in the queue and then lets the
+> workers loose on it. I had to guess what the jobs should be labelled, because the team
+> building the workers hadn't decided yet. I guessed `analyze_game`, with an underscore. They
+> chose `analyze-game`, with a dash. One character. The workers would have looked at the
+> queue, seen nothing with their label, decided there was no work, and gone home - and the
+> benchmark would have reported "zero games finished" as if the system were broken. It's like
+> leaving a parcel for "Jon" when the person is "John": nobody picks it up, and nobody tells
+> you why.
+
+**A bit deeper:** The harness and the worker share an implicit *interface*: the `jobs.type`
+string the harness writes is the one the worker's claim query filters on. Nothing checks that
+the two agree - a mismatch isn't an error, just an empty query result. And because workers
+run with `--until-empty`, an empty result means "finished", so the failure looks like success
+that did nothing.
+
+**Symptom:** None in a run - caught before the first real one, when M2 answered my question
+about the job format.
+
+**How I found it:** I had flagged the format as an open question rather than treating my
+guess as settled, and M2's answer differed from the default by one character.
+
+**Root cause:** A default chosen before the owner of the format had decided it - a guess with
+the same standing in the code as a fact.
+
+**Fix:** The defaults are now M2's confirmed format: type `analyze-game`, payload
+`{"game_id": N}`, dedupe key `analyze-game:N`. The default worker command is M2's real CLI,
+`chess-coach-worker --worker-id {worker_id} --until-empty`, and the docs say not to add
+`--enqueue-pending`, which would enqueue every pending game and grow the workload mid-round.
+The fake worker uses the same type and flag. A test pins all of it, so a future change on
+either side fails loudly instead of producing an empty benchmark.
+
+**Lesson:** When two components meet at a string, the string is an interface - test it like
+one. And when you have to guess someone else's decision, write the guess down as a question
+for them, not just as a default in your code. Asking is what caught this.
+
+**Where:** `bench/harness.py` (defaults), `bench/throughput.py` (`DEFAULT_WORKER_CMD`),
+`bench/fake_worker.py`, `tests/test_bench_harness.py::test_job_defaults_match_the_format_m2_confirmed`.
+
+---
+
 ## 2026-11-06 - Measured: what one cache lookup costs, layer by layer `DONE`
 
 > **In plain English:** Before the real speed test, I timed the cache itself. Getting a saved
@@ -935,8 +1316,10 @@ the next change.
   `{metrics_port}`), passed after `--` so Windows paths need no quoting. It defaults to
   `chess-coach-worker`; M2's exact flags plug in without changing the harness.
 - *Job format is configurable* (`--job-type`, `--job-payload`, `--dedupe-key`) because M2
-  owns it; the defaults are `analyze_game`, `{"game_id": N}` and `analyze-game:N` (the key
-  format `models.Job` documents), and the harness assumes nothing beyond them.
+  owns it; the defaults are M2's confirmed format - type `analyze-game`, payload
+  `{"game_id": N}`, dedupe key `analyze-game:N` - and the worker command defaults to M2's
+  `chess-coach-worker --worker-id {worker_id} --until-empty`. (The first default type was
+  wrong; see "The benchmark's default job type matched nothing".)
 - *A known bias, written down:* if two workers evaluate one position simultaneously only the
   winner's row exists, so the loser's engine time is invisible to SQL and the hit rate reads
   slightly high at large N. The workers' Prometheus counters count both and will be the
@@ -982,8 +1365,9 @@ didn't.
 **Root cause:** Reading the model (`default=100`) as if it described the table.
 
 **Fix:** The harness's INSERT names every `NOT NULL` column. A schema change (adding server
-defaults) would be the other fix, but migrations belong to M2, so it's noted for them rather
-than done here.
+defaults) would be the other fix, but migrations belong to M2, so I reported it rather than
+doing it here. M2's migration `0003` now adds server defaults to `jobs` (status, priority,
+attempts, max_attempts); the harness keeps naming the columns, which works with or without it.
 
 **Lesson:** The ORM model describes what the ORM does; the migration describes what the
 database enforces. Anything that bypasses the ORM - a benchmark, a `psql` session, a
@@ -1541,8 +1925,10 @@ Postgres, including eight threads racing on the same 25 positions).
 
 > **In plain English:** The chess engine has a setting for how much scratch memory it may
 > use while thinking. I had assumed that only changes how *fast* it thinks, not *what* it
-> concludes. I measured it anyway, and it does change the answer - rarely and slightly (one
-> position in six, by a fiftieth of a pawn), but it does. The saved answers were filed under
+> concludes. I measured it anyway, and it does change the answer. My quick check found one
+> small difference in six positions. The project's tester then checked 34 positions and found
+> 14 that differed - and in one of them the engine even picked a different best move. The
+> saved answers were filed under
 > a label that named the engine and how deep it thinks, not the memory size. So changing the
 > setting would have mixed two slightly different sets of answers under one label. The label
 > now includes the memory size. And a second setting I had only *warned* about - letting the
@@ -1555,10 +1941,22 @@ is the *hash size*: a smaller table evicts entries during the search and can tak
 different path. The fix extends the *engine version* part of the key, rather than adding a
 column, so the positions table, the cache protocol and every caller stay as they are.
 
-**Symptom / how it was found:** not a production failure - a measurement taken while building
-the engine wrapper. At depth 16 on six positions from one game, Hash = 16 MB gave `-45` where
-64, 128 and 256 MB all gave `-43`; the other five positions agreed. I logged it as an open
-question rather than acting on it; the decision was to fold it into the key.
+**Symptom / how it was found:** not a production failure - measurements, two of them.
+
+- *Mine, while building the engine wrapper:* depth 16, six positions from one game, hash
+  cleared per position, one thread. Hash = 16 MB gave `-45` where 64, 128 and 256 MB all gave
+  `-43`; the other five agreed. I logged it as an open question; the decision was to fold it
+  into the key.
+- *The tester's, afterwards, on a bigger sample:* the same settings (cleared hash, Threads=1,
+  depth 16) on 34 positions. 16 MB vs 128 MB disagreed on **14 of 34**, by up to **9 cp**, and
+  in one position **the best move changed** (`h2h3` vs `c1e3`). Threads=2 was not reproducible
+  from one run to the next.
+
+My six-position sample understated it badly: "one in six by 2 cp" became "four in ten, up to
+9 cp, and a different best move". The changed best move is the part that matters most. A move
+that matches the engine's best move is always graded `best`, so a player who played `c1e3`
+would get `best` under one hash size and be graded on arithmetic under the other - the same
+move, in the same position, at the same depth, with a different label.
 
 **Root cause:** the same one as five times before in this project - a stored value depending
 on an input its key does not name. (The others: engine version and depth in `positions`; the
@@ -1579,17 +1977,19 @@ instead of silently reusing the old ones - which is the point.
   benchmark, and then fails silently.
 - *Add a `hash_mb` column to the key*: correct, but a schema and protocol change across M2 and
   M3 for what the version string already expresses.
-- *Ignore a 2 cp difference*: it would never change a classification today, but "never
-  matters" is a claim about every future position, and the fix is one string.
+- *Ignore it as noise*: that was tempting at 2 cp. At up to 9 cp, and with a best move
+  changing, it can change a classification - and the fix is one string.
 
 **Lesson:** the third time it was caught by reasoning, this time by a measurement taken just
 to check an assumption ("hash size only affects speed"). Measuring the boring assumption is
-cheap; finding a mixed cache later is not.
+cheap; finding a mixed cache later is not. And a second lesson from the tester's re-run: a
+six-sample measurement is enough to show an effect exists, not to say how big it is.
 
 **Talking point:** "Six times now the bug has been the same: a stored value depends on an
 input its key doesn't name. The latest one I found by checking an assumption I was fairly
-sure of - that the engine's hash size only changes speed. It changed one score in six by 2
-centipawns. Tiny, but it means two hash sizes would share cache entries that disagree, so the
+sure of - that the engine's hash size only changes speed. My quick check found a 2 centipawn
+difference; a bigger re-test found 14 of 34 positions differing by up to 9 cp and one best
+move changing - and the best move decides whether a player's move is graded 'best'. So the
 hash size is now part of the engine version. And multi-threading went from a warning to an
 error, because thread timing is an input no key can capture."
 
@@ -2593,6 +2993,51 @@ shared bucket and every worker backs off together."
 `tests/test_chesscom_client.py`.
 
 <!-- end of M1 entries -->
+
+---
+
+<!-- PROCESS ENTRIES BELOW (how the work is merged and reviewed). Newest first. -->
+
+## 2026-11-12 - Merging a stack of PRs too fast merged them into each other, not into main `DONE`
+
+> **In plain English:** Big features here are split into a chain of small changes, each one
+> built on top of the one before, so each is easy to check. When the checker approved a whole
+> chain, I merged them one after another as fast as a script could go. GitHub only re-points
+> the next change at the main copy of the code a moment *after* the one below it lands. My
+> script didn't wait for that moment, so most of the changes were merged into the change
+> below them instead of into the main copy. On top of that, the script printed "Merged" for
+> every one, even the ones GitHub refused. Nothing was lost, but the main copy was
+> missing most of the work I thought was in it, for several days.
+
+**A bit deeper:** In a *stacked* set of pull requests, PR 2's target branch is PR 1's branch.
+When PR 1 merges and its branch is auto-deleted, GitHub retargets PR 2 onto `main`. That
+retarget is asynchronous. Merging PR 2 before it happens merges it into PR 1's (now dead)
+branch, and the commits only reach `main` if some later PR carries them there. The loop also
+reported success by printing after `gh pr merge`, not by checking the command's exit code.
+
+**How it was found:** after a session restart, `git log origin/main` showed only 6 of the 18
+approved merges. `gh pr list --state merged --json baseRefName` showed the rest had
+`baseRefName` set to the branch of the PR below them in the stack, e.g. `m2/4..m2/7` merged into
+`m2/3-engine-wrapper`, and `ui/6` and `ui/7` into `ui/5-progress-page` (`ui/8` went into
+`ui/7-polish`, which then carried it into `ui/5` nine seconds later).
+
+**The fix:** merging the three PRs that were still open at the bottom of each sub-stack (#19,
+#25, #43) carried everything into `main`, because each of those branches had absorbed the ones
+merged into it. A commit-by-commit check (`git merge-base --is-ancestor`) confirmed every
+reviewed commit is now on `main`; the only thing missing is one empty merge commit whose
+content arrived through the next PR. From now on: merge one PR, check the exit code and
+`gh pr view --json state`, wait until the next PR shows `base=main` and `CLEAN`, then merge it.
+
+**Talking point:** "My merge script had two bugs, and both are about trusting output instead of
+checking state. It didn't wait for GitHub to retarget each stacked PR onto main, so PRs merged
+into each other. And it printed 'Merged' unconditionally, so I believed it. I found it by
+comparing what I thought had merged with `git log` on main. The recovery was cheap because
+merge commits keep history intact - nothing had to be redone - but the lesson is that a
+success message you print yourself proves nothing."
+
+**Where:** repository history (`git log origin/main --merges`); PRs #19, #25, #43.
+
+<!-- end of process entries -->
 
 ---
 
