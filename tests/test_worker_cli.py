@@ -78,3 +78,45 @@ def test_a_missing_engine_binary_is_a_clear_error_not_a_traceback(
     assert proc.returncode == 2
     assert "worker.no_engine" in proc.stdout
     assert "Traceback" not in proc.stdout + proc.stderr
+
+
+def test_position_cache_setting_controls_whether_positions_are_stored(
+    clean_engine: Engine, database_url: str, stockfish_path: Path
+):
+    """POSITION_CACHE=full stores positions; POSITION_CACHE=off does not."""
+    # Test with caching enabled
+    insert_game(clean_engine, SCHOLARS_MATE, uuid="cached")
+    proc = _run(
+        database_url,
+        stockfish_path,
+        "--worker-id",
+        "cache-test",
+        "--enqueue-pending",
+        "--until-empty",
+        POSITION_CACHE="postgres",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    with clean_engine.connect() as c:
+        cached_positions = c.scalar(text("SELECT count(*) FROM positions"))
+    assert cached_positions > 0, "POSITION_CACHE=postgres should write positions"
+
+    # Clean positions table
+    with clean_engine.connect() as c:
+        c.execute(text("TRUNCATE positions CASCADE"))
+        c.commit()
+
+    # Test with caching disabled
+    insert_game(clean_engine, SCHOLARS_MATE, uuid="nocache")
+    proc = _run(
+        database_url,
+        stockfish_path,
+        "--worker-id",
+        "nocache-test",
+        "--enqueue-pending",
+        "--until-empty",
+        POSITION_CACHE="off",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    with clean_engine.connect() as c:
+        nocache_positions = c.scalar(text("SELECT count(*) FROM positions"))
+    assert nocache_positions == 0, "POSITION_CACHE=off should not write positions"
