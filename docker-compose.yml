@@ -119,6 +119,24 @@ services:
     stop_grace_period: 60s
     restart: unless-stopped
 
+  sync-worker:
+    profiles: ["app"]
+    image: chess-coach:dev
+    environment:
+      <<: *app-env
+      # Chess.com asks for a contactable User-Agent; set it in .env.
+      CHESSCOM_CONTACT: ${CHESSCOM_CONTACT:-you@example.com}
+    # sync-player jobs (queued by POST /players). No engine needed. One is
+    # enough: every sync worker shares one Redis rate limit of 1 request/s.
+    command: ["chess-coach-worker", "--kind", "sync"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    stop_grace_period: 30s
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:
