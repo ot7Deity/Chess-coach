@@ -23,10 +23,12 @@ import threading
 
 from chess_coach.analysis.jobs import enqueue_pending
 from chess_coach.analysis.runner import Worker
+from chess_coach.cache import build_eval_cache
 from chess_coach.config import get_settings
 from chess_coach.db import get_engine
 from chess_coach.engine import StockfishEngine
 from chess_coach.logging import get_logger, setup_logging
+from chess_coach.metrics import start_metrics_server
 
 
 def default_worker_id() -> str:
@@ -58,6 +60,13 @@ def main(argv: list[str] | None = None) -> int:
         "--enqueue-pending",
         action="store_true",
         help="first enqueue every pending game that has no job yet",
+    )
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=None,
+        help="base port for Prometheus /metrics endpoint (workers get base+index); "
+        "overrides METRICS_PORT env var; 0 disables metrics",
     )
     args = parser.parse_args(argv)
 
@@ -101,13 +110,31 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    with engine:
-        worker = Worker(db, engine, worker_id=worker_id, settings=settings)
+    # Start metrics server if requested (--metrics-port or METRICS_PORT env var)
+    metrics_port = args.metrics_port if args.metrics_port is not None else settings.metrics_port
+    metrics_server = None
+    if metrics_port > 0:
         try:
-            worker.run(max_jobs=args.max_jobs, until_empty=args.until_empty, stop=stop)
-        except KeyboardInterrupt:
-            log.warning("worker.interrupted", worker_id=worker_id)
-            return 130
+            metrics_server = start_metrics_server(port=metrics_port, worker_index=0)
+        except OSError as exc:
+            log.warning(
+                "worker.metrics_port_unavailable",
+                port=metrics_port,
+                detail=f"metrics endpoint disabled; worker will continue: {exc}",
+            )
+
+    try:
+        with engine:
+            cache = build_eval_cache(settings, db)
+            worker = Worker(db, engine, worker_id=worker_id, settings=settings, cache=cache)
+            try:
+                worker.run(max_jobs=args.max_jobs, until_empty=args.until_empty, stop=stop)
+            except KeyboardInterrupt:
+                log.warning("worker.interrupted", worker_id=worker_id)
+                return 130
+    finally:
+        if metrics_server is not None:
+            metrics_server.stop()
     return 0
 
 

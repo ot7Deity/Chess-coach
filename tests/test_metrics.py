@@ -64,8 +64,8 @@ def test_port_zero_disables_the_endpoint():
     assert metrics.start_metrics_server(port=0) is None
 
 
-def test_default_config_does_not_open_a_port(monkeypatch):
-    """Eight workers with the default config must not fight over one port."""
+def test_default_config_disables_metrics(monkeypatch):
+    """The default is 0 (disabled) to avoid port collisions between workers."""
     monkeypatch.delenv("METRICS_PORT", raising=False)
     assert Settings(_env_file=None).metrics_port == 0
 
