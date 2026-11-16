@@ -616,9 +616,9 @@ things break, and a dashboard has nothing to gain from being first."
 
 > **In plain English:** The analysis worker now records numbers that Prometheus can scrape: how
 > many games it finished, how many times it called the chess engine, and how much wall-clock
-> time the engine used. It also exposes a `/metrics` HTTP endpoint on port 8000 (or the
-> configured METRICS_PORT) so a monitoring system can collect those numbers from every worker
-> and graph them.
+> time the engine used. It also exposes a `/metrics` HTTP endpoint (default port 9100 to avoid
+> clashing with the API's port 8000) so a monitoring system can collect those numbers from
+> every worker and graph them.
 
 **A bit deeper:** The worker's main() now starts `start_metrics_server()`, which runs a tiny HTTP
 server on a background thread and listens for GET /metrics. The analysis loop records each game
@@ -628,11 +628,16 @@ outcome (complete, skipped, or error) using `GAMES_ANALYZED.labels(outcome=...)`
 
 **What changed:** Worker.main() calls `start_metrics_server()` and cleans it up in a finally
 block. CachedEvaluator records engine calls with `record_engine_eval(seconds)`. The analysis
-loop records game outcomes with `GAMES_ANALYZED.labels(outcome=...inc()`.
+loop records game outcomes with `GAMES_ANALYZED.labels(outcome=...)inc()`. METRICS_PORT now
+defaults to 9100 (was 0 / disabled) to allow metrics to be scraped out of the box without port
+conflicts.
 
 **Why:** A worker pool needs observability: are the workers busy or idle? Are they cache-hitting
 or constantly calling the engine? Is one stuck? Prometheus scrapes /metrics from each worker and
-can graph how many games/second the pool is processing, the cache hit rate, and engine load.
+can graph how many games/second the pool is processing, the cache hit rate, and engine load. The
+default port 9100 avoids collision with the API (port 8000): two services on one port is the
+same mistake as hardcoding CORS origins - a port baked into code, not a setting, breaks when
+something else claims it.
 
 **Alternatives rejected:** Logging these as text lines (messier than metrics for time series);
 storing metrics only in the database (slower than a local registry, requires querying later).
