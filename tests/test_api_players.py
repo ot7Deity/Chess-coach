@@ -190,3 +190,76 @@ def test_timestamps_have_a_z_suffix_and_whole_seconds():
     # A non-UTC aware time is converted, not relabelled.
     est = dt.timezone(dt.timedelta(hours=-5))
     assert iso_z(dt.datetime(2026, 11, 5, 21, 14, 5, tzinfo=est)) == "2026-11-06T02:14:05Z"
+
+
+# --- GET /players/{username}/report ---------------------------------------------
+
+
+def test_report_for_unknown_player_is_404(client: TestClient):
+    r = client.get("/players/nobody/report?time_class=blitz")
+    assert r.status_code == 404
+    assert r.json() == {"detail": "Player not found"}
+
+
+def test_report_without_time_class_is_422(client: TestClient, clean_engine: Engine):
+    add_player(clean_engine)
+    r = client.get("/players/deitythemenace/report")
+    assert r.status_code == 422
+    assert isinstance(r.json()["detail"], list)
+
+
+@pytest.mark.parametrize("time_class", ["invalid", "BLITZ", "blitz ", ""])
+def test_report_with_invalid_time_class_is_422(
+    client: TestClient, clean_engine: Engine, time_class: str
+):
+    add_player(clean_engine)
+    r = client.get(f"/players/deitythemenace/report?time_class={time_class}")
+    assert r.status_code == 422
+
+
+def test_report_for_daily_has_null_time_pressure(client: TestClient, clean_engine: Engine):
+    pid = add_player(clean_engine)
+    # Add a complete daily game with moves so analyzed_games > 0
+    g = add_game(clean_engine, pid, time_class="daily", analysis_status="complete")
+    from tests.report_data import add_moves
+
+    add_moves(clean_engine, g, [{"is_player_move": True, "classification": "good"}])
+    r = client.get("/players/deitythemenace/report?time_class=daily")
+    assert r.status_code == 200
+    assert r.json()["time_pressure"] is None
+
+
+def test_report_with_no_analyzed_games_has_null_sections(
+    client: TestClient, clean_engine: Engine
+):
+    pid = add_player(clean_engine)
+    # Add games but don't analyze them
+    add_game(clean_engine, pid, time_class="blitz", analysis_status="pending")
+    r = client.get("/players/deitythemenace/report?time_class=blitz")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["analyzed_games"] == 0
+    assert body["blunders_by_phase"] is None
+    assert body["time_pressure"] is None
+
+
+def test_report_has_contract_top_level_keys(client: TestClient, clean_engine: Engine):
+    pid = add_player(clean_engine)
+    add_game(clean_engine, pid, time_class="blitz", analysis_status="complete")
+    r = client.get("/players/deitythemenace/report?time_class=blitz")
+    assert r.status_code == 200
+    body = r.json()
+    # Contract requires these top-level keys
+    required_keys = {
+        "username",
+        "time_class",
+        "generated_at",
+        "games",
+        "analyzed_games",
+        "summary",
+        "rating_trend",
+        "openings",
+        "blunders_by_phase",
+        "time_pressure",
+    }
+    assert required_keys <= set(body.keys())

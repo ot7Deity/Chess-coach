@@ -61,7 +61,7 @@ exactly; a re-sync costs **2 requests**.
 **Why the details are the way they are:**
 - *404 is the standard for "resource not found."* If the username is unrecognized, there's no player resource, so 404 is right. 422 (validation error) would mean the input format was bad, but "deitythemenace" is a valid Chess.com username format.
 - *CORS origins from environment.* Hard-coded origins make deployment inflexible: the code doesn't know where the dashboard is running. An environment variable lets ops move the dashboard without code changes. Split on comma at startup so there's only one place where the list is parsed.
-- *time_pressure() enforces daily â†’ None.* The route already checks time_class != 'daily' before calling time_pressure(), but the function itself shouldn't return a misleading answer if called directly. Explicit null at function level is a contract guarantee, not just a route-level accident.
+- *time_pressure() enforces daily â†’ None.* The function checks time_class and returns None for daily, so the endpoint automatically returns null in the response. Daily games have no clock, so time pressure makes no sense.
 
 **The test, worked by hand:** POST /players for a new name queues a sync and returns 202. GET /players/{username} returns the player's status; if the name is garbage, it returns 404. GET /players/{u}/report?time_class=daily returns time_pressure=null even if analyzed_games > 0. CORS_ORIGINS env var set to "http://example.com" means only that origin is allowed, not localhost:3000.
 
@@ -69,22 +69,22 @@ exactly; a re-sync costs **2 requests**.
 
 **Where:** `src/chess_coach/api/main.py`, `src/chess_coach/api/players.py`, `src/chess_coach/config.py`, `src/chess_coach/analytics/report.py`.
 
-## 2026-11-06 - LAG window runs before classification filter to preserve move history `DONE`
+## 2026-11-06 - LAG window runs before classification filter: defensive against future changes `DONE`
 
-> **In plain English:** The time-pressure stat shows whether a player plays worse when low on the clock. To know "how much time did I have for this move?", the API looks at the clock reading from my previous move. But what counts as "previous"? If there's a move I didn't analyze (it failed or hasn't run yet), should it still be the "previous" move for calculating the current move's starting clock? The contract says yes: the start-of-move clock is always the player's previous move in time order, even if that move hasn't been analyzed yet. So the SQL has to compute the LAG window over all moves first, then filter out the unanalyzed onesâ€”not filter first and then compute LAG, which would skip the unanalyzed move and give the wrong answer.
+> **In plain English:** The time-pressure stat shows whether a player plays worse when low on the clock. It needs to know the clock reading at the start of each move, which is the clock after the previous move. On real data, every move in a complete game is analyzed and gets a classification. But if we ever queue incomplete games or skip some moves in analysis, a SQL mistake could compute wrong starting clocks. The defensive fix ensures that if unanalyzed moves ever appear, the clock history is correct.
 
-**A bit deeper:** A LAG window function looks at the previous row in an ordered set, here ordered by `ply` (move number). If a move has `classification = NULL` (not yet analyzed), filtering before LAG removes it from the window, so the next move's LAG sees the move *before* that as its previous. Now the second move's start-of-move clock is wrongâ€”it's the third-move-ago clock, not the previous-move clock. The fix: compute LAG on all moves (`all_moves` CTE has no classification filter), then add `AND classification IS NOT NULL` only to the buckets that count moves.
+**A bit deeper:** A LAG window function looks at the previous row in an ordered set. If filtering for classification happens before the LAG window, it removes unanalyzed moves from the window, so the next move's LAG sees the move before that, and the computed clock is from two moves ago, not one. The code computes LAG on all moves first (no classification filter in the CTE), then filters analyzed moves only in the buckets that count them. Today this makes no difference because every move is classified. If incomplete games were added in future, the CTE order would prevent wrong clocks.
 
-**What changed:** `analytics/report.py`, `time_pressure()` function. The `WITH mine AS (...)` CTE now filters only by `analysis_status='complete'` and `is_player_move`, **not** by `classification`. The LAG window runs over all of those moves. Then, in the outer `SELECT`, each bucket's counts add `AND classification IS NOT NULL` so they only count analyzed moves, but the start-of-move clock comes from LAG of all moves.
+**What changed:** `analytics/report.py`, `time_pressure()` function. The `WITH mine AS (...)` CTE filters only by `analysis_status='complete'` and `is_player_move`, **not** by `classification`. The LAG window runs over all of those moves. Then, in the outer `SELECT`, each bucket's counts add `AND classification IS NOT NULL` so only analyzed moves are counted, but the start-of-move clock always comes from LAG of all moves.
 
 **Why the details are the way they are:**
-- *The contract requires "player's previous move".* An unanalyzed move is still a move the player made. Its clock reading is dataâ€”the clock after that move endedâ€”even if the engine hasn't looked at it yet.
-- *LAG computed first, filter second.* This is the general rule for window functions: compute the window over the full input, then filter rows in the final SELECT. Filtering before the window breaks the window.
-- *Every bucket filters by classification.* low_moves, normal_moves, low_accurate, etc., all add `AND classification IS NOT NULL` so only analyzed moves are counted in rates and blunder counts, but the start_clock always comes from the correct previous move.
+- *Defensive, not a fix for an observed bug.* On real data every player move in a complete game is classified, so the LAG change makes no practical difference today. It guards against a case that cannot occur now but could if the architecture changes.
+- *LAG computed first, filter second.* The general rule for window functions: compute the window over the full input, then filter rows in the final SELECT. Filtering before the window would break it, should incomplete games ever exist.
+- *Every bucket filters by classification.* low_moves, normal_moves, low_accurate, etc., all add `AND classification IS NOT NULL` so only analyzed moves are counted in rates and blunder counts.
 
-**The test, worked by hand:** A game with moves 1â€“5, where move 2 is unanalyzed. LAG computes: move 1's start_clock = base time; move 2's = move 1's clock; move 3's = move 2's clock; move 4's = move 3's clock; move 5's = move 4's clock. When we filter to classification IS NOT NULL, we count moves 1, 3, 4, 5 in the buckets. Move 3 has start_clock = move 2's clock, not move 1's. Without the fix, LAG would see move 1, then move 3, and give move 3 the start_clock from move 1, which is wrong.
+**The test, worked by hand:** With hypothetical unanalyzed moves: a game with moves 1-5 where move 2 is unanalyzed. LAG computes move 3's start_clock from move 2 (correct), not move 1 (wrong). When we filter to classification IS NOT NULL, we count moves 1, 3, 4, 5 and move 3 keeps the right clock.
 
-**Talking point:** "The time-pressure stat's start-of-move clock is the player's previous move's clock. An unanalyzed move is still a moveâ€”it happened, the clock was spent. So LAG runs over all moves first, then we filter to only analyzed ones. Filtering first would skip the unanalyzed move and break the history."
+**Talking point:** “On real data, every move in a complete game is classified. The LAG-first ordering is defensive: if incomplete games ever appear, it ensures clock history is correct. If we filtered for classification before LAG, an unanalyzed move would break the history.”
 
 **Where:** `src/chess_coach/analytics/report.py`, `time_pressure()` function.
 
@@ -258,5 +258,6 @@ fencing token for leases - resetting it would let a stale worker's old lease mat
 <!-- end of M4 entries -->
 
 ---
+
 
 
