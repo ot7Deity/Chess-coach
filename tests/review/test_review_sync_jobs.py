@@ -43,14 +43,6 @@ def _status(engine: Engine) -> tuple[str, str | None]:
         return tuple(c.execute(text("SELECT sync_status, sync_error FROM players")).one())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "DISAGREEMENT: after a transient Chess.com outage sync_player marks the player "
-        "'error' and SyncWorker has no on_failed hook, so while the job waits to retry "
-        "the progress page shows 'The download from Chess.com failed' and stops polling."
-    ),
-)
 def test_a_sync_waiting_to_retry_is_not_reported_as_failed(clean_engine: Engine):
     pid = _player(clean_engine)
     with Session(clean_engine) as s, s.begin():
