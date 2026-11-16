@@ -11,10 +11,10 @@ from sqlalchemy.orm import Session
 
 from chess_coach import queue
 from chess_coach.analysis.jobs import JOB_TYPE, PRIORITY, dedupe_key, enqueue_pending_games
-from chess_coach.analysis.runner import CachedEvaluator, Worker
+from chess_coach.analysis.runner import BatchedEvaluator, CachedEvaluator, Worker
 from chess_coach.config import Settings
 from chess_coach.engine import EngineCrashed, StockfishEngine
-from chess_coach.positions import Evaluation
+from chess_coach.positions import Evaluation, fen_hash
 from tests.games import HANGS_A_BISHOP, LONG_GAME, SCHOLARS_MATE, insert_game
 
 pytestmark = [pytest.mark.postgres, pytest.mark.engine]
@@ -280,13 +280,36 @@ class RecordingCache:
     def __init__(self) -> None:
         self.store: dict[tuple, Evaluation] = {}
         self.gets = 0
+        self.engine_calls = 0
 
     def get(self, key, engine_version, depth):
         self.gets += 1
         return self.store.get((key, engine_version, depth))
 
+    def get_many(self, keys, engine_version, depth):
+        """Return hits only, keyed by fen_hash."""
+        return {
+            key: self.store[(key, engine_version, depth)]
+            for key in keys
+            if (key, engine_version, depth) in self.store
+        }
+
     def put(self, key, fen, engine_version, depth, evaluation):
         self.store.setdefault((key, engine_version, depth), evaluation)
+
+
+class CountingEngine:
+    """Engine wrapper that counts evaluate calls."""
+
+    def __init__(self, engine: StockfishEngine) -> None:
+        self.engine = engine
+        self.call_count = 0
+        self.version = engine.version
+        self.depth = engine.depth
+
+    def evaluate(self, board: chess.Board) -> Evaluation:
+        self.call_count += 1
+        return self.engine.evaluate(board)
 
 
 def test_the_evaluator_asks_the_cache_first_and_fills_it_on_a_miss(stockfish):
@@ -302,3 +325,41 @@ def test_the_evaluator_asks_the_cache_first_and_fills_it_on_a_miss(stockfish):
     cache.store[key] = sentinel
     assert evaluate(board) is sentinel, "a hit must not reach the engine"
     assert first.eval_cp != 12345
+
+
+def test_batched_evaluation_avoids_engine_calls_for_shared_positions(stockfish):
+    """Verify that shared positions across games avoid engine calls on the second game."""
+
+    # Set up a cache with pre-computed evaluations
+    cache = RecordingCache()
+    counting_engine = CountingEngine(stockfish)
+
+    # Evaluate starting position and a few positions
+    board = chess.Board()
+    # 1. e4
+    board.push_san("e4")
+    board_1 = board.copy()
+
+    # Manually add these to the cache (simulating game 1 computing them)
+    key_start = fen_hash(chess.Board())
+    key_1 = fen_hash(board_1)
+    start_eval = Evaluation(eval_cp=25, mate_in=None, best_move="e2e4")
+    eval_1 = Evaluation(eval_cp=-15, mate_in=None, best_move="c7c5")
+
+    cache.store[(key_start, stockfish.version, stockfish.depth)] = start_eval
+    cache.store[(key_1, stockfish.version, stockfish.depth)] = eval_1
+
+    # Now create a batched evaluator with these two positions pre-fetched
+    # (simulating game 2 sharing these positions with game 1)
+    keys = [key_start, key_1]
+    batched = BatchedEvaluator(counting_engine, cache, keys)
+
+    # Evaluate both positions: should not call the engine
+    result_start = batched(chess.Board())
+    result_1 = batched(board_1)
+
+    assert result_start is start_eval, "batched should return cached evaluation"
+    assert result_1 is eval_1, "batched should return cached evaluation"
+    assert (
+        counting_engine.call_count == 0
+    ), "batched evaluator should not call engine for cached positions"

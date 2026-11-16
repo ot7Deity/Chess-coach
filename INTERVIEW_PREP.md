@@ -612,6 +612,45 @@ things break, and a dashboard has nothing to gain from being first."
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-16 - Batched position lookup in per-game analysis `DONE`
+
+> **In plain English:** The worker now replays each game before it starts analyzing, writing
+> down all the chess positions it will need. It hands that whole list to the cache at once,
+> asking "give me everything you have", then analyzes the game using whatever the cache handed
+> back. If two games share positions (which is common in chess - e.g. two players of the same
+> color in the same opening), the second game costs zero engine time for the shared ones because
+> the first game already computed them.
+
+**A bit deeper:** `get_many` is a batch operation that returns a dict of all cache hits in one
+round trip to the database, instead of asking one by one (which would be 80+ round trips per
+game). `BatchedEvaluator` pre-fetches all positions, then falls back to the per-position cache
+for misses. The worker's `process` method now replays the game to collect all fen_hashes,
+prefetches them all at once, then analyzes using the batched evaluator.
+
+**What changed:** New `BatchedEvaluator` class that pre-fetches all positions before evaluation.
+Worker.process now replays each game to collect all boards, calls `get_many` once, and uses
+`BatchedEvaluator` instead of `CachedEvaluator` for the analysis.
+
+**Why:** A game's positions are often shared with others: the same opening, an endgame pattern,
+the same tactical blunder. With per-position lookups, the second game still queries the cache
+for each one. With one batch query, the second game asks once and gets all hits together.
+Measurements from the M3 microbenchmark: 80 positions one-by-one is 46 ms (Redis) or 306 ms
+(Postgres); one `get_many` is 3 ms (Redis) or 7 ms (Postgres) - **15x and 47x faster**.
+
+**Alternatives rejected:** Keeping per-position lookups and accepting 80 round trips per game;
+storing a game-level cache dict before the analysis instead of prefetching from the persistent
+cache (misses the second game's win).
+
+**Talking point:** "The microbenchmark showed that batching a game's 80 position lookups from
+one-by-one to a single `get_many` query is 15 times faster via Redis and 47 times faster via
+Postgres. I added a BatchedEvaluator that prefetches all positions before analyzing, so when
+two games share positions, the second game costs zero engine time for the shared ones."
+
+**Where:** `src/chess_coach/analysis/runner.py` (`BatchedEvaluator`, Worker.process),
+`tests/test_runner.py` (test for shared positions across games).
+
+---
+
 ## 2026-11-16 - Wired the position cache into the worker `DONE`
 
 > **In plain English:** The cache is built, but nothing was using it. I plugged it into the

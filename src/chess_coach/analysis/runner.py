@@ -30,7 +30,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from chess_coach import queue
-from chess_coach.analysis.game import BadGame, MoveRow, analyze_game
+from chess_coach.analysis.game import BadGame, MoveRow, analyze_game, replay
 from chess_coach.analysis.jobs import JOB_TYPE
 from chess_coach.config import Settings
 from chess_coach.engine import StockfishEngine
@@ -65,6 +65,28 @@ class CachedEvaluator:
             key, normalize_fen(board), self.engine.version, self.engine.depth, evaluation
         )
         return evaluation
+
+
+class BatchedEvaluator:
+    """Batch cache lookup, then per-position cache+engine falls back for misses.
+
+    Fetches all positions at once with `get_many` before any evaluation, so
+    shared positions between games require zero engine calls on the second game.
+    """
+
+    def __init__(self, engine: StockfishEngine, cache: EvalCache | None, keys: list[bytes]) -> None:
+        self.engine = engine
+        self.cache: EvalCache = cache if cache is not None else NullCache()
+        # Pre-fetch all positions at once: dict of key -> Evaluation
+        self.prefetch = self.cache.get_many(keys, engine.version, engine.depth)
+        # Per-position fallback: cache misses will be evaluated and written
+        self.fallback = CachedEvaluator(engine, cache)
+
+    def __call__(self, board: chess.Board) -> Evaluation:
+        key = fen_hash(board)
+        if key in self.prefetch:
+            return self.prefetch[key]
+        return self.fallback(board)
 
 
 @dataclass
@@ -200,14 +222,24 @@ class Worker:
             if game is None:
                 bound.info("job.already_analysed")
                 return
-            rows = analyze_game(
-                game.pgn,
-                start_fen=game.start_fen,
-                player_color=game.color,
-                time_control=game.time_control,
-                evaluate=self.evaluate,
-                on_position=_Heartbeat(self.db, lease, self.heartbeat_interval),
-            )
+            # Batch lookup: replay the game first to collect all fen_hashes,
+            # prefetch them all at once, then evaluate only misses.
+            plies, final = replay(game.pgn, game.start_fen)
+            if not plies:
+                rows = []
+            else:
+                boards = [p.board_before for p in plies] + [final]
+                keys = [fen_hash(board) for board in boards]
+                evaluator = BatchedEvaluator(self.engine, self.evaluate.cache, keys)
+                # Now re-replay and analyze using the batched evaluator
+                rows = analyze_game(
+                    game.pgn,
+                    start_fen=game.start_fen,
+                    player_color=game.color,
+                    time_control=game.time_control,
+                    evaluate=evaluator,
+                    on_position=_Heartbeat(self.db, lease, self.heartbeat_interval),
+                )
             self._finish(lease, game_id, rows)
         except LeaseLost:
             # Reaped while working - presumably by someone who thought we were
