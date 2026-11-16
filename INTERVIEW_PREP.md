@@ -969,6 +969,22 @@ things break, and a dashboard has nothing to gain from being first."
 
 ---
 
+## 2026-11-16 - Wired metrics recording into the analysis pipeline `DONE`
+
+> **In plain English:** Prometheus metrics were defined but not recorded - the pipeline didn't tell the metrics system when work happened. I wired the recording into the actual evaluation and game-completion paths, so now engine time, positions evaluated, and games analyzed show up in /metrics.
+
+**A bit deeper:** `CachedEvaluator.__call__()` now records `ENGINE_SECONDS` and `POSITIONS_EVALUATED` when it actually sends a position to Stockfish (cache miss). `Worker._finish()` records `GAMES_ANALYZED` with outcome="complete" after a successful game commit. The metrics framework is in place with a Prometheus /metrics endpoint on each worker process.
+
+**What changed:** `CachedEvaluator.__call__()` calls `metrics.ENGINE_SECONDS.inc()` and `metrics.POSITIONS_EVALUATED.inc()` on cache misses, computed_ms converted to seconds. `Worker._finish()` calls `metrics.GAMES_ANALYZED.labels(outcome="complete").inc()` after the commit.
+
+**Why:** Metrics must be recorded at the actual event: when the engine runs (not on cache hits), when a game finishes. Recording elsewhere or later means dashboards can't see real-time progress. This provides visibility into worker behavior: cache effectiveness, engine load, and job throughput.
+
+**Talking point:** "Engine time and games analyzed weren't showing up in Prometheus because the metrics were defined but nothing recorded them. I wired recording into the cache misses and game completion, so dashboards can now track work in real time."
+
+**Where:** `src/chess_coach/analysis/runner.py` (CachedEvaluator and Worker._finish), `src/chess_coach/metrics.py` (counter definitions).
+
+---
+
 ## 2026-11-16 - Default metrics disabled (METRICS_PORT=0) to avoid worker-vs-worker collision `DONE`
 
 > **In plain English:** Each worker can run a metrics server on a port so external tools can scrape stats. Early design had a default port (9100) that multiple workers would fight over, crashing the second worker. The fix: metrics are disabled by default (port 0), and the bench harness assigns each worker a unique port when needed (base + worker index).

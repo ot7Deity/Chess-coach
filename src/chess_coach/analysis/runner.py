@@ -25,7 +25,7 @@ from sqlalchemy import Engine, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from chess_coach import queue
+from chess_coach import metrics, queue
 from chess_coach.analysis.game import BadGame, MoveRow, analyze_game, replay
 from chess_coach.analysis.jobs import JOB_TYPE
 from chess_coach.config import Settings
@@ -79,6 +79,10 @@ class CachedEvaluator:
         # Miss: evaluate and cache
         evaluation = self.engine.evaluate(board)
         self.engine_ms += evaluation.compute_ms or 0
+        # Record engine time and positions evaluated
+        engine_seconds = (evaluation.compute_ms or 0) / 1000.0
+        metrics.ENGINE_SECONDS.inc(engine_seconds)
+        metrics.POSITIONS_EVALUATED.inc()
         self.cache.put(
             key, normalize_fen(board), self.engine.version, self.engine.depth, evaluation
         )
@@ -214,6 +218,8 @@ class Worker(JobRunner):
                     engine_ms=engine_ms,
                 )
             )
+        # Record metrics after successful commit
+        metrics.GAMES_ANALYZED.labels(outcome="complete").inc()
 
 
 def _game_id(payload: dict) -> int | None:
