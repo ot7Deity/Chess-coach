@@ -53,6 +53,24 @@ exactly; a re-sync costs **2 requests**.
 
 <!-- M4 ENTRIES BELOW (report SQL, report and sync API). Newest first. -->
 
+## 2026-11-16 - Bug: re-adding a player showed 'failed' forever `DONE`
+
+> **In plain English:** The website lets you re-add a player—say, to retry a download that failed. When you did, the page showed "The download from Chess.com failed" with the old error, and it never changed even after the queued retry succeeded. The page keeps checking for new work while there's work to do, but once a sync fails the page stops checking, so it missed the retry happening in the background. The bug was in the API: it queued the retry but didn't tell the page "oh, that failed sync is now pending again."
+
+**A bit deeper:** A sync worker claims a job, tries to fetch from Chess.com, and if it fails sets `players.sync_status = 'error'` and the error message. When you POST the same username again, the API calls `enqueue_sync` to re-arm the old job back to `pending`. But the response's `sync_status` was still `error` because the endpoint returned it from memory without refreshing from the database. The page saw "error" and stopped polling. A tester caught it by reading `Progress.tsx`'s polling rule against the API response spec and seeing they could diverge.
+
+**How it was found:** The tester read Progress.tsx and noticed its polling rule: "poll while there's work, stop once work is done." Then checked what the API says in both cases: (1) sync failed, page stops; (2) POST to retry, then GET — does the page see the job is pending again? The API still said "error", so the page would never poll again even though the work restarted.
+
+**Root cause:** The fix lives in the API, not the UI, because another browser tab's GET would still see the stale error forever. The endpoint had to update `sync_status` and `sync_error` in the same transaction as the job re-arm.
+
+**Fix:** In `add_player`, after `enqueue_sync` returns a job id (meaning a job was re-armed): `UPDATE players SET sync_status = 'pending', sync_error = NULL WHERE id = :id AND sync_status <> 'syncing'`. The last condition prevents clobbering an in-progress sync if one is already running. If `enqueue_sync` returns None (a job was already queued or running), leave `sync_status` alone; the sync worker owns it.
+
+**Talking point:** "The API queued a retry of a failed sync but didn't update sync_status, so the response still said 'error'. The UI's polling rule (stop when work is done) was correct; the API's response was stale. The fix is atomic: when the API re-arms a job, it atomically updates status in the same transaction, so a GET after the POST always sees the queued work."
+
+**Where:** `src/chess_coach/api/players.py` (`add_player`), `tests/test_api_players.py`.
+
+---
+
 ## 2026-11-06 - Asking for a sync is a queued job, and a re-sync re-arms the old one `DONE`
 
 > **In plain English:** When someone types their username into the website, the website
