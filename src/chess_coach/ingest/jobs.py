@@ -152,6 +152,27 @@ class SyncWorker(JobRunner):
             analysis_enqueued=queued,
         )
 
+    def on_failed(self, session: Session, lease: Lease, status: str) -> None:
+        """A sync failed: update sync_status based on what comes next.
+
+        If the job will retry (status='pending'), reset sync_status to 'pending'
+        so the progress page keeps polling. If the job is dead-lettered (status='dead'),
+        leave sync_status='error' (the last attempt's result).
+        """
+        player_id = lease.payload.get("player_id")
+        if player_id is None:
+            return
+        if status == "pending":
+            # Another process (e.g. the chess-coach-sync CLI) may be mid-sync and
+            # owns 'syncing'; same guard as add_player.
+            session.execute(
+                text(
+                    "UPDATE players SET sync_status = 'pending' "
+                    "WHERE id = :id AND sync_status <> 'syncing'"
+                ),
+                {"id": int(player_id)},
+            )
+
     def on_reaped(self, session: Session, job: queue.ReapedJob) -> None:
         """A sync worker died mid-sync: the player is no longer 'syncing'."""
         player_id = job.payload.get("player_id")
