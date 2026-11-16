@@ -112,3 +112,33 @@ jobs:
         env:
           STOCKFISH_PATH: vendor/stockfish/stockfish
         run: uv run pytest --cov=chess_coach --cov-report=term-missing
+
+  # The dashboard. Independent of the Python jobs: it builds against the mock
+  # data layer (NEXT_PUBLIC_API_URL unset), so it needs no API, database or
+  # engine to prove it compiles, lints and typechecks.
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
