@@ -951,6 +951,24 @@ things break, and a dashboard has nothing to gain from being first."
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-16 - Bench measures engine time per game (independent of cache mode) `DONE`
+
+> **In plain English:** The benchmark measures two things about engine time: (1) how much engine work this round actually did (time reported by each game's analysis), and (2) how much engine work all plies' positions *would* have cost if we had to compute them all (the cost without cache). The difference shows how much time the cache saved.
+
+**A bit deeper:** Each game records its engine_ms (actual engine time spent analyzing that game, independent of cache setting). The bench harness sums games.engine_ms to get the round's true engine time. For the POSITION_CACHE=off baseline, games.engine_ms is the full time since nothing was cached. For cached runs, games.engine_ms is only misses. Engine_seconds_spent now reads games.engine_ms instead of positions.compute_ms, so the baseline (with no positions table) correctly reports the engine time it spent.
+
+**What changed:** bench/harness.py measure() reads `sum(games.engine_ms)` instead of `sum(positions.compute_ms)`. The function still computes "without_ms" (cost of all positions' compute_ms if they had all been computed) but now engine_seconds_spent is the actual engine time per game.
+
+**Why:** With POSITION_CACHE=off, positions aren't stored, so sum(positions.compute_ms) is 0 even though the engine worked for hours. games.engine_ms records the actual engine time the Worker spent, so sum(games.engine_ms) is the round's true cost regardless of cache setting. The baseline now reports real engine seconds (the tester's xfail_strict test passes without xfail).
+
+**Alternatives rejected:** Recording engine_ms in every positions row would duplicate data and add write overhead. Summing workers' own engine_ms counters would require aggregating from worker logs (unreliable). games.engine_ms is the source of truth.
+
+**Talking point:** "The bench baseline (POSITION_CACHE=off) now reports the actual engine time it spent. I changed the measurement to sum games.engine_ms (what each game's analysis cost) instead of positions.compute_ms (which only exists if positions were stored), so every run reports real engine time regardless of cache mode."
+
+**Where:** `bench/harness.py`, measure() function; `src/chess_coach/models.py` and worker persist games.engine_ms.
+
+---
+
 ## 2026-11-16 - Default metrics disabled (METRICS_PORT=0) to avoid worker-vs-worker collision `DONE`
 
 > **In plain English:** Each worker can run a metrics server on a port so external tools can scrape stats. Early design had a default port (9100) that multiple workers would fight over, crashing the second worker. The fix: metrics are disabled by default (port 0), and the bench harness assigns each worker a unique port when needed (base + worker index).

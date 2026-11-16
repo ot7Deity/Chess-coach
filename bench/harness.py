@@ -259,13 +259,19 @@ def measure(
             ).all()
             search = (groups[0][0], groups[0][1]) if len(groups) == 1 else None
 
-        evals, spent_ms = conn.execute(
+        evals, _positions_spent_ms = conn.execute(
             text(
                 "SELECT count(*), coalesce(sum(compute_ms), 0) FROM positions "
                 "WHERE computed_at >= :since"
             ),
             ids,
         ).one()
+
+        # Engine time spent per game, independent of cache setting
+        game_engine_ms = conn.execute(
+            text("SELECT coalesce(sum(engine_ms), 0) FROM games WHERE id = ANY(:ids)"),
+            ids,
+        ).scalar_one()
 
         # Saved is computed over ply positions only, on both sides: what every
         # ply's position costs (as if nothing were cached) minus what was
@@ -313,7 +319,7 @@ def measure(
         lookups=lookups,
         engine_evaluations=evals,
         cache_hit_rate=hit_rate,
-        engine_seconds_spent=spent_ms / 1000,
+        engine_seconds_spent=game_engine_ms / 1000,
         engine_seconds_without_cache=without_ms / 1000,
         engine_seconds_saved=max(0, without_ms - spent_on_plies_ms) / 1000,
         search=[search[0], str(search[1])] if search else None,
