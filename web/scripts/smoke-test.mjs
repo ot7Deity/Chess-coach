@@ -16,6 +16,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const webDir = path.resolve(__dirname, "..");
 const projectRoot = path.resolve(__dirname, "../..");
+const FORCE_STUB_500 = process.argv.includes("--stub-500");
 
 let stubServer = null;
 let nextApp = null;
@@ -61,7 +62,12 @@ async function waitForPort(port, maxWaitMs = 10000) {
 function startStubServer() {
   return new Promise((resolve, reject) => {
     console.log(`Starting stub API on port ${STUB_PORT}...`);
-    stubServer = spawn("node", [path.join(__dirname, "stub-api.mjs"), String(STUB_PORT)], {
+    const args = [path.join(__dirname, "stub-api.mjs"), String(STUB_PORT)];
+    if (FORCE_STUB_500) {
+      args.push("--force-500");
+      console.log("[Note: stub will return 500 for all requests]");
+    }
+    stubServer = spawn("node", args, {
       stdio: "pipe",
       cwd: projectRoot,
     });
