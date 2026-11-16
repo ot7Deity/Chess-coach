@@ -270,9 +270,7 @@ def test_report_for_daily_has_null_time_pressure(client: TestClient, clean_engin
     assert r.json()["time_pressure"] is None
 
 
-def test_report_with_no_analyzed_games_has_null_sections(
-    client: TestClient, clean_engine: Engine
-):
+def test_report_with_no_analyzed_games_has_null_sections(client: TestClient, clean_engine: Engine):
     pid = add_player(clean_engine)
     # Add games but don't analyze them
     add_game(clean_engine, pid, time_class="blitz", analysis_status="pending")
