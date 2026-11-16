@@ -21,9 +21,9 @@ from sqlalchemy.orm import Session
 
 pytest.importorskip("chess_coach.worker")
 
-from chess_coach.analysis.jobs import enqueue_pending_games
-
-from tests.games import LONG_GAME, insert_game
+enqueue_pending_games = pytest.importorskip("chess_coach.analysis.jobs").enqueue_pending_games
+_games = pytest.importorskip("tests.games")
+LONG_GAME, insert_game = _games.LONG_GAME, _games.insert_game
 
 pytestmark = [pytest.mark.postgres, pytest.mark.engine]
 

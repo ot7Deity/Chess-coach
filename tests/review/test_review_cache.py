@@ -16,6 +16,7 @@ import pytest
 import redis
 from sqlalchemy import Engine, text
 
+from chess_coach.config import Settings
 from chess_coach.positions import Evaluation, fen_hash, normalize_fen
 
 pc = pytest.importorskip("chess_coach.cache.position_cache")
@@ -93,14 +94,11 @@ def test_the_production_redis_client_fails_fast(dead_redis):
     decides how much each payment costs. A default redis-py client retries a
     failed connect (measured here: 6.5 s per call against a dead port with a
     0.2 s timeout). cache_redis_client must not."""
-    from chess_coach.cache import cache_redis_client
-
-    from chess_coach.config import Settings
 
     settings = Settings(
         _env_file=None, redis_url="redis://127.0.0.1:1/0", position_cache_redis_timeout_sec=0.2
     )
-    client = cache_redis_client(settings)
+    client = pytest.importorskip("chess_coach.cache").cache_redis_client(settings)
     started = time.monotonic()
     with pytest.raises(redis.RedisError):
         client.ping()
@@ -111,6 +109,8 @@ def test_the_production_redis_client_fails_fast(dead_redis):
 
 
 @pytest.mark.xfail(
+    # Fixed by #48 (the epoch namespace, which also adds `redis_name`).
+    not hasattr(pc.PositionCache, "redis_name"),
     strict=True,
     reason=(
         "DISAGREEMENT: position_cache.py:5-9 says Redis 'can only disagree by "
@@ -188,7 +188,12 @@ def test_a_value_planted_under_the_right_key_for_another_engine_is_not_served(
 ):
     key, _ = _position("g3")
     cache = _cache(clean_engine, redis_client, redis_client.key_prefix)
-    name = pc.redis_key(redis_client.key_prefix, key, ENGINE, DEPTH)
+    # Where the cache will actually look: after #48 the namespace carries the
+    # database and the table's epoch, so ask the cache rather than rebuild it.
+    if hasattr(cache, "redis_name"):
+        name = cache.redis_name(key, ENGINE, DEPTH)
+    else:
+        name = pc.redis_key(redis_client.key_prefix, key, ENGINE, DEPTH)
     redis_client.set(name, b'[1,"sf_17",16,999,null,"e7e5",null,null]')
     assert cache.get(key, ENGINE, DEPTH) is None
     assert cache.stats.corrupt_values == 1

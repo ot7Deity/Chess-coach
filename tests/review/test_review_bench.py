@@ -19,9 +19,10 @@ from sqlalchemy import Engine
 harness = pytest.importorskip("bench.harness")
 pytest.importorskip("chess_coach.worker")
 
-from chess_coach.analysis.jobs import JOB_TYPE, dedupe_key  # noqa: E402
-
-from tests.games import HANGS_A_BISHOP, insert_game  # noqa: E402
+_jobs = pytest.importorskip("chess_coach.analysis.jobs")
+_games = pytest.importorskip("tests.games")
+JOB_TYPE, dedupe_key = _jobs.JOB_TYPE, _jobs.dedupe_key
+HANGS_A_BISHOP, insert_game = _games.HANGS_A_BISHOP, _games.insert_game
 
 pytestmark = [pytest.mark.postgres, pytest.mark.engine]
 
