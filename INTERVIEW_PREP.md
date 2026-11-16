@@ -32,14 +32,18 @@ milestones, done in parallel on different branches, merges without conflicts.
 
 ## The 60-second pitch
 
-> "It pulls my whole Chess.com history - about 4,000 games - and runs every position through
-> Stockfish to find where I actually lose rating. The interesting part isn't the chess, it's
-> that analyzing 220,000 positions is hours of CPU time, so it's a job queue feeding a pool
-> of worker processes, with a position-level cache in front of the engine, and an API that
-> only ever reads finished results so the site stays fast while the backlog drains."
+> "Given any Chess.com username, it pulls that player's whole history - for my own account,
+> about 4,500 games and 220,000 positions - and runs every position through Stockfish to find
+> where they actually lose rating. The interesting part isn't the chess, it's that analyzing
+> a history that size is hours of CPU time, so it's a job queue feeding a pool of worker processes, with a
+> position-level cache in front of the engine, and an API that only ever reads finished results
+> so the site stays fast while the backlog drains."
 
 Numbers to fill in as they are measured: games analyzed, cache hit rate, games/minute at
 1/2/4/8 workers, engine seconds saved by the cache.
+
+The app works for any Chess.com username; `deitythemenace` (the author's account) is the
+acceptance-test account because its totals can be checked against Chess.com's own profile.
 
 Measured so far: **4,550 games** ingested for `deitythemenace` across 53 months in 55 seconds
 at one request per second; win/loss/draw per time control matches Chess.com's own totals
@@ -47,13 +51,41 @@ exactly; a re-sync costs **2 requests**.
 
 ---
 
-<!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
+<!-- M4 ENTRIES BELOW (report SQL, report and sync API). Newest first. -->
 
-<!-- end of M3 entries -->
+## 2026-11-16 - Bug: a merge quietly deleted 1,670 lines of documentation `DONE`
+
+> **In plain English:** While restacking the branches, a merge of m4/3 into m4/4 needed to resolve a conflict in INTERVIEW_PREP.md. I took m4/4's version without noticing it was a short stub, not the full file. The result silently dropped all the UI dashboard entries, all earlier M4 entries, and all M2 entries—1,670 lines of design decisions. The PR diff made it obvious only after the fact: a PR that should add ~40 lines showed -4,099 lines. The tester found it by looking at the line diff; tests passed because documentation has no tests.
+
+**How it was found:** The tester saw a PR diff stat showing 4,099 lines removed and asked what happened. A conflict was resolved by keeping m4/4's short version wholesale, dropping everything else.
+
+**Root cause:** When resolving a merge conflict by taking one side, I didn't verify that the conflict was truly exclusive (m4/4 had newer entries) instead of one side being incomplete (m4/4 had *only* its own entries, missing earlier ones).
+
+**Fix:** Restore from m4/3, then re-add m4/4's new entry at the top. For INTERVIEW_PREP conflicts going forward: never take one side wholesale; keep both sides' entries, with newer ones first in each section.
+
+**Lesson:** A large diff stat against the parent (not comparing two sides of a conflict) is a red flag for a merge resolution mistake. Tests don't catch documentation loss. Check the diff yourself when conflict resolution touches vital files.
+
+**Where:** This entry is the fix.
 
 ---
 
-<!-- M2 ENTRIES BELOW (job queue, Stockfish, analysis worker). Newest first. -->
+## 2026-11-16 - Bug: re-adding a player showed 'failed' forever `DONE`
+
+> **In plain English:** The website lets you re-add a player—say, to retry a download that failed. When you did, the page showed "The download from Chess.com failed" with the old error, and it never changed even after the queued retry succeeded. The page keeps checking for new work while there's work to do, but once a sync fails the page stops checking, so it missed the retry happening in the background. The bug was in the API: it queued the retry but didn't tell the page "oh, that failed sync is now pending again."
+
+**A bit deeper:** A sync worker claims a job, tries to fetch from Chess.com, and if it fails sets `players.sync_status = 'error'` and the error message. When you POST the same username again, the API calls `enqueue_sync` to re-arm the old job back to `pending`. But the response's `sync_status` was still `error` because the endpoint returned it from memory without refreshing from the database. The page saw "error" and stopped polling. A tester caught it by reading `Progress.tsx`'s polling rule against the API response spec and seeing they could diverge.
+
+**How it was found:** The tester read Progress.tsx and noticed its polling rule: "poll while there's work, stop once work is done." Then checked what the API says in both cases: (1) sync failed, page stops; (2) POST to retry, then GET — does the page see the job is pending again? The API still said "error", so the page would never poll again even though the work restarted.
+
+**Root cause:** The fix lives in the API, not the UI, because another browser tab's GET would still see the stale error forever. The endpoint had to update `sync_status` and `sync_error` in the same transaction as the job re-arm.
+
+**Fix:** In `add_player`, after `enqueue_sync` returns a job id (meaning a job was re-armed): `UPDATE players SET sync_status = 'pending', sync_error = NULL WHERE id = :id AND sync_status <> 'syncing'`. The last condition prevents clobbering an in-progress sync if one is already running. If `enqueue_sync` returns None (a job was already queued or running), leave `sync_status` alone; the sync worker owns it.
+
+**Talking point:** "The API queued a retry of a failed sync but didn't update sync_status, so the response still said 'error'. The UI's polling rule (stop when work is done) was correct; the API's response was stale. The fix is atomic: when the API re-arms a job, it atomically updates status in the same transaction, so a GET after the POST always sees the queued work."
+
+**Where:** `src/chess_coach/api/players.py` (`add_player`), `tests/test_api_players.py`.
+
+---
 
 ## 2026-11-06 - Bug: with the cache switched off, engine time was recorded nowhere `DONE`
 
@@ -95,1661 +127,7 @@ column with and without the cache."
 (`CachedEvaluator.engine_ms`, `Worker._finish`), `src/chess_coach/models.py`,
 `tests/test_runner.py::test_engine_time_is_recorded_per_game_whether_or_not_there_is_a_cache`.
 
-## 2026-11-06 - The sixth time: the engine's memory size was a hidden input to the cache `DONE`
-
-> **In plain English:** The chess engine has a setting for how much scratch memory it may
-> use while thinking. I had assumed that only changes how *fast* it thinks, not *what* it
-> concludes. I measured it anyway, and it does change the answer. My quick check found one
-> small difference in six positions. The project's tester then checked 34 positions and found
-> 14 that differed - and in one of them the engine even picked a different best move. The
-> saved answers were filed under
-> a label that named the engine and how deep it thinks, not the memory size. So changing the
-> setting would have mixed two slightly different sets of answers under one label. The label
-> now includes the memory size. And a second setting I had only *warned* about - letting the
-> engine think on several processor cores at once - is now refused outright, because it
-> makes the answer change from run to run, and no label can fix that.
-
-**A bit deeper:** The cache key is (position, engine version, depth). With the hash table
-cleared before every search, the remaining engine setting that changes a fixed-depth result
-is the *hash size*: a smaller table evicts entries during the search and can take a slightly
-different path. The fix extends the *engine version* part of the key, rather than adding a
-column, so the positions table, the cache protocol and every caller stay as they are.
-
-**Symptom / how it was found:** not a production failure - measurements, two of them.
-
-- *Mine, while building the engine wrapper:* depth 16, six positions from one game, hash
-  cleared per position, one thread. Hash = 16 MB gave `-45` where 64, 128 and 256 MB all gave
-  `-43`; the other five agreed. I logged it as an open question; the decision was to fold it
-  into the key.
-- *The tester's, afterwards, on a bigger sample:* the same settings (cleared hash, Threads=1,
-  depth 16) on 34 positions. 16 MB vs 128 MB disagreed on **14 of 34**, by up to **9 cp**, and
-  in one position **the best move changed** (`h2h3` vs `c1e3`). Threads=2 was not reproducible
-  from one run to the next.
-
-My six-position sample understated it badly: "one in six by 2 cp" became "four in ten, up to
-9 cp, and a different best move". The changed best move is the part that matters most. A move
-that matches the engine's best move is always graded `best`, so a player who played `c1e3`
-would get `best` under one hash size and be graded on arithmetic under the other - the same
-move, in the same position, at the same depth, with a different label.
-
-**Root cause:** the same one as five times before in this project - a stored value depending
-on an input its key does not name. (The others: engine version and depth in `positions`; the
-CI engine cache's probe and host; the engine image's CPU; the games table's player; and the
-engine's transposition table and halfmove clock.)
-
-**Fix:** `StockfishEngine.version` is now `sf_18-h128` (release plus hash size), built by
-`engine_version(name, hash_mb=...)`; the plain release (`sf_18`) is kept as `.release` for
-logs. `ENGINE_THREADS` other than 1 is now rejected - by `Settings` and by the wrapper -
-instead of logging a warning, because multi-threaded search gave -186 and -213 for one
-position on two runs, and thread timing is not something any key can name.
-
-**Cost:** none at run time. Changing `ENGINE_HASH_MB` now starts a fresh set of cache entries
-instead of silently reusing the old ones - which is the point.
-
-**Alternatives rejected:**
-- *Pin the hash size and document it*: a rule that holds until someone tunes memory for a
-  benchmark, and then fails silently.
-- *Add a `hash_mb` column to the key*: correct, but a schema and protocol change across M2 and
-  M3 for what the version string already expresses.
-- *Ignore it as noise*: that was tempting at 2 cp. At up to 9 cp, and with a best move
-  changing, it can change a classification - and the fix is one string.
-
-**Lesson:** the third time it was caught by reasoning, this time by a measurement taken just
-to check an assumption ("hash size only affects speed"). Measuring the boring assumption is
-cheap; finding a mixed cache later is not. And a second lesson from the tester's re-run: a
-six-sample measurement is enough to show an effect exists, not to say how big it is.
-
-**Talking point:** "Six times now the bug has been the same: a stored value depends on an
-input its key doesn't name. The latest one I found by checking an assumption I was fairly
-sure of - that the engine's hash size only changes speed. My quick check found a 2 centipawn
-difference; a bigger re-test found 14 of 34 positions differing by up to 9 cp and one best
-move changing - and the best move decides whether a player's move is graded 'best'. So the
-hash size is now part of the engine version. And multi-threading went from a warning to an
-error, because thread timing is an input no key can capture."
-
-**Where:** `src/chess_coach/engine.py` (`engine_version`, `StockfishEngine.version` and
-`.release`), `src/chess_coach/config.py`, `.env.example`, `tests/test_engine.py`,
-`tests/test_config.py`.
-
-## 2026-11-06 - The container proved the "probe at start" decision on my own laptop `DONE`
-
-> **In plain English:** Earlier I decided the chess engine must be chosen when the
-> container starts, on the machine that runs it, not when the package is built - because the
-> fastest version crashes on processors that lack one special feature. I expected that to
-> matter on *other* machines. The first time I ran the container on my own laptop, the
-> fastest version crashed right there. My laptop's processor has the feature, but the little
-> virtual computer Docker runs containers in doesn't pass it through. The installer noticed
-> the crash, stepped down one level, and the worker started normally. If the engine had been
-> picked while building the package on this same laptop, every container would have crashed.
-
-**A bit deeper:** On Windows, Docker Desktop runs Linux containers inside a lightweight
-*virtual machine* (WSL 2). A VM can expose a subset of the host CPU's *instruction set
-extensions*. Here the host (Intel Core Ultra 7 155H) supports AVX-VNNI, the VM did not
-expose it, and the AVX-VNNI build of Stockfish died with an illegal instruction (exit -4).
-The fallback chain picked the AVX2 build.
-
-**What changed:** a `Dockerfile` (one image for the API, migrations and the worker; Stockfish
-deliberately absent), `docker/entrypoint.sh` (runs `tools/fetch_stockfish.py`, then `exec`s
-the command), and `migrate` / `api` / `worker` services in `docker-compose.yml` behind an
-`app` profile, with the engine in a named `vendor` volume.
-
-**What I ran, and what it printed** (first start, empty volume):
-
-```
-[fetch-stockfish] trying stockfish-ubuntu-x86-64-avxvnni.tar (109 MiB)
-[fetch-stockfish]   smoke test exited -4 (wrong SIMD build for this CPU)
-[fetch-stockfish] trying stockfish-ubuntu-x86-64-avx2.tar (109 MiB)
-[fetch-stockfish]   OK - Stockfish 18 (searched both evaluation networks)
-worker.start depth=8 engine=sf_18
-```
-
-The second start re-probed the binary already in the volume ("nothing to do"), and the whole
-`docker run` took 3.6 s. Then the container analysed the 90-ply test game at depth 12 in
-6.3 s against the test database: `complete`, 90 moves. The engine version is `sf_18` on the
-host's AVX-VNNI build and the container's AVX2 build alike, which is what lets their cached
-evaluations be shared.
-
-**Why the details are the way they are:**
-
-- *The `app` profile.* `docker compose up -d` is what every developer and the tests already
-  run for Postgres and Redis. Adding the app without a profile would quietly start a second
-  worker competing for the same queue as the ones on the host.
-- *`flock` around the installer.* `--scale worker=4` starts four containers at once on one
-  shared volume; without a lock, four installers would download into the same directory at
-  once. With it, the first downloads and the rest wait, then find a verified binary.
-- *Only the worker probes.* The API and migrations never touch the engine, so they set
-  `FETCH_STOCKFISH=0` and start in a second instead of waiting on a download.
-- *Dependencies are a separate layer* from the source, so a code change rebuilds in seconds;
-  uv is pinned to the version the lock file is maintained with; the app runs as a non-root
-  user; `stop_grace_period: 60s` gives SIGTERM time to finish the current game.
-
-**Alternatives rejected:** the ones in the original `DECIDED` entry (fetch at build time, bake
-the baseline build, one image per SIMD level) - and this run is the evidence for that call:
-build-time selection on this very laptop would have produced an image that crashes on this
-very laptop.
-
-**Talking point:** "I'd decided the engine build must be picked on the machine that runs it,
-because an image moves between CPUs. I assumed that mattered for other machines. The first
-container I ran on my own laptop proved it: the host CPU has AVX-VNNI, Docker's VM doesn't
-expose it, the fast build died with an illegal instruction, and the probe fell back to AVX2.
-A build-time choice would have shipped an image that crashes on the machine that built it."
-
-**Where:** `Dockerfile`, `docker/entrypoint.sh`, `docker-compose.yml`. The original decision is
-the "engine is probed at container start" entry in the pre-M1 block.
-
-## 2026-11-06 - M2: kill a worker mid-game, and the game is still analysed exactly once `DONE`
-
-> **In plain English:** This is the test the whole second milestone was aiming at. I start
-> a real worker, let it get properly into analysing a 90-move game, and then kill it
-> instantly - no warning, no chance to tidy up, like pulling the plug on a computer. Then I
-> start a second worker and tell it to finish whatever is left. It has to notice the first
-> worker has gone quiet, take over the game, analyse it from the start, and stop. At the end
-> the game has exactly 90 moves saved - not 0, not 180 - it is marked finished once, and the
-> logs show only the second worker ever finished it. It took about 8 seconds from the first
-> worker's last sign of life to a finished game, and it passed on every one of nine runs.
-
-**A bit deeper:** The test uses real *processes* (not threads pretending), a real Postgres and
-a real Stockfish. "Killed hard" means `TerminateProcess` on Windows (`SIGKILL` on Linux): the
-process gets no chance to run any cleanup code, which is what a crash, an out-of-memory kill
-or a power cut looks like. Recovery then depends only on the *lease* expiring and the
-*reaper* handing the job back - the mechanisms in the earlier entries.
-
-**What the test does, step by step** (`tests/test_kill_recovery.py`):
-
-1. Insert a 90-ply game and enqueue it. Start worker A as a subprocess at depth 12 with a
-   3-second lock timeout (so it heartbeats every second).
-2. Wait until A has claimed the job **and heartbeated at least once** - proof it is in the
-   middle of the analysis, not just past the claim - and assert no moves are written yet.
-3. Kill A. Then watch the job for 2.5 heartbeat intervals and assert its `locked_at` does not
-   move: A really is dead. (This check exists because on Windows `sys.executable` in a venv is
-   a launcher that starts the real interpreter as a child; if killing the launcher left the
-   child running, the test would say so instead of passing by accident. It doesn't.)
-4. Start worker B with `--until-empty`. B waits out A's lease, reaps it, re-claims the job as
-   attempt 2, analyses the game and exits 0.
-5. Assert: the job is `done`, by B, on attempt 2, and its `last_error` records that A's lease
-   expired; the game is `complete` with `ply_count` 90; there are exactly 90 move rows with
-   90 distinct plies running 1 to 90, all graded; A's log contains no `job.done`, B's contains
-   one `job.reaped` and one `job.done`.
-
-A second test runs three workers over eight games concurrently and asserts every job finished
-on its first attempt, every game is complete, and the move count is exactly the sum of the
-games' lengths.
-
-**Measured:** last heartbeat from A to game complete: 8.0 s, 8.1 s, 8.3 s across three runs
-(3 s of that is the lock timeout, ~2.5 s is the test's own "is A dead" wait, the rest is B
-starting and analysing 91 positions). The test passed 9 runs out of 9.
-
-**Why "exactly once" holds, in one paragraph:** a job can be *executed* more than once - that
-is what recovery means - but its *effect* is written once. A writes nothing until the end;
-its results would commit in the same transaction as `done`, and only if its lease (fenced by
-the attempt number) is still current. So a killed A leaves no trace, a stalled-then-revived A
-writes zero rows, and B's run is the only one that commits. Moves are upserted on
-(game_id, ply) underneath that, so even a hypothetical double commit could not create
-duplicate rows.
-
-**Alternatives rejected:**
-- *Test with threads and a fake "kill"*: a thread cannot be killed without running its
-  `finally` blocks, which is precisely the cleanup a real crash skips.
-- *Kill at a random moment*: it would sometimes kill before the claim or after the commit,
-  which tests nothing interesting. Waiting for the first heartbeat pins the kill inside the
-  window that matters.
-
-**Talking point:** "The acceptance test for the queue kills a real worker process with
-SIGKILL in the middle of a 90-move game, after it has heartbeated, so it's genuinely
-mid-analysis. A second worker waits out the lease, takes the job over through the reaper and
-finishes it. Then I assert 90 rows, 90 distinct plies, the game completed once, and from the
-logs, only the second worker ever completed it. Recovery took about 8 seconds with a
-3-second lease. It's 'at-least-once execution, exactly-once effect', and the test checks
-the effect, not the mechanism."
-
-**Where:** `tests/test_kill_recovery.py`, `src/chess_coach/worker.py` (the CLI the test
-launches), and the queue, worker and fencing entries below.
-
-## 2026-11-06 - The queue's defaults lived in Python, where only Python could see them `DONE`
-
-> **In plain English:** Every job has a few settings that are normally left at a standard
-> value - how urgent it is, how many tries it has had, how many it is allowed. Those standard
-> values were written in my Python code, not in the database. So anything that added a job
-> *without* going through my Python code - a speed-test script, or me typing into the
-> database by hand - got an error demanding every value spelled out. The person building the
-> speed tests spotted it. The fix moves the standard values into the database itself, where
-> every tool sees them.
-
-**A bit deeper:** SQLAlchemy's `default=` is applied by the Python library when it builds an
-`INSERT`; the database knows nothing about it. `server_default=` puts a `DEFAULT` clause on
-the column, which the database applies to every insert from anywhere. The columns are
-`NOT NULL`, so a plain-SQL insert that omitted them failed outright.
-
-**What changed:** migration `0003` adds database defaults to `jobs.status` (`'pending'`),
-`priority` (100), `attempts` (0) and `max_attempts` (5); the `Job` model declares them too,
-so the drift test keeps the two honest. A test inserts a job with only `type` and `payload`
-in raw SQL and claims it.
-
-**How it was found:** the M3 builder, writing a benchmark harness that enqueues by SQL, read
-the model and asked. My own enqueue SQL had silently worked around it by naming every column
-- which is exactly how this kind of gap survives: the first author always knows the trick.
-
-**Why it matters for this table in particular:** the jobs table is the one table other tools
-are *expected* to write to directly - it is the integration point between ingestion, the
-workers, benchmarks and, later, the API's sync jobs. A default that only one client knows
-about is part of that client, not part of the schema.
-
-**Alternatives rejected:** *document "always set these columns"* - a rule every future
-script has to remember, enforced by a NOT NULL error at run time.
-
-**Talking point:** "An ORM default is a client-side default. My queue table is written to by
-several tools, and only the ORM knew what 'priority' defaulted to - a teammate building the
-benchmark hit it from raw SQL. Moving the defaults into the schema made the database the
-single source of truth for what a new job looks like."
-
-**Where:** `migrations/versions/0003_jobs_server_defaults.py`, `src/chess_coach/models.py`
-(`Job`), `tests/test_queue.py::test_a_job_inserted_with_plain_sql_needs_only_a_type_and_a_payload`.
-
-## 2026-11-06 - The worker: nothing is written until the whole game is done `DONE`
-
-> **In plain English:** A worker takes a game off the queue, has the engine judge every
-> position in it, and saves the results. The important choice is *when* it saves. It saves
-> nothing while the engine is working, then saves the whole game - every move, the "finished"
-> mark on the game, and the "done" mark on the job - in one go. Like a bank transfer, it all
-> happens or none of it does. So if a worker is killed halfway through, there is no
-> half-finished game to tidy up: the game just goes back on the pile and someone does it
-> again from the start. While it works, the worker checks in every so often to say "still
-> on it"; if it finds out it has been replaced, it stops and throws its work away.
-
-**A bit deeper:** The write is one *database transaction*, which commits atomically. The
-lease check (`queue.complete`) is the first statement in it, so a worker whose lease was
-taken away writes zero rows. *Heartbeats* run between positions. Re-running a game is safe
-regardless, because moves are *upserted* on (game id, ply) - insert, or overwrite if present.
-
-**What changed:** `analysis/game.py` (replay the PGN onto `games.start_fen` or the normal
-start, one evaluation per position, rows for `moves`), `analysis/runner.py` (`Worker`:
-reap, claim, analyse, complete; `CachedEvaluator`, the single seam where M3's cache plugs
-in), `analysis/jobs.py` (one set-based `INSERT ... SELECT` that enqueues every pending game,
-priority by time class), and one call in `ingest/cli.py` so a sync enqueues what it found.
-
-**Why the details are the way they are:**
-
-- *One job per `games.id`, keyed `analyze-game:<id>`, payload `{"game_id": <id>}`.* Not the
-  Chess.com uuid: a game between two tracked players is two rows with two points of view,
-  and each needs its own moves.
-- *`moves.fen_hash` is the position the move was played from*, so it joins to the
-  `positions` row holding the engine's best move for that decision.
-- *Enqueueing is a sweep, not an event.* It inserts a job for every pending game without
-  one, so a crash between "games saved" and "jobs enqueued" is repaired by the next run.
-- *A game status is never moved backwards.* Every status update excludes `complete` and
-  `skipped`, so a stale job can't un-finish a game.
-- *The worker refuses a lock timeout it cannot keep.* Heartbeats happen between positions, so
-  one search must fit in the gap: `ENGINE_TIMEOUT_SEC` must be under two thirds of
-  `JOB_LOCK_TIMEOUT_SEC`, or the worker will not start.
-- *A database outage does not kill the worker.* It logs, waits a poll interval and tries
-  again; any job it held simply lapses to the reaper.
-
-**Bugs and surprises found while testing it:**
-
-- *A Postgres type error from reusing one parameter.* The enqueue SQL used `:type` both as the
-  `jobs.type` value and inside `:type || ':' || g.id` for the dedupe key. psycopg 3 binds
-  parameters server-side, so Postgres had to give `$1` one type, and deduced `varchar` from
-  one use and `text` from the other: `AmbiguousParameter: inconsistent types deduced for
-  parameter $1`. The fix is one parameter per use. Lesson: with server-side binding, a
-  parameter is a typed value, not a text substitution.
-- *python-chess does not raise on a bad move.* `read_game("1. e4 e5 2. Ke3")` returns a game
-  with two moves and the error tucked into `game.errors`. Grading that would silently drop
-  the rest of the game, so any recorded error makes it a permanent `BadGame`. A test I wrote
-  with obviously-garbage text passed through as an empty, error-free game - which is why the
-  test now uses illegal moves instead.
-- *The engine disagreed with my chess.* I wrote a test expecting 2...bxa6 (taking a hung
-  bishop) to be "best" or "good". Stockfish prefers 2...Nxa6, which keeps the pawns intact:
-  +452 vs +377 for Black at depth 16 (an inaccuracy), 126 cp at depth 8 (a mistake). The test
-  now asserts what the engine actually says.
-
-**Alternatives rejected:**
-- *Write moves as they are evaluated*: a killed worker leaves half a game, and "is this game
-  analysed?" needs a second source of truth.
-- *A heartbeat thread*: keeps a hung worker's lease alive forever.
-- *Enqueue inside the ingest transaction* (a transactional outbox): stronger, but means
-  reworking M1's upsert; the sweep gets the same eventual result with one call.
-
-**Talking point:** "The worker's guarantee is all-or-nothing per game. It computes the whole
-game, then one transaction checks it still owns the job, writes every move, marks the game
-complete and the job done. A worker killed at any point leaves either nothing or everything,
-never half, and a zombie writes zero rows. Moves are upserted on game and ply anyway, as a
-second line of defence."
-
-**Where:** `src/chess_coach/analysis/`, `src/chess_coach/ingest/cli.py` (one line),
-`tests/test_analysis_game.py`, `tests/test_runner.py`, `tests/games.py`.
-
-## 2026-11-06 - Grading a move: whose point of view, a mate already given, and what the cap really does `DONE`
-
-> **In plain English:** The engine always scores a position for whoever's turn it is. So
-> after you move, its score is from your *opponent's* side, and the program has to flip it
-> to say how your move went. Flipping is just "change the sign" - except in one case:
-> checkmate. The engine writes "already checkmated" as zero, and flipping zero gives zero, so
-> "I just checkmated them" would quietly turn into "I've been checkmated". That case is now
-> handled on its own, and checkmating someone always counts as the best move. Writing the
-> tests also caught me misreading my own rule: I'd assumed capping scores at ten pawns made a
-> slip in an already-lost game count for nothing. For the example in my own notes it doesn't
-> - it shrinks a "blunder" to a "mistake". The tests now say what the rule really does.
-
-**A bit deeper:** Engine scores are *relative* (side-to-move point of view); the report needs
-them from the *mover's* point of view, which is a negation for the position after the move.
-A *mate score* is a distance ("mate in 3"), signed by who is mating, and *mate in 0* is the
-checkmate itself. Classification *clamps* both scores to +/-1000 centipawns before
-subtracting, so swings beyond the cap stop counting - but only the part beyond the cap.
-
-**What changed:** `src/chess_coach/analysis/classify.py` (`MoverScore`, `mover_before`,
-`mover_after`, `classify`, `classify_move`, `phase`) and `analysis/clock.py`
-(`parse_time_control`, `move_times`), with 51 unit tests.
-
-**The two things the tests caught:**
-
-- *Mate in 0 cannot be negated.* `mover_after` special-cases it: the opponent is to move and
-  mated, so the mover has delivered mate (`mate_in_after = 0` in mover terms), which clamps to
-  +1000. `classify_move` then calls any mating move `best` outright - otherwise, with two mates
-  in one on the board, the one the engine didn't name would be graded on arithmetic. The
-  reviewer flagged this independently; the tests cover a mating move from a lost position and
-  from a position where the engine preferred a different mate.
-- *My reading of the clamp was wrong, not the code.* The decision log's example, -900 -> -1300,
-  is a 400 cp drop raw. Clamped, it is -900 -> -1000: 100 cp, a **mistake**. I had written the
-  test expecting "good". The clamp fully erases swings that are beyond the cap on *both* sides
-  (-1100 -> -1500 is "good"), and softens ones that cross it. That is the rule the project
-  decided on, so the code stays and the test now documents it honestly.
-
-**Other details:** the engine's own move is `best` whatever the arithmetic says (the score
-after a move is a fresh, deeper search and can differ by more than noise); thresholds are
-inclusive (exactly 300 cp is a blunder); phase is endgame by material alone (non-pawn material
-<= 26 of the starting 62), opening for moves 1-10, middlegame otherwise. Move times use each
-player's own previous clock reading plus the increment, never go negative, and are `None`
-rather than guessed when a reading is missing or the game is daily.
-
-**Alternatives rejected:**
-- *Encode a delivered mate as +1 or a sentinel*: changes the meaning of `moves.mate_in_after`
-  for every consumer; an explicit branch in one function is cheaper to explain.
-- *Change the test to match my assumption by tightening the clamp*: the clamp value is a
-  recorded decision, and the raw evals are stored precisely so it can be revisited with real
-  data.
-
-**Talking point:** "Point of view is where move grading goes wrong. The engine scores for the
-side to move, so the 'after' score is the opponent's and has to be negated - except checkmate,
-which the engine writes as mate-in-zero, and negating zero is still zero. So 'I gave mate'
-would have read as 'I got mated'. And my own tests caught me misreading my own clamping rule:
-it softens a slip in a lost game from blunder to mistake, it doesn't erase it."
-
-**Where:** `src/chess_coach/analysis/classify.py`, `src/chess_coach/analysis/clock.py`,
-`tests/test_classify.py`, `tests/test_clock.py`.
-
-## 2026-11-06 - Bug: my timeout fix made the test run hang forever, one run in four `DONE`
-
-> **In plain English:** If the chess engine freezes, my program is supposed to give up on it
-> after a set time, shut it down and start a fresh one. The test for that passed. But
-> roughly one time in four, the whole test run then never finished - it just sat there after
-> printing that every test had passed. The cause was how I shut the frozen engine down. I
-> first told the program "forget about the question you asked", then pulled the plug. Doing
-> it in that order confused the library that talks to the engine, so it never noticed the
-> engine had actually gone, and kept a helper waiting for it - forever. The program refuses
-> to exit while a helper is still waiting. The fix was to just pull the plug, and let the
-> unanswered question fail on its own.
-
-**A bit deeper:** python-chess runs each engine on a background *thread* with its own *event
-loop* (the machinery that waits on the engine's output). Python will not exit while a
-*non-daemon* thread is still running. Cancelling the pending request and then killing the
-process put the library's internal state machine into a state where the "process exited"
-notification itself crashed (`InvalidStateError`), so the background thread waited for an
-exit it would never be told about.
-
-**Symptom:** `pytest tests/test_engine.py` sometimes printed every test passing and then hung.
-Run alone, every test passed. The first full run sat for over three minutes before I killed it.
-
-**How I found it:** pytest showed nothing - the tests had finished. A loop that ran the hang,
-crash and normal scenarios eight times, with `faulthandler.dump_traceback_later`, reproduced
-it on every iteration rather than one in four: each "hang" case took 6.2 s instead of ~1.2 s,
-logged my own `engine.kill_unconfirmed` warning (the 5 s wait for the process's exit code ran
-out), printed `InvalidStateError` from python-chess's `connection_lost`, and the traceback
-dump at the end showed one leaked engine event-loop thread per timeout, plus the main thread
-parked in `threading._shutdown`. The "one in four" in pytest was just how often the leaked
-thread was still alive when the interpreter tried to exit.
-
-**Root cause:** `future.cancel()` before killing the process. Cancelling the analysis coroutine
-left python-chess's command half-torn-down; when the kill then arrived, its termination
-handler tried to set a result on a future that was already cancelled.
-
-**Fix:** don't cancel; kill the process, and let the in-flight command fail with the ordinary
-"engine terminated" error, which python-chess handles cleanly. The same eight-iteration loop
-now runs each hang case in 1.2 s with no warnings and exits. The hang test now also asserts
-that the thread count returns to where it started after the engine is closed.
-
-**Lesson:** "the test passed" and "the test run finished" are different claims - a resource
-leak shows up as the process not ending, not as a red test. And when a library gives you two
-ways to stop something, the more forceful one can be the cleaner one: killing the process
-goes through the library's well-tested crash path, while cancelling went through an
-interleaving it had never been tested for.
-
-**Talking point:** "My hung-engine timeout leaked a thread. The test was green; the test *run*
-hung one time in four. The cause was cancelling the request before killing the engine,
-which left the library unable to process the exit. I found it by looping the scenario with a
-traceback dump on a timer, which showed a leaked event-loop thread per timeout. Killing
-without cancelling fixed it, and the test now checks the thread count goes back down."
-
-**Where:** `src/chess_coach/engine.py` (`StockfishEngine.evaluate`, the comment on the
-timeout branch), `tests/test_engine.py::test_a_hung_search_is_killed_restarted_and_reported`.
-
 ---
-
-## 2026-11-06 - The same position, the same depth, three different answers `DONE`
-
-> **In plain English:** The project saves the engine's opinion of each chess position so it
-> never has to work it out twice. That only makes sense if asking twice would give the same
-> answer. It didn't. The engine keeps notes from the positions it looked at before, and those
-> notes nudge its next answer - so the same position came back as +264, +266 or +269
-> depending on what it had been asked just before. The reviewer on the project also found a
-> second leak: the engine's answer depends on how many moves have passed without a capture,
-> which my saved-answer label ignores. The fix is to wipe the engine's notes before every
-> position and to show it only what the label describes. It costs about 7% in speed, and
-> now asking twice gives exactly the same answer, down to the amount of work done.
-
-**A bit deeper:** Stockfish has a *transposition table* (its "hash"): a memory of positions
-it has already searched, kept between searches to speed them up. That memory is an input to
-the result that the cache key (position, engine version, depth) does not name. So is the
-*halfmove clock* - the count towards the fifty-move draw rule - which the position
-identifier deliberately drops. And so is the number of search *threads*, because
-multi-threaded search depends on timing. A cache is only correct if the value it stores is a
-*pure function* of its key; this was the fifth time the project hit "the value depends on
-something the key doesn't name".
-
-**How it was found:** two ways, independently. While writing the engine wrapper I searched one
-position at depth 16 three times, each after a different preceding search, without clearing
-the hash: +264, +266, +269, with node counts of 596k to 1.1M. With the hash cleared first:
-+273 and 45,986 nodes, three times out of three. Separately, the reviewer agent showed with
-real Stockfish that 31 of 34 positions in one game differ warm vs cold, by up to 42 cp with
-some best moves changing, and that one king-and-rook endgame scores +529 / +359 / +11 / 0 at
-halfmove clocks 0 / 50 / 90 / 98.
-
-**What changed:** `StockfishEngine.evaluate` sends `chess.Board(normalize_fen(board) + " 0 1")`
-- no move history, halfmove clock zero - with a fresh `game` object so python-chess sends
-`ucinewgame`, which clears the hash. `ENGINE_THREADS` is documented as "keep at 1" and the
-wrapper logs a warning if it is not. The engine version is read from the binary's own UCI name
-("Stockfish 18" -> `sf_18`), so it cannot disagree with the binary that actually ran.
-
-**Measured cost** (sf_18 avxvnni, one 91-position game, Threads=1, Hash=128 MB):
-
-| Depth | Hash kept between positions | Hash cleared per position | Cost |
-| --- | --- | --- | --- |
-| 16 | 25.6 s (3.56 positions/s) | 27.3 s (3.34 positions/s) | +6.6% |
-| 12 | 2.5 s (36.5 positions/s) | 5.3 s (17.1 positions/s) | +114% |
-
-The fixed cost is the clear itself: 29 ms per position at 128 MB, 10.5 ms at 16 MB. At the
-production depth of 16 it is noise; at shallow test depths it dominates.
-
-**Other measurements:** Threads=2 gave different scores on two runs of the same position at
-depth 16 (-186 vs -213, -125 vs -133). Hash size is a much weaker input: 16 MB vs 64/128/256 MB
-changed one score in six, by 2 cp.
-
-**Known cost of the fix:** with the clock zeroed, a position that is genuinely one move from a
-fifty-move draw is graded as if the clock had just reset. That is rare in real games and is
-the price of a value that can be shared between every game that reaches the position.
-
-**Alternatives rejected:**
-- *Put the halfmove clock in the key*: correct, and splits one cache entry into up to a
-  hundred for a property that changes the answer only near the end of a fifty-move run.
-- *Keep the warm hash for speed*: 6.6% faster at depth 16 and the cached numbers stop meaning
-  anything - a cache hit and a miss would return different values for the same key.
-- *Multi-threaded search per worker*: not reproducible; scale with worker processes instead.
-
-**Talking point:** "I asked Stockfish about the same position three times and got three
-answers, because its hash table carries information from earlier searches into later ones.
-For a cache keyed on position, engine and depth, that means storing one sample of a
-distribution. So the engine only ever sees what the key contains - no history, clock zeroed -
-with the hash cleared before every position and one search thread. At depth 16 that costs
-6.6%, and now the same position gives the same score and the same node count every time."
-
-**Where:** `src/chess_coach/engine.py`, `src/chess_coach/config.py` (Engine section),
-`tests/test_engine.py` (same position after different searches; same position reached by two
-move orders with different halfmove clocks).
-
-## 2026-11-05 - Retries back off, crashes count, and hopeless jobs stop retrying `DONE`
-
-> **In plain English:** Sometimes analysing a game fails. If it failed for a passing reason
-> - the database hiccupped - it should be tried again, but not instantly, and not all at the
-> same moment as every other job that failed at the same time. So each retry waits longer
-> than the last, plus a little randomness. If a game has failed five times, it is set aside
-> on a "needs a human" pile instead of being retried forever. And if the game itself is
-> broken - its move list is garbage - it goes straight to that pile, because trying again
-> won't fix it. Finally, a cleaner comes round and takes back games from workers that have
-> gone silent, so a crashed worker can never keep a game hostage.
-
-**A bit deeper:** *Exponential backoff* doubles the wait after each failure; *jitter* adds
-randomness so jobs that failed together don't retry together (a *thundering herd*). A job that
-has used up its attempts is *dead-lettered*: moved to a terminal state where it is visible
-for inspection but no longer runs. The *reaper* is a periodic sweep that returns jobs whose
-lease expired - their worker stopped heartbeating - to the queue.
-
-**What changed:** `queue.fail`, `queue.reap_expired` and `queue.retry_delay`; Workers
-settings `JOB_RETRY_BASE_SEC` / `JOB_RETRY_CAP_SEC`, and `JOB_LOCK_TIMEOUT_SEC` documented
-as a heartbeat timeout rather than a job-length limit.
-
-**Why the details are the way they are:**
-
-- *The backoff lives in `run_after`.* The claim query already skips rows whose `run_after`
-  is in the future, so a retry policy needs no scheduler and no extra state.
-- *Equal jitter, the same shape as the Chess.com client's backoff.* Half the window is fixed
-  so a retry is never immediate; half is random to spread the herd out.
-- *Two kinds of terminal failure.* `failed` is "the input is bad, retrying cannot help" (a
-  PGN that does not replay). `dead` is "five honest attempts failed". They mean different
-  things to whoever reads the dead-letter pile, so they are different statuses - and the
-  schema already had both.
-- *A reaped attempt counts.* A job that kills every worker that touches it - out of memory,
-  an engine crash that takes the process down - would otherwise loop forever, one worker
-  at a time. It is dead-lettered after `max_attempts` like any other.
-- *Reaped jobs come back immediately, not after a backoff.* The lock timeout they just sat
-  out already was one; adding more would only delay recovering from an ordinary crash.
-- *The reaper uses `SKIP LOCKED` too.* A row that is locked is being heartbeated or completed
-  at that moment - the opposite of abandoned. Blocking on it would make the reaper wait for a
-  job to finish and then (after the lock released) look again at a row that is now `done`.
-  A test holds a completion transaction open and asserts the reaper walks straight past.
-- *The lock timeout is about silence, not duration.* Workers heartbeat while they work, so
-  a long game at a high depth is never reaped while its worker is alive.
-
-**Alternatives rejected:**
-- *Retry immediately*: a database blip that fails 50 jobs brings 50 jobs back at once,
-  into the same blip.
-- *Retry forever*: a poison job never surfaces; it just costs a worker every few minutes.
-- *A reaper that ignores attempts*: the poison job again, via a different door.
-
-**Talking point:** "There are two ways a job ends badly and they mean different things:
-'the input is broken' goes straight to failed, 'it failed five times' is dead-lettered. And a
-crash counts as an attempt - otherwise a job that crashes its worker takes down the whole
-pool, one worker at a time, forever. The reaper skips locked rows on purpose: a locked row
-is a job that's completing right now, which is the opposite of abandoned."
-
-**Where:** `src/chess_coach/queue.py`, `tests/test_queue_retries.py` (including three zombie
-worker scenarios: reaped and re-claimed by someone else, reaped and not yet re-claimed, and
-re-claimed by a restart under the same worker id).
-
-## 2026-11-05 - A claimed job is a lease with a fencing token, not just a lock `DONE`
-
-> **In plain English:** The work queue is a list of games waiting to be analysed, and
-> several workers take games off it at the same time. Two rules stop them stepping on each
-> other. First, when a worker grabs a game, the others skip straight past it instead of
-> waiting in line behind it. Second, a worker's claim on a game is like a numbered parking
-> ticket. If a worker goes silent for too long, its game is given to someone else with a
-> *new* ticket number. If the first worker wakes up later and tries to hand in its finished
-> work, its old ticket no longer matches, so its work is thrown away instead of being saved
-> on top of the new worker's.
-
-**A bit deeper:** The queue is a Postgres table. A worker claims a job with
-`SELECT ... FOR UPDATE SKIP LOCKED`: *row locking* means only one transaction can hold a row
-at a time, and *SKIP LOCKED* means other workers step over locked rows instead of blocking on
-them. A claim is a *lease* - ownership that has to be renewed (a *heartbeat*) or it expires.
-The danger with leases is the *zombie*: a worker that was presumed dead, had its job handed
-on, and then comes back. The defence is a *fencing token* - a number that goes up on every
-claim - and every write the worker makes is conditional on still holding the current number.
-
-**What changed:** `src/chess_coach/queue.py`: `enqueue` (idempotent on `jobs.dedupe_key`),
-`claim`, `heartbeat`, `complete`, `has_unfinished`, and the `Lease` / `LeaseLost` types.
-
-**Why the details are the way they are:**
-
-- *The fencing token is `attempts`, which already existed.* Every claim increments it, so
-  (job id, worker id, attempts) names one specific claim, with no new column. `locked_by`
-  alone is not enough: a worker restarted under the same id (`worker-1` in a benchmark) can
-  legitimately re-claim the job it was reaped from, and then its zombie's `locked_by` would
-  match. There is a test for exactly that case.
-- *`complete()` runs inside the transaction that writes the results, and goes first.* Its
-  `UPDATE` takes the row lock and checks the lease, so the job's results and its `done` status
-  commit together or not at all - and a reaper that got there first leaves nothing to match,
-  so a zombie writes zero rows rather than writing moves and then failing.
-- *The heartbeat is called from the work loop, not a background thread.* A background thread
-  proves the process exists. A worker stuck in a hung call would keep its lease forever.
-- *Time is the database's `now()`.* A worker with a skewed clock cannot make a lease look
-  fresh or expired - the same reasoning as the rate limiter using Redis's clock.
-- *The claim query matches the partial index* `ix_jobs_claimable (priority, run_after) WHERE
-  status = 'pending'`, so a claim walks the index in order and stops at the first row it can
-  lock, no matter how many finished jobs pile up. A test runs `EXPLAIN` with sequential scans
-  disabled to prove the planner can use it.
-- *Enqueue is a no-op on a `done` job too.* Re-running finished work should be a deliberate
-  act, not a side effect of a sync enqueueing every pending game twice.
-
-**Alternatives rejected:**
-- *Plain `FOR UPDATE`*: correct, but every idle worker queues behind whichever one holds the
-  head of the queue. A test sets `lock_timeout` so a regression to it fails instead of hanging.
-- *`pg_try_advisory_lock` per job*: locks that live on the connection, invisible in the jobs
-  table, and lost silently when a pooled connection is recycled.
-- *Fencing on `locked_by` only*: fails the restarted-under-the-same-name case above.
-
-**Talking point:** "Claiming a job safely is the easy half - `SKIP LOCKED` does it. The hard
-half is the worker you gave up on that isn't actually dead. So a claim is a lease with a
-fencing token: I reused the attempts counter, which goes up on every claim, and every write a
-worker makes is conditional on it. A zombie's completion matches zero rows, and because
-completion shares a transaction with the results, it can't half-write either. Eight threads
-racing for 200 jobs claim each exactly once."
-
-**Where:** `src/chess_coach/queue.py`, `tests/test_queue.py`.
-
-<!-- end of M2 entries -->
-
----
-
-<!-- M1 ENTRIES BELOW (ingestion). Newest first. -->
-
-## 2026-11-05 - M1: the whole history loads once, and every re-sync costs two requests `DONE`
-
-> **In plain English:** The first big piece works. You type in a Chess.com username and the
-> program downloads every game that person has ever played - for my account, 4,550 games in
-> under a minute. Run it again and it doesn't download everything twice: it asks Chess.com
-> "has anything changed since last time?" and usually gets back "no", which costs almost
-> nothing. To check it was right, I compared my counts of wins, losses and draws with the
-> numbers Chess.com shows on my profile. They matched exactly, for every type of game.
-
-**A bit deeper:** Chess.com stores a player's games in monthly bundles. A month that has
-ended can never change, so once it has been downloaded it is marked finished and never asked
-for again. Only the current month is re-checked, and that uses a *conditional request*: we
-send back a fingerprint (an *ETag*) of the version we already have, and if nothing changed
-the server answers "304 Not Modified" with an empty body. Each month is saved on its own, so
-if the program crashes halfway through it picks up where it stopped instead of starting over.
-And saving a game is an *upsert* - "insert it, or if it is already there, leave it alone" -
-which is why running it twice can never create duplicates.
-
-**What changed:** `src/chess_coach/chesscom/` (HTTP client and game parser),
-`src/chess_coach/ratelimit.py`, `src/chess_coach/ingest/` (sync and the `chess-coach-sync`
-CLI), migration `0002`, and tests for each against real Postgres and Redis.
-
-**Why the details are the way they are:**
-
-- *A month is final a day after it ends, not at midnight.* Games are filed by end time, and a
-  game that finishes at 23:59 UTC on the 31st is not guaranteed to be in the archive at
-  00:00. Freezing on the stroke of midnight would lose it forever. The grace day costs at
-  most one extra 304.
-- *One commit per month.* A crash mid-sync leaves the finished months marked done, so a
-  resumed sync re-requests only what it had not finished - and nothing is half-written,
-  because a month's games and its archive row commit together.
-- *The upsert never touches analysis state.* A re-ingested game keeps its
-  `analysis_status`; otherwise every re-sync would send finished games back to the queue. The
-  only field allowed to change is Chess.com's accuracy score, which appears later if someone
-  requests a review. A `WHERE` on the `ON CONFLICT DO UPDATE` means re-downloading an
-  unchanged month writes zero rows, and `RETURNING (xmax = 0)` counts which rows were
-  genuinely new without a second query.
-- *Wins and losses are decided by where `win` appears.* Chess.com marks the winner `win` and
-  the loser with the reason (`resigned`, `timeout`, `abandoned`...). Keying on `win` keeps
-  working when Chess.com invents a new way to lose; only draws need a list of names. The
-  loser's reason is stored as `termination`, so "win + timeout" reads as "my opponent
-  flagged".
-- *A per-player advisory lock stops two syncs of one player at once.* Not for correctness -
-  the upsert already guarantees that - but so two workers do not spend the shared rate
-  budget downloading the same months.
-- *The username is validated before it goes into a URL.* `../x` or `a?b` cannot reach a
-  different endpoint than intended.
-
-**Verified against the real API:** the parser was written after reading a real 505-game
-archive, and it found two more things the docs do not say. Chess960 games have Shredder-FEN
-castling rights in the PGN header (`HBhb`) but `KQkq` in the JSON `initial_setup`; only the
-header is right, so the parser uses it. And Chess.com puts an ECO code on chess960 games,
-which means nothing for a shuffled back rank, so openings are only recorded for normal
-starts. The first real sync also turned up a variant I had never seen, `oddschess`, which was
-stored and skipped exactly as designed.
-
-**Alternatives rejected:**
-- *Re-download everything every night*: 53 requests and ~20 MB per player per night, against
-  2 requests and 0 bytes.
-- *Track "last synced month" on the player* (the design doc's `last_synced_month`): one
-  number cannot express "October has gained a late game but August is final", and it cannot
-  resume a crashed sync mid-history. Per-month rows with ETags can.
-- *One transaction for the whole sync*: a crash in month 50 would throw away 49 months of
-  work, and the transaction would hold locks for a minute.
-
-**Talking point:** "The acceptance test wasn't a unit test, it was my own account: 4,550
-games, and the per-time-control win/loss/draw totals matched Chess.com's profile numbers
-exactly. Then I ran it again and it made two requests - the archive list and the current
-month, which came back 304 with zero bytes. Every ended month is frozen and never fetched
-again, a crash resumes from the last finished month, and the upsert can't reset analysis
-state, so running it nightly is free."
-
-**Where:** `src/chess_coach/ingest/sync.py`, `src/chess_coach/chesscom/`, `tests/test_sync.py`,
-`tests/test_chesscom_parse.py`, `tests/test_chesscom_client.py`.
-
----
-
-## 2026-11-05 - The "no duplicate games" rule would have deleted games instead `DONE`
-
-> **In plain English:** I had a rule in the database that said "each Chess.com game can only
-> be stored once", to stop duplicates. It sounds obviously right, but it is wrong. The
-> program stores each game *from one player's side* - who had white, who won. If two people
-> who both use the app play each other, that one game has to be saved twice: once as a win
-> for one, once as a loss for the other. My rule would have quietly thrown the second copy
-> away, so one of them would be missing a game and nothing would ever say so. I caught it
-> while reading the database design before writing the code that fills it.
-
-**A bit deeper:** The rule is a *unique constraint* - the database refuses to store a second
-row with the same value. Uniqueness is how the program stays safe to re-run: it tries to save
-every game, and the database ignores the ones it already has. But the constraint was on the
-Chess.com game ID alone, while what a row actually represents is "this game, for this
-player". The fix makes the pair unique: game ID *plus* player.
-
-**What changed:** Migration `0002` drops the unique constraint on `games.chesscom_uuid` and
-adds `uq_games_player_uuid` on `(player_id, chesscom_uuid)`. The ingest upsert targets the
-new constraint.
-
-**Why:** Every column that makes a row distinct has to be in its key. `color`, `result`,
-`player_rating` and `opponent_rating` are all relative to the tracked player, so the row is
-keyed on the player as well as the game. With the old constraint, the second player's
-`INSERT ... ON CONFLICT` would hit the first player's row: `DO NOTHING` drops the game
-silently; `DO UPDATE` would be worse, overwriting the first player's perspective with the
-second's.
-
-This is the **fourth** time this project has turned on the same question - *what does this
-value actually depend on?* - after the `positions` cache key, the CI engine cache, and the
-engine image. The other three were cache keys; this one is an idempotency key, which is the
-same idea from the write side.
-
-**Alternatives rejected:**
-- *Store each game once and derive the perspective at read time*: correct, but it turns every
-  report query into a "which side was I" `CASE` expression, and the analysis worker's
-  `is_player_move` would no longer be a column.
-- *Leave it until a second user exists*: it would surface as a missing game in one user's
-  report, the hardest kind of bug to trace back to a constraint.
-
-**Talking point:** "My idempotency key was one column short. I'd made the Chess.com game ID
-unique, but a row is 'a game from one player's perspective', so when two tracked players
-meet, that's two rows - and the second would have silently disappeared. It's the same bug as
-a cache key that's missing an input, seen from the write side instead of the read side. I
-found it reading the schema before writing the ingestion code, and there's a test where two
-tracked players play each other and both see the game."
-
-**Where:** `migrations/versions/0002_games_unique_per_player.py`, `src/chess_coach/models.py`,
-`tests/test_sync.py::test_a_game_between_two_tracked_players_belongs_to_both`.
-
----
-
-## 2026-11-05 - One speed limit shared by every worker, kept in Redis `DONE`
-
-> **In plain English:** Chess.com asks programs not to ask it for data too fast, and if you
-> do, it starts saying "slow down" or blocks you. My program can run several downloaders at
-> once, so the speed limit has to be shared between them - otherwise four downloaders would
-> each think they were allowed the full speed, and together go four times too fast. Think of
-> one jar of tickets that every downloader has to take a ticket from before it asks
-> Chess.com for anything, with new tickets dropping into the jar at a steady rate. And if
-> Chess.com ever does say "slow down" to one of them, they *all* slow down, because they are
-> all spending from the same jar.
-
-**A bit deeper:** That jar is a standard design called a *token bucket*: tokens refill at a
-fixed rate (one a second here), the bucket holds a few spare so short bursts are allowed, and
-each request spends one. It lives in Redis, a fast shared store every process can reach. The
-"take a token" step runs as a single small script inside Redis, so two downloaders can never
-both grab the last token at the same moment. Retries back off exponentially (wait 1 s, then
-2, then 4...) with some randomness, so a group of workers that all failed together do not all
-retry together.
-
-**What changed:** `RedisTokenBucket` in `src/chess_coach/ratelimit.py` (a Lua script for
-take, another for penalize); `ChessComClient._get` acquires a token before every attempt,
-retries 429 / 5xx / network errors with backoff, and honours `Retry-After`.
-
-**Why the details are the way they are:**
-
-- *Redis's clock, not the worker's.* The script reads `TIME` inside Redis. If callers passed
-  their own timestamps, a worker whose clock ran ahead would refill the bucket early for
-  everyone.
-- *Reservation, not polling.* Taking a token may push the balance negative; the script returns
-  how long the caller must wait. One round trip and one sleep per request, and waiters are
-  served roughly in order instead of hammering Redis in a retry loop.
-- *A 429 penalises the shared bucket.* A 429 means the budget everyone shares is spent, so
-  `penalize()` drives the shared balance into debt and every worker waits - not only the one
-  that got the 429.
-- *The wait comes back as a string.* Redis converts Lua numbers to integers on the way out,
-  so a 0.2 s wait would arrive as 0 - "go now". There is a test for exactly that.
-- *Equal jitter, not full jitter.* Full jitter can pick a near-zero delay, which is the wrong
-  response to being told to slow down. Half the window is fixed, half random.
-- *Every retry spends a token.* A retry is a request as far as Chess.com is concerned.
-- *Other 4xx responses are not retried.* A 400 is our bug; retrying it only burns budget.
-
-**Alternatives rejected:**
-- *A limiter per process*: N workers get N times the budget, which is the failure this exists
-  to prevent.
-- *`INCR` with a one-second key expiry (fixed window)*: allows double the rate across a window
-  boundary, and gives no "how long should I wait".
-- *Postgres as the limiter*: a row lock taken once a second by every worker is contention on
-  the database the queue also depends on.
-
-**Known limitation:** a worker already sleeping on a reservation when a 429 arrives will
-still fire when it wakes. Its request may 429 too, which re-penalises the bucket, so the
-system converges. Cancelling outstanding reservations would need a coordination channel
-that is not worth it at one request per second.
-
-**Talking point:** "The rate limit belongs to the client, not to a process, so the token
-bucket lives in Redis and is one atomic Lua script that uses Redis's own clock - otherwise
-one worker with a fast clock refills the bucket for everybody. And a 429 isn't a private
-message to the worker that got it, it means the shared budget is gone, so it penalises the
-shared bucket and every worker backs off together."
-
-**Where:** `src/chess_coach/ratelimit.py`, `src/chess_coach/chesscom/client.py`,
-`tests/test_ratelimit.py` (real Redis, including two connections sharing one budget),
-`tests/test_chesscom_client.py`.
-
-<!-- end of M1 entries -->
-
----
-
-<!-- Entries before M1 (setup, CI, schema). -->
-
-## 2026-11-05 - Compose starts the infrastructure, not the app `DONE`
-
-> **In plain English:** Running this project needs a database and a cache server. Rather than
-> install those onto my laptop, one command now starts them in containers - the same versions
-> the automated tests use, isolated from everything else, and deletable without a trace. I
-> deliberately left the application itself out of it, because two of its three parts have not
-> been written yet. The immediate payoff is that the tests covering my database design now
-> actually run on my own machine; until today they quietly skipped themselves and had only ever
-> run on GitHub's servers.
-
-**What changed:** `docker-compose.yml` starts `postgres:17-alpine` and `redis:7-alpine` with
-healthchecks, named volumes and a first-boot script that creates a second database,
-`chess_coach_test`. A `.dockerignore` landed with it. The API and workers are not in the file.
-
-**Why:**
-
-*The test database is the actual point.* `tests/conftest.py` proves the Alembic migrations can
-build the schema from nothing by running `DROP SCHEMA public CASCADE` before every upgrade to
-head - a schema that is only ever created from the models is a schema whose migrations have
-never been tested. A fixture that destructive refuses to run unless the database name contains
-`test`. With no local Postgres at all, that refusal was moot: **every** Postgres-backed test
-skipped, so `test_models.py` and `test_migrations.py` had never once executed outside CI. The
-schema was being designed with its tests running somewhere I couldn't see.
-
-*Versions are pinned to match CI* because the queue's correctness lives in version-specific
-locking behaviour. Deliberately introducing a "passes locally, fails in CI" axis in the one
-component where correctness is hardest would be self-sabotage.
-
-*The app is excluded because two thirds of it does not exist.* A compose entry for the ingest
-and analysis workers would start containers that idle with nothing to do, and the Dockerfile
-would have to answer where the engine binary comes from - a question with real consequences
-that deserves to be answered when it bites, not pre-emptively.
-
-*`.dockerignore` was written before the Dockerfile* because the first `docker build` is exactly
-when it is too late to discover the build context is 211 MB, 114 MB of which is a Windows
-executable that cannot run in a Linux image.
-
-**Alternatives rejected:**
-- *Install Postgres natively on Windows*: a second thing to keep version-matched with CI, no
-  clean reset, and an uninstall that leaves data directories behind.
-- *Point the tests at the development database*: `conftest.py` refuses on purpose, and it is
-  right to - it drops the schema.
-- *Put the app in compose now with placeholder worker services*: containers that start and do
-  nothing, plus a Dockerfile written against code that has not been designed yet.
-- *SQLite for local tests*: rejected earlier for the queue, and the same argument applies.
-
-**Talking point:** "My schema and migration tests had never run on my own machine. They skip
-cleanly when no database is reachable - which is the right default, so a fresh clone can run
-the suite - but it meant I was designing a schema while its tests only ever ran in CI. One
-compose file fixed that. The detail I would point at is that it creates a *second*, separate
-test database: my fixtures prove the migrations work by dropping the schema and rebuilding it,
-and they refuse to run unless the database name contains 'test'. That guard is there because
-the cost of that fixture pointing at real data once is unrecoverable."
-
-**Where:** `docker-compose.yml`, `docker/postgres/init/01-create-test-database.sql`,
-`.dockerignore`, README quick start. `docs/DESIGN.md` still lists M0 as Compose starting "API,
-workers, Postgres, Redis" - the original plan, left unedited on purpose so the gap stays
-visible.
-
----
-
-## 2026-11-05 - The engine is probed at container start, never baked into the image `DECIDED`
-
-> **In plain English:** The chess engine ships in several builds aimed at different processor
-> generations, and the fastest one does not politely slow down on an older chip - it crashes
-> outright. My laptop is new enough to run the fastest build. If the engine were chosen while
-> *building* the shipping package, it would pick the fast build based on my laptop and then
-> crash on the older servers it gets deployed to. So the choice happens when the container
-> starts, on the machine that will actually run it.
-
-**What changed:** The M2 Dockerfile will **not** run `tools/fetch_stockfish.py` as a build
-step. The installer runs in the container entrypoint instead, with `vendor/` mounted as a named
-volume so the 109 MB download happens once per machine rather than once per container start.
-
-**Why:** An image is portable; the probe's answer is not. "Which SIMD build runs here" is a
-property of the host CPU, so baking it into an image is a cache key that omits something the
-value depends on - **the third instance of that same error in this project**, after the
-`positions` primary key (caught by reasoning) and the CI engine cache (caught by two red
-builds). The pattern is now unmistakable: every time I store a computed answer, I have to ask
-what inputs it actually depended on, and a probe's input is the machine.
-
-The fix costs no new code. `fetch_stockfish.py` already re-probes a binary that is present and
-re-fetches only if it cannot search, which is the self-healing behaviour added in `c360e9b`.
-Calling it from the entrypoint is that same validate-on-read property, applied to images.
-
-**Alternatives rejected:**
-- *Fetch at build time*: fastest container start, and the image is silently valid only on CPUs
-  resembling the build machine's. Breaks the first time it is deployed or handed to someone
-  else - and breaks with `SIGILL`, which tells the next person nothing.
-- *Bake the conservative `sse41-popcnt` build*: always runs, and throws away measurable
-  nodes/sec on the machine doing hours of analysis. Nodes/sec is the input to every throughput
-  number this project is meant to produce.
-- *Build one image per SIMD variant*: correct for a product, and triples the build matrix for a
-  one-person project with one deployment target.
-- *Fetch per container start with no volume*: 109 MB per worker per start. At eight workers
-  that is most of a gigabyte to start a benchmark.
-
-**Talking point:** "Same bug, third appearance - and by the third time I recognised it before
-it fired. I cache engine evaluations keyed on the engine version and depth because the value
-depends on both. My CI cache broke because its key named the release but not the probe that
-picked the binary. So when it came to the container image, the question was already familiar:
-the build picks the engine by testing the CPU, and an image gets copied to machines with
-different CPUs. The probe's answer belongs to the host, so it has to be computed on the host -
-at container start, not at build time."
-
-**Where:** planned for the M2 `Dockerfile` entrypoint. `tools/fetch_stockfish.py` already has
-the re-probe behaviour this depends on.
-
----
-
-## 2026-11-05 - I made the exact cache mistake I had designed out of the app `DONE`
-
-> **In plain English:** To save time, the test system keeps a copy of the chess engine rather
-> than re-downloading it every run. The copy it kept only works on *some* of the machines that
-> run the tests - and nothing ever checked. It just handed the copy over and the tests died.
-> Worse, the step that would have replaced the bad copy was skipped precisely *because* a copy
-> already existed, so a fix sitting in the project had no way to take effect. The real trap is
-> subtler than "the saved copy was bad": the right answer depends on which machine asks, and
-> the machine changes from run to run, so **no filing system could have got this right**. The
-> only fix is to check the thing still works at the moment you pick it up.
-
-**Keep this one next to the position-cache entry and the engine-image entry. The three
-together are the best answer you have to "tell me about a time you made a mistake" - the same
-error three times: reasoned out in advance, then committed for real, then recognised before it
-fired.**
-
-**What changed:** The CI cache key for the engine binary now hashes the installer script as
-well as the lock file, and the installer runs on every build instead of only on a cache miss.
-
-**What happened:** After the dual-net probe fix went green, a later PR failed with the same
-`SIGILL` - on a branch that already contained the fix. The probe was correct. The cache was
-the cause:
-
-```
-Cache Stockfish: Cache hit for: stockfish-Linux-c2ff5d61...
-Fetch Stockfish: skipped (if: cache-hit != 'true')
-Tests:           engine process died unexpectedly (exit code: -4)
-```
-
-**The detail I got wrong when I first wrote this up, and the logs disprove:** I assumed an
-earlier *failing* run had saved the bad binary. It had not. `actions/cache` does not save when
-the job fails - both red runs show `Post Cache Stockfish: skipped`, and both show
-`Cache not found`. The entry was saved by a **green** run on `main`
-([42049637201](https://github.com/ot7Deity/Chess-coach/actions/runs/42049637201)), which had
-fetched, probed, passed, and cached the binary that worked *on that host*.
-
-**The evidence that settles it.** Two runs on the same PR, two minutes apart, restored the
-*identical* entry - same key, same `74804294 B`:
-
-| Run | Cache | Engine tests |
-| --- | --- | --- |
-| [42051183768](https://github.com/ot7Deity/Chess-coach/actions/runs/42051183768) (15:04) | hit, fetch skipped | **passed** (its 3 failures were schema tests) |
-| [42051512216](https://github.com/ot7Deity/Chess-coach/actions/runs/42051512216) (15:06) | hit, fetch skipped | **`SIGILL`** |
-
-Same bytes, opposite outcomes. `ubuntu-latest` is a heterogeneous fleet: the host that saved
-the cache had AVX-VNNI, so the probe correctly accepted the `avxvnni` build; the 15:06 host did
-not. The green run after the fix proves it directly, because the fetch step ran again:
-
-```
-[fetch-stockfish] trying stockfish-ubuntu-x86-64-avxvnni.tar
-[fetch-stockfish]   smoke test exited -4 (wrong SIMD build for this CPU)
-[fetch-stockfish] trying stockfish-ubuntu-x86-64-avx2.tar
-[fetch-stockfish]   OK - Stockfish 18 (searched both evaluation networks)
-```
-
-**Why the key was wrong - and why no key could have been right.** The cached value is not
-"Stockfish 18". It is *"the build this runner was able to actually run, as judged by that
-version of the probe"*. So it depends on the probe, which the key never mentioned - and it
-depends on **the runner's CPU**, which is not a property of the repository at all. The key had
-already been through two formulations, and neither could have worked: it started as
-`stockfish-sf_18-ubuntu-avxvnni`, naming a SIMD variant the job had no way to guarantee, and
-became `stockfish-<os>-<hash of stockfish.lock.json>`, naming the release. Adding the
-installer's hash is a genuine improvement, because changing the probe should expire entries the
-old probe produced. **But it would not have prevented this failure.** Nothing in the repository
-changed between 15:04 and 15:06. The machine did.
-
-That is the same error the `positions` primary key was changed to avoid - a cache key that
-omits something the value depends on - with a sharper edge. There, every input (position,
-engine version, depth) was nameable. Here one input is the host, so the lesson "name everything
-the value depends on" runs out of road, and what is left is: **validate on read.**
-
-**Which is why the second fix is the one that actually works:** the installer now runs
-unconditionally. It already re-probes a binary that is present and re-fetches if it cannot
-search, so running it always makes a bad entry **self-healing** instead of permanently broken.
-Gating it on a cache miss was an optimisation worth under a second that cost two red CI runs.
-A cache you cannot validate on read is a cache that can only be fixed by hand.
-
-**Alternatives rejected:**
-- *Manually purge the cache*: fixes this instance and leaves the mechanism able to do it again.
-- *Stop caching the binary*: 80 MB per run, and it would hide the lesson rather than fix it.
-- *Only save the cache on success*: this is what `actions/cache` already does - it is exactly
-  how the bad entry got saved. Believing otherwise is what made me misdiagnose this the first
-  time.
-- *Pin the baseline `sse41-popcnt` build in CI*: cacheable by any key and always runs, but it
-  stops CI from exercising the fallback chain the project depends on.
-
-**Talking point:** "I corrected my design so the position cache key included the engine version
-and depth, because an evaluation depends on both. Then I wrote the identical bug into my CI
-config - and when I first wrote it up, I got the cause wrong. I assumed a failing run had
-poisoned the cache. The logs said otherwise: a *green* run saved it, and the proof was two runs
-on the same branch, two minutes apart, restoring byte-identical bytes - one passed, one died
-with an illegal instruction. The runners aren't the same hardware. So the cached value wasn't
-'Stockfish 18', it was 'the build that worked on whichever machine happened to save it', and
-that's not something a key can name. Two lessons. A cache key has to name everything the value
-depends on - and when one of those things is the machine, you can't fix it with a key at all,
-you validate on read. Re-probing cost under a second and turned a permanently broken cache into
-a self-healing one."
-
-**Where:** `.github/workflows/ci.yml` (`Fetch or verify Stockfish`). Cache saved green by
-[42049637201](https://github.com/ot7Deity/Chess-coach/actions/runs/42049637201); the
-same-bytes-different-outcome pair is
-[42051183768](https://github.com/ot7Deity/Chess-coach/actions/runs/42051183768) and
-[42051512216](https://github.com/ot7Deity/Chess-coach/actions/runs/42051512216); the fallback
-proof is [42051930368](https://github.com/ot7Deity/Chess-coach/actions/runs/42051930368).
-Related: the `positions` cache-key entry, the dual-net probe entry, and the engine-image entry,
-which is this bug caught in advance.
-
----
-
-## 2026-11-05 - The engine service gets extracted after M3, not before `DECIDED`
-
-> **In plain English:** Splitting a big application into smaller independent pieces
-> ("microservices") is fashionable, and splitting off the chess-engine part is the one split
-> here that genuinely pays for itself. But I'm doing it *after* I've measured how fast the
-> current version runs, not before. If I split first I could never answer "what did that cost
-> you?" - and being able to answer that is the entire point of doing it.
-
-**What changed:** The engine stays in-process through M3. Once the 1/2/4/8-worker throughput
-numbers exist, Stockfish and the position cache get extracted into a separate **analysis
-service** behind an HTTP contract, as its own PR, and the benchmark is re-run.
-
-**Why:** The system is already service-oriented in the way that matters - three
-independently deployable processes (API, ingest worker, analysis worker) that scale
-separately, fail separately, and communicate *asynchronously through the jobs table* rather
-than by calling each other. Full textbook microservices would actively hurt it: a database
-per service would break the report queries, which are single SQL statements joining games,
-moves and positions, and replacing those with eventual consistency buys nothing. Many
-services sharing one database is the "distributed monolith" anti-pattern, which is exactly
-what an interviewer probes for when they hear the word.
-
-Extracting *the engine specifically* is the one split with real justification: it owns
-Stockfish and the cache behind a versioned contract, engine replicas scale independently of
-queue workers, an engine upgrade deploys without touching ingestion, and it enables **request
-coalescing** - four workers asking for the same position concurrently collapse into one
-engine call, which raises the effective cache hit rate rather than just moving code around.
-
-The ordering is the important part. The entire value of the split is being able to say what
-it cost, and that requires an in-process baseline to compare against. Splitting first makes
-"what did the network boundary cost you?" unanswerable.
-
-**Alternatives rejected:**
-- *Extract it now*: same architecture, no baseline, no measurement, nothing to say about it.
-- *Full microservices (DB per service + message bus)*: breaks M4's analytics and invites the
-  distributed-monolith critique.
-- *Never split*: fine engineering, but leaves a measurement worth having unmeasured.
-
-**Talking point:** "I deliberately did not start with microservices. The processes were
-already decoupled through a queue, which is the property people actually want. Then I
-extracted the engine into its own service once I had baseline throughput numbers, so I could
-measure what the boundary cost instead of assuming. It also let the service coalesce
-duplicate position requests across workers, which a shared in-process cache could not do."
-
-**Where:** planned for after M3.
-
----
-
-## 2026-11-05 - A health check that doesn't exercise the real path lies to you `DONE`
-
-> **In plain English:** Before using the downloaded chess engine, the installer tests that it
-> works. My test was far too shallow - it asked the engine to introduce itself, which it could
-> do, and then the engine crashed the instant it was asked to actually think about a chess
-> position. I made the test ask it to think, pushed the fix, and it failed again in exactly
-> the same way: the engine turns out to have two separate "brains", one for crowded boards and
-> one for nearly-empty ones, and my test only ever used the one that worked. The takeaway is
-> that a self-test proves only what it actually does. "It started up" is not "it can do its
-> job".
-
-**This is the best bug in the project so far. CI found it, twice, and the second time proved
-my first fix wrong.** Learn this one properly - it is the "tell me about a bug you hit"
-answer.
-
-**What changed:** The installer's SIMD probe now runs **two** searches - a dense position and
-a sparse one - and requires both to return a move. It originally sent only `uci`.
-
-**The failure:** The fallback chain for CPUs without AVX-VNNI was designed in from the start.
-It did not fire. CI failed with:
-
-```
-chess.engine.EngineTerminatedError: engine process died unexpectedly
-    (exit code: -4, binary not compatible with cpu?)
-```
-
-Exit code -4 is `SIGILL`: an illegal instruction. The AVX-VNNI binary was running on a runner
-whose CPU has no AVX-VNNI, exactly the case the fallback existed to handle.
-
-**Root cause, attempt 1 (wrong fix):** the probe only performed the UCI handshake. Answering
-`uci` prints strings and never reaches the vectorised evaluation code, so a binary that cannot
-evaluate anything passes it. Note which test agreed with the broken probe:
-`test_engine_starts_and_reports_pinned_version` **passed** while
-`test_engine_finds_a_mate_in_one` failed - the test that merely started the engine was wrong
-in precisely the same way the probe was wrong. I made the probe search `startpos` at depth 8
-and pushed.
-
-**It failed again, identically.** The probe reported "searched" and the same two tests died.
-
-**Root cause, attempt 2 (the real one):** Stockfish 18 has **two NNUE networks** - `EvalFile`
-and `EvalFileSmall` (visible as separate UCI options) - and it selects the small one for
-sparse positions and large material imbalances. The two have **separate vectorised code
-paths**. Searching `startpos` is a dense position, so it exercises the big net only. The
-illegal instruction lived in the small net's code. Both failing tests touch sparse positions:
-a six-piece mate-in-one directly, and a depth-14 search that simplifies into endgames deep in
-its tree. So the probe tested the half of the engine that worked.
-
-The fix is to probe a dense position *and* a sparse one - the minimum that touches both nets.
-
-**The transferable lesson:** a health check is only worth the code paths it executes. "The
-process started" is not "the process can do its job", and "it handled one request" is not "it
-can handle every kind of request". The same reasoning is why `/health` and `/ready` are
-separate endpoints here, and why the queue tests kill a worker mid-job rather than asserting
-that the worker starts.
-
-**Alternatives rejected:**
-- *Pin the baseline `sse41-popcnt` build everywhere*: guaranteed to run, and throws away real
-  nodes/sec on the machine doing hours of analysis.
-- *Read CPU flags from `/proc/cpuinfo` or `cpuid`*: platform-specific, and - as this bug
-  shows - a proxy for "does it work" rather than the thing itself. Running the binary is the
-  direct test. Had I done this, I would have had to know in advance that the small net
-  needed AVX-VNNI too.
-- *Catch the crash at analysis time and retry with another build*: moves a setup failure into
-  the hot path, to be re-discovered once per job forever.
-
-**Talking point:** "I had a fallback for CPUs that lacked the instruction set, and it didn't
-fire - my probe only did the UCI handshake, which doesn't touch the vectorised evaluation
-code. I fixed it to actually search a position, and CI failed again in exactly the same way.
-It turned out Stockfish 18 has two neural networks, a big one and a small one for sparse
-positions, with separate SIMD code paths - and my probe only ever searched the opening
-position, so it tested the half that worked. The second fix searches a dense position and an
-endgame. What I took from it is that a health check is worth exactly the code paths it
-executes - the first fix felt like a real fix and was still testing the wrong half."
-
-**Where:** `tools/fetch_stockfish.py` (`smoke_test`), regression test
-`tests/test_stockfish_binary.py::test_smoke_test_rejects_an_engine_that_cannot_search`, which
-fakes both failure modes: an engine that answers the handshake but never moves, and one that
-serves the first search then dies. CI runs
-[42047974613](https://github.com/ot7Deity/Chess-coach/actions/runs/42047974613) and
-[42048894115](https://github.com/ot7Deity/Chess-coach/actions/runs/42048894115).
-
----
-
-## 2026-11-05 - Engine downloads are checksum-verified and SIMD-probed `DONE`
-
-> **In plain English:** The project downloads Stockfish - the chess engine that does the actual
-> judging - off the internet and then runs it. Two things had to be handled. First, a download
-> that has been tampered with or truncated should fail loudly rather than run, so every
-> download is checked against a fingerprint recorded in the project. Second, the engine comes
-> in several builds aimed at different generations of processor, and the fastest build doesn't
-> politely slow down on an older chip - it crashes outright. So the installer tries the fastest
-> build, actually runs it, and steps down a level if it fails.
-
-**What changed:** `tools/fetch_stockfish.py` downloads Stockfish against SHA-256 digests
-pinned in `tools/stockfish.lock.json`, then picks the right build for the CPU by trying
-`avxvnni` then `avx2` then `sse41-popcnt` and running a UCI smoke test on each.
-
-**Why:** Two separate problems.
-
-*Supply chain:* the build pipeline downloads an 80 MB binary from the internet and then
-executes it on every worker. Verifying it against a digest pinned in the repo costs three
-lines and means a compromised or truncated download fails loudly instead of running. The
-digests come straight from the GitHub release API, so no manual hash copying was involved.
-
-*Portability:* picking a SIMD build is not a preference, it is a hard constraint - a binary
-compiled for AVX-VNNI does not degrade on a CPU that lacks it, it dies with an illegal
-instruction. This laptop is Meteor Lake and has AVX-VNNI; GitHub Actions runners are older
-Ice Lake server parts that do not. One hardcoded choice breaks either local dev or CI. So the
-script tries the fastest first and falls back, and "does it work" is answered by actually
-starting the engine and speaking UCI to it, because an illegal instruction cannot be detected
-any other way.
-
-Note that the *architecture* may differ between machines while the *version* may not: all
-SIMD variants of the same release return identical evaluations, just at different speeds. The
-version is what cached evaluations depend on.
-
-**Alternatives rejected:**
-- *`curl | tar` in the Dockerfile*: no verification, no fallback, and it would have silently
-  picked a build that crashes in CI.
-- *`apt-get install stockfish`*: version floats with the base image, which would invalidate
-  the position cache on an unrelated image rebuild.
-- *Detect CPU flags from `/proc/cpuinfo` or `cpuid`*: platform-specific, and still needs the
-  smoke test as a backstop. Running the binary is the direct test.
-
-**Talking point:** "The engine binary is downloaded and executed by every worker, so it is
-verified against a checksum pinned in the repo. The more interesting part is SIMD: the fast
-AVX-VNNI build raises an illegal instruction on the older CPUs GitHub Actions uses, and you
-cannot catch that with a try/except - so the installer tries builds fastest-first and smoke
-tests each one by speaking UCI to it. Local dev gets the fast binary, CI gets a working one,
-and both are the same Stockfish version, which is what my cache keys depend on."
-
-**Where:** `tools/fetch_stockfish.py`, `tools/stockfish.lock.json`,
-`tests/test_stockfish_binary.py`.
-
----
-
-## 2026-11-05 - CI tests against real Postgres and Redis, not mocks `DONE`
-
-> **In plain English:** The automated tests run against a real database, not a simplified
-> stand-in. The hardest problem in this project is making sure that when several background
-> workers are chewing through a pile of games, no two ever grab the same game - and that
-> depends on specific guarantees only the real database makes. A stand-in would have given me
-> a reassuring green tick while hiding the one bug I actually care about.
-
-**What changed:** GitHub Actions runs two jobs - lint, and tests against `postgres:17` and
-`redis:7` service containers.
-
-**Why:** The riskiest code in this project is the job queue, and its correctness lives
-entirely in behaviour SQLite and mocks cannot reproduce: `SELECT ... FOR UPDATE SKIP LOCKED`,
-transaction visibility between concurrent workers, and row-level locking. A test suite that
-mocked the database would pass while the queue handed the same job to two workers. The same
-argument applies to the Redis token bucket, whose whole purpose is coordination between
-processes - a faked Redis tests nothing.
-
-Engine tests are opt-in via `STOCKFISH_PATH` and the binary is cached by release tag, so a
-fresh clone can run the unit suite immediately without an 80 MB download.
-
-**Alternatives rejected:**
-- *SQLite for tests*: fast, and would make the one part of the system worth testing untestable.
-- *A mocked Redis*: tests the mock, not the coordination.
-- *Testcontainers*: works, but Actions service containers are already there and need no
-  Docker-in-Docker setup.
-
-**Talking point:** "CI runs against a real Postgres because the queue's correctness is
-`SKIP LOCKED` and row-level locking - behaviour you cannot mock. If I had tested against
-SQLite, the suite would have been green while two workers analysed the same game."
-
-**Where:** `.github/workflows/ci.yml`, `tests/conftest.py`.
-
----
-
-## 2026-11-05 - Classify blunders on capped evaluation, not raw centipawn loss `DECIDED`
-
-> **In plain English:** The report labels your bad moves as blunders, mistakes or
-> inaccuracies, based on how much each one cost you. My first rule just measured the raw drop,
-> which gets things backwards in real games: a sloppy move in an already-hopeless position
-> looked like a catastrophe, while the single move that threw away a drawn game barely
-> registered. The fix treats "already winning by a mile" and "already losing by a mile" as
-> single states, so only swings that genuinely change the result count. This matters because
-> it's the headline number of the whole report.
-
-**What changed:** The design doc's rule was "blunder = lost >= 300 centipawns". The
-implementation will clamp both evaluations to +/-1000 cp *before* subtracting, and store the
-raw evals and `mate_in` separately.
-
-**Why:** Centipawn loss is not linear in how much a mistake matters. Going from -900 to -1300
-is a 400 cp "blunder" by the naive rule, but the game was already lost - nothing changed.
-Going from +50 to -250 is only 300 cp but it is the move that threw a drawn game. Raw
-centipawn diffing therefore over-reports blunders in losing positions and under-reports the
-ones that actually cost the game - which would make the headline number of the whole report
-wrong. Clamping to +/-1000 means "already winning/losing by a lot" is treated as a single
-state, so swings inside it stop registering.
-
-**Alternatives rejected:**
-- *Raw centipawn loss* (the doc's version): simplest, but produces the bias above.
-- *Win-probability delta* (convert cp to expected score, diff that): this is what Lichess
-  does and it is the most correct option. Rejected **for now** because it adds a tuned
-  sigmoid whose constants would be unexplainable, and clamping captures most of the benefit.
-  Revisit once the first report exists - the raw evals are stored, so it is a re-computation,
-  not a re-analysis.
-
-**Talking point:** "My first classification rule was wrong in a way that only shows up in
-real data: it called moves in already-lost positions blunders. I kept the raw evaluations in
-the database precisely so I could change the rule without burning hours of engine time again
-- re-classifying 220k positions is a SQL update, re-analyzing them is six hours of CPU."
-
-**Where:** will land in `src/chess_coach/analytics/` and the `moves.classification` column.
-
----
-
-## 2026-11-05 - Pin Stockfish 18, not the latest release `DECIDED`
-
-> **In plain English:** I deliberately use an older release of the chess engine rather than the
-> newest one. The newest is published for Windows only, and I write the code on Windows but run
-> the real workload on Linux servers - so I'd have ended up with two different engines giving
-> two different opinions on the same position. Since the project saves engine opinions and
-> reuses them later, mixing two versions would quietly poison the saved results.
-
-**What changed:** The engine is pinned to Stockfish `sf_18`, using the `avxvnni` build.
-
-**Why:** Two reasons. First, `sf_19` (the latest) ships **Windows binaries only** - no Linux
-build. Development happens on Windows and the workers run in Linux containers, so `sf_19`
-would mean a different engine version on each side, or compiling from source in the
-Dockerfile. `sf_18` ships prebuilt binaries for both. Second, and more important: a cached
-evaluation is only valid for the engine version that produced it, so having dev and
-production on different versions would quietly poison the shared cache.
-
-The `avxvnni` variant is chosen because this machine is an Intel Core Ultra 7 155H (Meteor
-Lake), which has AVX-VNNI but no AVX-512. Picking the right SIMD build changes nodes/sec
-measurably, and nodes/sec is the input to every throughput number in this project.
-
-**Alternatives rejected:**
-- *Latest release (`sf_19`)*: no Linux binary, so dev and prod engines would diverge.
-- *Compile from source in the Dockerfile*: reproducible, but adds minutes to every image
-  build for no benefit over a pinned official binary.
-- *Debian's `stockfish` apt package*: unpinned and several versions behind; the version would
-  change under us on a base-image bump, silently invalidating the cache.
-
-**Talking point:** "I pinned an older engine release on purpose. The newest one had no Linux
-build, and since my cache keys include the engine version, running different versions locally
-and in production would have meant cache misses everywhere - or worse, if I had keyed the
-cache on position alone, silently mixing evaluations from two engines."
-
-**Where:** `tools/fetch_stockfish.py`, `Dockerfile`, `.env.example`.
-
----
-
-## 2026-11-05 - Position cache is keyed on (position, engine version, depth) `DECIDED`
-
-> **In plain English:** The same chess position turns up in thousands of different games, so
-> the engine's verdict on it is worked out once and reused - that's what makes analysing
-> thousands of games affordable. The subtlety is that a "verdict" isn't a fact about the
-> position; it's what *this* engine concluded after thinking *this* hard. So each saved verdict
-> is filed under all three. Without that, turning the thinking time down for a quick
-> experiment would have permanently replaced good results with rushed ones, and nothing
-> anywhere would have warned me.
-
-**What changed:** The design doc made `positions.fen_hash` the primary key. The primary key
-will instead be `(fen_hash, engine_version, depth)`.
-
-**Why:** An evaluation is not a property of a position - it is the output of *one engine* at
-*one search depth*. With a bare `fen_hash` key, the first worker to see a position writes its
-eval and every later lookup gets that row back regardless of what it asked for. Lower the
-depth for a fast local run and those shallow evals become permanent; upgrade the engine and
-you are mixing two engines' judgments in the same report. Neither failure throws an error -
-the numbers just quietly stop meaning anything, which is the worst kind of bug to have in the
-one feature the whole project is about.
-
-**Alternatives rejected:**
-- *Bare `fen_hash`* (the doc's version): silently serves wrong-depth and wrong-engine evals.
-- *Store only the deepest eval per position, overwrite on deeper search*: avoids duplicates
-  and is tempting, but makes a benchmark at depth 12 destroy the depth-16 data it is
-  measuring against, and makes "cache hit rate at depth N" unanswerable.
-
-**Talking point:** "This is the cache bug I designed out before it happened. A cache key has
-to include everything the value depends on. My value depended on engine version and search
-depth, not just the board position - so if I had keyed on position alone, lowering the depth
-for a quick test run would have permanently contaminated the dataset with shallow
-evaluations, with no error message anywhere."
-
-**Where:** will land in `src/chess_coach/models.py` and the `positions` migration.
-
----
-
-## 2026-11-05 - Fixed search depth, never movetime `DECIDED`
-
-> **In plain English:** When you ask the engine about a position you can either say "think for
-> one second" or "think this many moves ahead". I always use the second. "Think for one second"
-> gives a different answer depending on how busy the computer happens to be, which makes the
-> answer impossible to save and reuse, and makes my speed measurements meaningless - adding
-> more workers wouldn't make the system faster, it would just make every answer sloppier while
-> the numbers looked unchanged.
-
-**What changed:** Stockfish is always asked for a fixed `depth`, never a time budget.
-
-**Why:** A movetime search returns whatever it managed to compute in N milliseconds, so the
-same position gives different answers depending on machine load - and that makes the result
-uncacheable, because a cache entry has to be reproducible to be trustworthy. It also makes
-the 1/2/4/8-worker benchmark meaningless: with movetime, more workers would not run faster,
-they would each just search more shallowly, and throughput would look constant.
-
-**Alternatives rejected:** *movetime* (common in casual analysis scripts, and what most
-tutorials use) - fails both reproducibility and benchmarking. *Node-limited search* is
-reproducible too and would work, but depth is the unit the chess world quotes, so it is
-easier to compare against Lichess and Chess.com.
-
-**Talking point:** "Fixed depth rather than fixed time, because a time-limited search isn't
-reproducible, and an unreproducible result can't be cached or benchmarked. It also means my
-scaling numbers measure throughput instead of silently measuring search quality."
-
-**Where:** `.env.example` (`ENGINE_DEPTH`), `src/chess_coach/config.py`.
-
----
-
-## 2026-11-05 - Sync Python throughout, not async `DONE`
-
-> **In plain English:** There's a popular programming style ("async") that pays off when a
-> program spends most of its time waiting for other computers to reply. This program barely
-> waits - it spends its time on heavy calculation. Using that style here would have added real
-> complexity to the most delicate part of the system and bought no speed at all. To go faster
-> I run more copies of the program instead, which is what actually uses the rest of the
-> processor.
-
-**What changed:** SQLAlchemy sync sessions and `def` (not `async def`) FastAPI handlers.
-
-**Why:** The design doc listed "async" as a reason to pick FastAPI, but nothing here benefits
-from it. The analysis workers are CPU-bound - they block on a Stockfish subprocess, which
-async cannot speed up. The ingest worker is rate-limited to about one request per second on
-purpose, so there is no concurrency to exploit. Meanwhile async SQLAlchemy would make the
-queue's `SELECT ... FOR UPDATE SKIP LOCKED` transaction handling considerably harder to
-reason about, in the one part of the system where correctness matters most.
-
-FastAPI runs `def` handlers in a threadpool, so blocking database calls are safe. Declaring
-them `async` while doing blocking I/O inside is the actual footgun - it stalls the event loop
-and is one of the most common FastAPI mistakes.
-
-**Alternatives rejected:** *async everywhere*: more fashionable, more complexity, and it
-would make the transactional queue code harder to get right for zero throughput gain on a
-CPU-bound workload.
-
-**Talking point:** "I used sync Python deliberately. The expensive work is a Stockfish
-subprocess pegging a core - async doesn't make a CPU-bound task faster, it just adds
-complexity to the transaction handling in my job queue. I scale with processes, not
-coroutines, because that is what actually uses the other 15 cores."
-
-**Where:** `src/chess_coach/api/main.py`, and all future worker/db code.
-
----
-
-## 2026-11-05 - Chess.com contact email lives only in gitignored `.env` `DONE`
-
-> **In plain English:** Chess.com asks any program using their data to say who to contact if it
-> misbehaves, and a program that doesn't risks being blocked. But this project's code is public
-> on GitHub, and an email address sitting in public code gets harvested by spam bots within
-> days. So the address lives in a private settings file that is never published: Chess.com gets
-> it with every request, the open internet doesn't.
-
-**What changed:** The `User-Agent` is built at runtime as
-`ChessCoach/0.1 (<CHESSCOM_CONTACT>)`, with the real address read from `.env`.
-`.env.example` ships a placeholder and `.env` is gitignored.
-
-**Why:** Chess.com asks API clients to identify themselves with contact information, and an
-unidentified client risks being throttled or blocked - a failure that is miserable to debug
-mid-build. But this repository is public, so a hardcoded address would be scraped by bots
-within days. Reading it from the environment satisfies Chess.com on every request without
-publishing the address.
-
-**Alternatives rejected:** *hardcoded in source* (scraped); *no contact info at all*
-(risks a block that looks like a mysterious ingestion bug).
-
-**Talking point:** "Third-party API etiquette: their docs ask for a contactable User-Agent,
-so every request carries one, but it comes from the environment rather than source because
-the repo is public. Same reason the database URL isn't committed."
-
-**Where:** `src/chess_coach/config.py` (`Settings.user_agent`), `.env.example`.
-
----
-
-## 2026-11-05 - Seven corrections to the design doc, found by calling the API first `DONE`
-
-> **In plain English:** Before writing any of the code that pulls games off Chess.com, I spent
-> ten minutes simply asking their service for a few real games and reading what came back.
-> Seven things in my design document turned out to be wrong - including that the field I had
-> planned to use for naming chess openings contains a web link rather than the opening's name,
-> which would have broken one of the four features the report is built around. These were the
-> cheapest fixes in the project, because none of that code had been written yet.
-
-**What changed:** Before writing any ingestion code, the Chess.com API was called directly to
-check what it actually returns. Five assumptions in the design doc were wrong.
-
-**Why / what was found:**
-
-1. **`eco` in the JSON is a URL, not an ECO code** (`.../openings/Closed-Sicilian-Defense-...`),
-   and it is missing on about 2% of games. The real code is in the PGN header `[ECO "B24"]`.
-   The doc's plan to store `opening_eco` straight from the JSON field would have filled the
-   column with URLs - and "results by opening" is one of the four report features.
-2. **`rules` is not always `chess`.** `chess960`, `bughouse`, `crazyhouse`, `kingofthehill`
-   and `threecheck` all appear in archives. Stockfish cannot evaluate those positions, so
-   they must be ingested but marked `analysis_status='skipped'` - not dropped, or our game
-   count would disagree with Chess.com's and look like an ingestion bug.
-3. **Clocks are real and per-move:** `{[%clk 0:01:01.3]}` comments on every move. The
-   "accuracy under 30 seconds on the clock" feature is buildable, which was not certain.
-4. **Some games have `SetUp`/`FEN` headers** - a non-standard starting position. The analysis
-   worker has to start from that FEN or it will replay the moves onto the wrong board.
-5. **`accuracies` is already in the response** - Chess.com's own accuracy numbers for most
-   games. Storing them gives free ground truth to check our own pipeline against.
-6. **`If-None-Match` genuinely returns `304` with 0 bytes**, confirmed against a live archive.
-   The entire re-sync design depends on this, so it was worth 30 seconds to verify.
-7. **The player-side `result` vocabulary is wide**: `win`, `resigned`, `timeout`,
-   `checkmated`, `stalemate`, `insufficient`, `repetition`, `agreed`, `abandoned`... A
-   `result` column holding these raw needs normalizing to win/loss/draw for reporting, with
-   the raw termination kept for the "how do I lose" breakdown.
-
-**Talking point:** "Before I wrote the ingestion layer I spent ten minutes just calling the
-API and reading the response, and found five things my design document had wrong - including
-that the field I planned to use for opening classification contains a URL, not an opening
-code. Cheapest bug fixes in the project, because none of them had been written yet."
-
-**Where:** `docs/DESIGN.md` keeps the original assumptions; corrections land in
-`src/chess_coach/chesscom/`.
-
----
-
-## 2026-11-05 - Python pinned to 3.12, though 3.14 is installed `DONE`
-
-> **In plain English:** The project runs on an older version of Python than the one installed
-> on my laptop. The libraries it depends on ship ready-made installers for each Python
-> version, and the newest version often has gaps - when one is missing, your computer tries to
-> build the library from scratch, which on Windows means losing an afternoon. On top of that,
-> my laptop, the test system and the server all have to be on the same version, or "it works
-> on my machine" becomes the normal state of affairs.
-
-**What changed:** `.python-version` pins 3.12; `requires-python = ">=3.12,<3.13"`; uv manages
-the interpreter.
-
-**Why:** The machine has Python 3.14.3 system-wide. Packages with compiled extensions
-(`psycopg`, `pydantic-core`) publish prebuilt wheels per Python version, and a version that
-new often has gaps - a missing wheel means pip tries to compile from source, which on Windows
-means needing a C++ toolchain and an afternoon lost. 3.12 has wheels for everything here. The
-project also has to run on the same version in CI and in the container, so pinning is
-necessary regardless; this just pins to a boring version.
-
-**Alternatives rejected:** *use 3.14*: nothing in the project needs it, and it trades real
-setup risk for no feature. *Leave it unpinned*: guarantees local, CI and container drift apart.
-
-**Talking point:** "I pinned 3.12 rather than the newest Python because binary wheel coverage
-matters more than language features here, and because local, CI and the container have to be
-the same interpreter or 'works on my machine' becomes the default failure mode."
-
-**Where:** `.python-version`, `pyproject.toml`.
-
----
-
-## 2026-11-05 - Repo moved out of OneDrive to `C:\dev\chess-coach` `DONE`
-
-> **In plain English:** I moved the project folder off OneDrive. A project like this generates
-> tens of thousands of small working files, and OneDrive tries to back up every one of them as
-> it changes. While it's doing that it holds files open, which makes installs and test runs
-> fail with "permission denied" and "file in use" - errors that look exactly like bugs in your
-> own code and send you hunting in the wrong place. GitHub is already the backup.
-
-**What changed:** The repository was moved from `OneDrive\Desktop\Chess coach\` to
-`C:\dev\chess-coach` while it was still empty.
-
-**Why:** A Python virtualenv and `node_modules` are tens of thousands of small files.
-OneDrive tries to sync every one of them, which is slow, burns bandwidth, and - the real
-problem - holds file handles open. A sync running during an install or a test run produces
-"permission denied" and "file in use" errors that look like bugs in your code. Moving before
-any code existed made it a one-line operation.
-
-**Alternatives rejected:** *stay in OneDrive and gitignore the heavy directories*: gitignore
-stops git from tracking them, but OneDrive still syncs them - it does not read `.gitignore`.
-
-**Talking point:** Minor, but a real one: "cloud-sync folders and build artifacts don't mix.
-Git plus GitHub is already the backup; OneDrive on top of it just adds file locks."
-
-**Where:** repository root. Git remote unchanged.
-
----
-
-## 2026-11-05 - Line endings normalized to LF via `.gitattributes` `DONE`
-
-> **In plain English:** Windows and Linux disagree about the invisible character that marks the
-> end of a line in a text file. I write the code on Windows; it runs on Linux. Without a rule
-> forcing one convention, startup scripts fail with error messages that tell you nothing useful,
-> and the project history shows whole files as rewritten when only one line actually moved.
-
-**What changed:** `* text=auto eol=lf` plus explicit rules for `.py`, `.sh`, `.yml`, `.sql`.
-
-**Why:** Development is on Windows (CRLF), while CI and the containers are Linux (LF). Without
-normalization, every file committed from Windows arrives in the container with CRLF - which
-makes shell scripts fail with a confusing `\r: command not found`, and makes diffs show whole
-files as changed when only one line moved.
-
-**Talking point:** "Cross-platform hygiene: I develop on Windows and deploy to Linux
-containers, so the repo stores LF and checkouts convert. Otherwise a shebang line with a
-carriage return breaks an entrypoint script and the error tells you nothing useful."
-
-**Where:** `.gitattributes`.
-
----
-
-## 2026-11-05 - One PR per feature, merged with a merge commit `DONE`
-
-> **In plain English:** Every change goes through the same formal review-and-test step a team
-> would use, even though I'm the only person on the project. Two things come out of that: the
-> main copy of the code is always in a working state I can go back to, and every decision has
-> a written explanation attached to it. That written trail is why I can still explain choices
-> I made months earlier - and it's where the entries in this file come from.
-
-**What changed:** Every feature gets a `feat/*` or `chore/*` branch, a PR with a written
-description, CI, and a merge (not a squash).
-
-**Why:** CI gates `main`, so `main` always has a working state to go back to. A merge commit
-rather than a squash keeps the individual commits on `main`, which preserves the order the
-work was actually done in - useful when writing the project up later. Each PR description
-records what changed and why, which is where the entries in this file come from.
-
-**Talking point:** "Every change went through a PR with CI, even solo. It kept main
-deployable and gave me a written trail of why each decision was made - which is how I can
-still explain choices I made months earlier."
-
-**Where:** `.github/workflows/`, repository history.
-
-<!-- M4 ENTRIES BELOW (report SQL, report and sync API). Newest first. -->
-## 2026-11-16 - Bug: a merge quietly deleted 1,670 lines of documentation `DONE`
-
-> **In plain English:** While restacking the branches, a merge of m4/3 into m4/4 needed to resolve a conflict in INTERVIEW_PREP.md. I took m4/4's version without noticing it was a short stub, not the full file. The result silently dropped all the UI dashboard entries, all earlier M4 entries, and all M2 entries—1,670 lines of design decisions. The PR diff made it obvious only after the fact: a PR that should add ~40 lines showed -4,099 lines. The tester found it by looking at the line diff; tests passed because documentation has no tests.
-
-**How it was found:** The tester saw a PR diff stat showing 4,099 lines removed and asked what happened. A conflict was resolved by keeping m4/4's short version wholesale, dropping everything else.
-
-**Root cause:** When resolving a merge conflict by taking one side, I didn't verify that the conflict was truly exclusive (m4/4 had newer entries) instead of one side being incomplete (m4/4 had *only* its own entries, missing earlier ones).
-
-**Fix:** Restore from m4/3, then re-add m4/4's new entry at the top. For INTERVIEW_PREP conflicts going forward: never take one side wholesale; keep both sides' entries, with newer ones first in each section.
-
-**Lesson:** A large diff stat against the parent (not comparing two sides of a conflict) is a red flag for a merge resolution mistake. Tests don't catch documentation loss. Check the diff yourself when conflict resolution touches vital files.
-
-**Where:** This entry is the fix.
-
-
-
-## 2026-11-16 - Bug: re-adding a player showed 'failed' forever `DONE`
-
-> **In plain English:** The website lets you re-add a player—say, to retry a download that failed. When you did, the page showed "The download from Chess.com failed" with the old error, and it never changed even after the queued retry succeeded. The page keeps checking for new work while there's work to do, but once a sync fails the page stops checking, so it missed the retry happening in the background. The bug was in the API: it queued the retry but didn't tell the page "oh, that failed sync is now pending again."
-
-**A bit deeper:** A sync worker claims a job, tries to fetch from Chess.com, and if it fails sets `players.sync_status = 'error'` and the error message. When you POST the same username again, the API calls `enqueue_sync` to re-arm the old job back to `pending`. But the response's `sync_status` was still `error` because the endpoint returned it from memory without refreshing from the database. The page saw "error" and stopped polling. A tester caught it by reading `Progress.tsx`'s polling rule against the API response spec and seeing they could diverge.
-
-**How it was found:** The tester read Progress.tsx and noticed its polling rule: "poll while there's work, stop once work is done." Then checked what the API says in both cases: (1) sync failed, page stops; (2) POST to retry, then GET — does the page see the job is pending again? The API still said "error", so the page would never poll again even though the work restarted.
-
-**Root cause:** The fix lives in the API, not the UI, because another browser tab's GET would still see the stale error forever. The endpoint had to update `sync_status` and `sync_error` in the same transaction as the job re-arm.
-
-**Fix:** In `add_player`, after `enqueue_sync` returns a job id (meaning a job was re-armed): `UPDATE players SET sync_status = 'pending', sync_error = NULL WHERE id = :id AND sync_status <> 'syncing'`. The last condition prevents clobbering an in-progress sync if one is already running. If `enqueue_sync` returns None (a job was already queued or running), leave `sync_status` alone; the sync worker owns it.
-
-**Talking point:** "The API queued a retry of a failed sync but didn't update sync_status, so the response still said 'error'. The UI's polling rule (stop when work is done) was correct; the API's response was stale. The fix is atomic: when the API re-arms a job, it atomically updates status in the same transaction, so a GET after the POST always sees the queued work."
-
-**Where:** `src/chess_coach/api/players.py` (`add_player`), `tests/test_api_players.py`.
 
 ## 2026-11-06 - "Under 30 seconds" means the clock when you *started* the move `DONE`
 
@@ -1797,6 +175,8 @@ would hand a move with unknown timing the full starting clock. Picking the first
 row_number keeps unknown as unknown."
 
 **Where:** `src/chess_coach/analytics/report.py`, `tests/test_report_moves.py`.
+
+---
 
 ## 2026-11-06 - Which openings cost me rating: a window function, checked against real data `DONE`
 
@@ -1856,6 +236,8 @@ fixture exactly."
 
 **Where:** `src/chess_coach/analytics/report.py`, `src/chess_coach/analytics/progress.py`,
 `tests/test_report_games.py`.
+
+---
 
 ## 2026-11-06 - Asking for a sync is a queued job, and a re-sync re-arms the old one `DONE`
 
@@ -1918,11 +300,103 @@ fencing token for leases - resetting it would let a stale worker's old lease mat
 **Where:** `src/chess_coach/ingest/jobs.py`, `src/chess_coach/jobrunner.py`,
 `src/chess_coach/worker.py`, `tests/test_sync_jobs.py`.
 
+---
+
+## 2026-11-06 - My explanation was wrong, the code was right, and real data showed it `DONE`
+
+> **In plain English:** To work out how long a player spent on each move, my code takes
+> their clock before the move, subtracts their clock after it, and adds back the bonus
+> seconds the game gives per move. Next to that code I wrote an explanation: "the clock
+> doesn't run on your first move, so the first move always costs zero". The project's tester
+> checked my formula against every move of my 4,550 real games, and found the formula was
+> right - but my explanation was not. In most games the clock *is* running on the first move.
+> The formula never relied on that claim, so it gave the right answers anyway. I deleted the
+> wrong sentence. A wrong comment is a trap for the next person who reads it.
+
+**A bit deeper:** A *code comment* is a claim that no test checks. Mine claimed a fact about
+Chess.com's clocks that I had inferred from one synthetic example. The formula (previous
+reading - this reading + increment, with the base time as the "previous reading" for a
+player's first move) is correct whether or not the first move is free, so the false claim
+never caused a wrong number - which is exactly why nothing caught it.
+
+**Measured, by the tester, read-only over the 4,550 real games (254,553 plies):**
+- The formula produces **0** negative move times. Treating `%clk` as if it excluded the
+  increment would have produced **31,262** - so the readings really do include the increment.
+- White's first reading is already **below** the base time in **1,018 of 1,143** bullet games
+  without increment, so the first move is not free.
+
+**Fix:** the docstring in `analysis/clock.py` now states what was measured instead of the
+false claim, and a test comment that repeated it was corrected. No code changed.
+
+**Lesson:** I had tested the formula and explained it with a guess. Tests check behaviour;
+nothing checks prose. When a comment states a fact about someone else's system, it should
+be a fact somebody measured, and say so.
+
+**Talking point:** "A reviewer ran my move-time formula over a quarter of a million real moves.
+The formula was right - zero negative times, versus 31,000 if I'd misread the clock format -
+but the comment explaining it claimed the first move is free, and in 1,018 of 1,143 games it
+isn't. The code never depended on the claim, so nothing failed. I fixed the comment, and now
+the docstring cites the measurement instead of my guess."
+
+**Where:** `src/chess_coach/analysis/clock.py`, `tests/test_clock.py`.
+
 <!-- end of M4 entries -->
 
 ---
 
 <!-- UI ENTRIES BELOW (dashboard). Newest first. -->
+
+## 2026-11-06 - The dashboard's container bakes in the API address, on purpose and loudly `DONE`
+
+> **In plain English:** The website now has its own container, so it can be started next
+> to the rest of the app with one command. One setting - where the website should look for
+> the server - has a catch: it is written into the website when the container is *built*,
+> not when it is *started*, and it has to be the address your own browser can reach, not
+> the nickname the containers use for each other. Get either wrong and the page would
+> quietly show sample data or an error. So the build now refuses to run without that
+> address, and the instructions say exactly which address to use.
+
+**A bit deeper:** Next.js copies any `NEXT_PUBLIC_*` variable into the JavaScript it sends
+to the browser while it builds, so changing it at `docker run` does nothing. And the
+dashboard calls the API *from the browser*: inside Docker's network the API is
+`http://api:8000`, but a browser on the laptop cannot resolve `api`; it needs
+`http://localhost:8000`. That second point is the classic mistake in a compose setup.
+
+**What changed:** `web/Dockerfile` (three stages: `npm ci`, `next build` with standalone
+output, and a runtime stage that copies only the traced server and static files and runs
+as the unprivileged `node` user, with a health check), `web/.dockerignore`, and
+`next.config.ts` turning on standalone output only when the image asks for it.
+
+**Why:**
+
+- *Fail the build without the address.* An empty value would not error: it would build
+  the sample-data dashboard, which looks like a working site showing someone else's games.
+  `WEB_FIXTURES=1` builds that on purpose.
+- *Standalone output.* Next traces the files the server actually uses, so the runtime
+  image has no full `node_modules`, no source and no build tools.
+- *`.dockerignore` excludes `node_modules`.* The host's copy was installed on Windows and
+  contains Windows-native compiler binaries; the Linux build must install its own.
+- *Standalone only in Docker,* so `npm start` keeps working on a laptop.
+- *CORS ties the port:* the API allows `http://localhost:3000`, so compose maps the
+  dashboard to host port 3000. Moving it means adding the new origin to the API.
+
+**Alternatives rejected:**
+- *Runtime config* (a `/config.js` served by the container, or a server-side proxy): it
+  would let one image serve any API, but it adds a moving part to a dashboard that runs in
+  exactly one place. Revisit if the dashboard is ever deployed to more than one
+  environment from one image.
+- *Proxy the API through Next (`/api/*` rewrites)*: it hides CORS, but makes the dashboard
+  server a hop on every request, and the API is meant to be called directly.
+
+**Talking point:** "In Next.js, `NEXT_PUBLIC_` variables are build-time constants inlined
+into the browser bundle, so the image is built with the API's browser-visible address -
+`localhost:8000`, not the compose service name, which a browser can't resolve. The build
+fails without it, because the alternative failure is silent: a dashboard happily showing
+sample data."
+
+**Where:** `web/Dockerfile`, `web/.dockerignore`, `web/next.config.ts`.
+
+---
 
 ## 2026-11-06 - Bug: my win rate claimed to match Chess.com, and didn't `DONE`
 
@@ -2435,6 +909,813 @@ things break, and a dashboard has nothing to gain from being first."
 
 <!-- M3 ENTRIES BELOW (position cache, scaling, metrics). Newest first. -->
 
+## 2026-11-06 - Measured: what one cache lookup costs, layer by layer `DONE`
+
+> **In plain English:** Before the real speed test, I timed the cache itself. Getting a saved
+> answer from Redis takes about half a thousandth of a second; from the main database, about
+> five times longer. The big win is asking for a whole game's positions at once instead of one
+> by one: **15 times faster** from Redis and **47 times faster** from the database - like
+> handing the librarian your whole list instead of walking back to the desk for each book.
+> And when Redis is switched off, the shortcut I built to skip it makes each lookup about
+> **90 times faster** than knocking on Redis's door every time.
+
+**A bit deeper:** A *microbenchmark* times one small operation in isolation, many times, and
+reports the *median* (the middle value, which ignores rare slow outliers). These are not
+throughput numbers - those come from the worker benchmark once the real worker exists - but
+they explain where a game's cache time goes, and they check two design decisions: the batch
+lookup and the circuit breaker.
+
+**Results** (`uv run python -m bench.cache_micro`; Windows 10 laptop, Postgres 17 and Redis 7.4
+in Docker Desktop on the same machine; medians):
+
+| Measurement | Median |
+| --- | ---: |
+| One `get` served by Redis | 0.53 ms |
+| One `get` served by Postgres (Redis-less cache) | 2.39 ms |
+| One `get` that misses both layers | 3.14 ms |
+| A game's 80 positions, 80 single `get`s, Redis | 46.2 ms |
+| A game's 80 positions, one `get_many`, Redis | 3.04 ms |
+| A game's 80 positions, 80 single `get`s, Postgres | 305.8 ms |
+| A game's 80 positions, one `get_many`, Postgres | 6.53 ms |
+| One `put` (Postgres insert + Redis copy) | 6.64 ms |
+| One `get` with Redis unreachable, breaker open | 5.90 ms |
+| One `get` with Redis unreachable, no breaker | 526 ms |
+| Redis memory per entry (benchmark's longer key and engine name) | 208 B |
+
+**What it shows:**
+- *Batching is the biggest single win:* 15x via Redis, 47x via Postgres, because a game's
+  lookups become one or two round trips instead of 80.
+- *Redis is worth ~3.5 ms per game over Postgres alone* when batched (3.0 vs 6.5 ms). That's
+  real but small next to a depth-16 Stockfish search, and it's why `POSITION_CACHE=postgres`
+  exists: the worker benchmark will show whether Redis matters at system level, instead of me
+  assuming it does.
+- *The breaker matters:* 526 ms without it is two 0.25 s timeouts per lookup (the read, then
+  the backfill write); with it, the lookup costs a Postgres read.
+- *208 bytes per entry* here versus 184 in my earlier spot check: this run's key and engine
+  name are longer (`bench:micro:<tag>:micro-<tag>:...`). The production key format is close to
+  the earlier one.
+
+**Caveats, stated plainly:** one laptop, Docker Desktop's virtual network (a Linux server would
+be faster for both layers), warm connection pools, no concurrent load. A `put` includes a
+commit, so it measures Postgres's write path, not the cache's logic.
+
+**Talking point:** "I microbenchmarked the cache before the system benchmark. Redis answers a
+lookup in about half a millisecond against two and a half for Postgres, but the much bigger
+lever was batching: a whole game's eighty lookups in one round trip is fifteen times faster
+from Redis and forty-seven times faster from Postgres. And the circuit breaker turns a Redis
+outage from half a second per lookup into the cost of a normal database read."
+
+**Where:** `bench/cache_micro.py`; results JSON in `bench/results/` (gitignored).
+
+---
+
+## 2026-11-06 - I quoted a measurement from a script nobody else could run, and overstated it `DONE`
+
+> **In plain English:** Earlier I wrote that when the chess engine "remembers" its last
+> question, its scores shift slightly but its recommended move stays the same. When I turned my
+> quick throwaway test into a proper tool that lives in the project, so anyone can rerun it,
+> the scores still shifted, but **half the recommended moves changed too**. My first claim
+> was based on looking at only five examples. Like saying "everyone in the class passed"
+> after checking half the papers.
+
+**A bit deeper:** The original number came from a one-off script in a scratch folder, which
+printed only the first five positions whose scores differed. All five kept the same best
+move, so I wrote "with the same best move" for all ten - a *generalisation from a truncated
+sample*. The reproducible version, `bench/engine_determinism.py`, compares every position
+and reports scores and best moves separately.
+
+**Symptom:** The repo script disagreed with the number already written in four places.
+
+**How I found it:** Rerunning the measurement from the committed script before quoting it in
+a later entry, as the project's "measured numbers only" rule requires.
+
+**Root cause:** Two things. The claim was wider than the evidence (5 rows seen, 10 claimed).
+And the evidence lived in a scratch file, so nobody - including me - could check it later.
+
+**Fix:** Every place that quoted it now says what the committed script measures at depth 14
+on this machine: two cold runs identical; warm vs cold, **10/10 scores differ (by 1 to 54
+centipawns) and 5/10 best moves differ**. The original PR's text was not rewritten (it was
+already pushed); the correction lands in this later change and says so.
+
+**Lesson:** A number in an interview-prep doc should come with the command that reproduces
+it. And when a result is summarised from a printout, check the printout showed every row.
+
+**Why it matters more than it looks:** "same best move" made the non-determinism sound
+cosmetic. A changed best move means a cached "you should have played X" can depend on which
+worker happened to evaluate the position first - which is exactly why the producer now
+evaluates from a cleared hash.
+
+**Where:** `bench/engine_determinism.py`; the corrected lines in the Postgres-store, Redis-layer
+and contract entries; `src/chess_coach/cache/position_cache.py` (module docstring).
+
+---
+
+## 2026-11-06 - The benchmark said "no cache" had a 100% cache hit rate `DONE`
+
+> **In plain English:** One way to show the cache is worth having is to run the same work with
+> the cache switched off and compare. When I tested that, the benchmark reported that the
+> switched-off cache answered **every** question - a perfect score for something that wasn't
+> there. It worked out "how often did we skip the engine" by counting how many new answers got
+> saved. With the cache off, nothing gets saved, and "nothing new saved" looks exactly like
+> "we never needed the engine". Like judging how much homework someone did by how many pages
+> they handed in, when they weren't allowed to hand anything in.
+
+**A bit deeper:** The harness measures from the database. It counts engine evaluations as
+*new rows in `positions`* during the round, and computes hit rate = 1 - evaluations /
+lookups. That is an *indirect measurement*, and it silently assumes every evaluation gets
+stored. `POSITION_CACHE=off` (`NullCache`) breaks that assumption: real engine work, zero rows.
+
+**Symptom:** A test I wrote for the no-cache run failed with `assert 1.0 is None`: a 100% hit
+rate where the truth is 0%.
+
+**How I found it:** Writing a test for the "without cache" configuration on purpose, because
+it's the baseline the engine-seconds-saved number is compared against and had never been run.
+The first version of the test only checked the round finished; adding "and the hit rate is
+not nonsense" caught it.
+
+**Root cause:** Treating "no rows" as "no work". Absence of evidence was read as evidence of
+absence.
+
+**Fix:** `measure()` only reports a hit rate when the round stored its evaluations under one
+identifiable (engine version, depth). Otherwise the hit rate is `None`, shown as `-` in the
+table: unknown, which is honest, instead of 100%, which is the opposite of the truth. For the
+no-cache baseline the right source is the workers' own `chess_coach_positions_evaluated_total`
+counter, once metrics are wired into the real worker.
+
+**Lesson:** An indirect measurement carries the assumptions of the thing it reads from. Test
+every configuration a number will be reported for, especially the baseline: every comparison
+is made against it. Here, "no cache: 100% hit rate" next to "with cache: 60%" would have made
+the cache look worse than nothing.
+
+**Where:** `bench/harness.py::measure`,
+`tests/test_bench_end_to_end.py::test_the_no_cache_baseline_runs_too`.
+
+---
+
+## 2026-11-06 - My "time saved" sum compared two different sets of positions `DONE`
+
+> **In plain English:** The benchmark reports how much engine time the cache saved: "what it
+> would have cost with no saved answers" minus "what it actually cost". My first version took
+> the first number from one list of positions and the second number from a slightly bigger
+> list - like working out your savings by comparing the price of the groceries on your list
+> with what you paid for everything in the bag, including the snacks you added at the till.
+> The answer always came out a bit too small.
+
+**A bit deeper:** The worker evaluates the position before every move *plus* the final
+position of each game. The "no cache" cost was summed from the `moves` table, which has one
+row per move and so never includes the final position. The "actually spent" cost was summed
+from every `positions` row computed during the run, which does include it. Subtracting
+across two different populations biases the result.
+
+**Symptom:** None yet - caught before the first run, while writing the test's expected
+values by hand from the PGNs.
+
+**How I found it:** To assert an exact number I had to say exactly which positions each side
+covered, and the two sides didn't match.
+
+**Root cause:** A difference of two sums whose ranges weren't the same set.
+
+**Fix:** Both sides now cover only positions some move refers to; final positions are left
+out of both (documented as a slight undercount). The end-to-end test asserts the saved seconds
+exactly: (plies - distinct ply positions) x engine milliseconds per evaluation.
+
+**Lesson:** Writing the expected value by hand, from first principles, is a design review of
+the formula. If you can't say exactly what an assertion should equal, the code doesn't know
+either.
+
+**Where:** `bench/harness.py::measure`,
+`tests/test_bench_end_to_end.py::test_a_two_round_benchmark_measures_the_workload_exactly`.
+
+---
+
+## 2026-11-06 - The scaling benchmark measures from the database, not from the workers `DONE`
+
+> **In plain English:** To find out how much faster eight workers are than one, I built a
+> test rig. It gives the same pile of games to 1, then 2, 4 and 8 workers, with the saved
+> answers wiped before each round so every round starts equal, and times how long each round
+> takes. The timing comes from the database's own record of when each game was finished, not
+> from the workers' claims - like timing a race with the finish-line camera instead of asking
+> the runners. The real numbers wait for the real worker.
+
+**A bit deeper:** The harness is a *closed workload* benchmark: a fixed set of games, the same
+every round. Each round resets those games, empties the position cache (in Postgres and
+Redis), enqueues one job per game, launches N worker processes and waits until the games all
+have `analyzed_at`. Throughput, plies per second, cache hit rate and engine seconds saved are
+all computed with SQL afterwards. It refuses to run against a database whose name lacks
+"bench" or "test", because it deliberately wipes state.
+
+**What changed:** `bench/harness.py` (reset, enqueue, launch, measure - the previous change)
+and `bench/throughput.py`, the driver: rounds, JSON in `bench/results/` (gitignored, with
+per-worker logs), the markdown table and the CLI, run as `uv run python -m bench.throughput
+--games 200 --workers 1 2 4 8 -- <worker command>`. A stand-in worker for end-to-end tests is
+the next change.
+
+**Why the details are the way they are:**
+- *Measured from the database.* A worker's own counters can be wrong or lost with the
+  process. `analyzed_at` and the `positions` rows are the ground truth.
+- *Cold cache every round.* Otherwise round 2 is served from round 1's cache and "2 workers"
+  looks impossibly fast. The hit rate that remains is real reuse *within* the workload -
+  shared openings - which is what a new user's first sync looks like.
+- *The worker command is an argument with placeholders* (`{worker_id}`, `{index}`, `{n}`,
+  `{metrics_port}`), passed after `--` so Windows paths need no quoting. It defaults to
+  `chess-coach-worker`; M2's exact flags plug in without changing the harness.
+- *Job format is configurable* (`--job-type`, `--job-payload`, `--dedupe-key`) because M2
+  owns it; the defaults are `analyze_game`, `{"game_id": N}` and `analyze-game:N` (the key
+  format `models.Job` documents), and the harness assumes nothing beyond them.
+- *A known bias, written down:* if two workers evaluate one position simultaneously only the
+  winner's row exists, so the loser's engine time is invisible to SQL and the hit rate reads
+  slightly high at large N. The workers' Prometheus counters count both and will be the
+  cross-check once wired.
+
+**Alternatives rejected:**
+- *Trust worker logs for throughput*: lost with a crash, and easy to double-count.
+- *Warm cache between rounds*: measures the cache, not the workers.
+- *Wait for M2 before writing the harness*: the harness's arithmetic would then be debugged on
+  the first real run, which is the run whose numbers go in the README.
+
+**Talking point:** "The benchmark is a fixed workload run at 1, 2, 4 and 8 workers with the
+cache wiped between rounds, and every number comes from SQL over the database afterwards -
+completion timestamps, rows written - not from what the workers say about themselves. I built
+it before the real worker existed, so when real numbers arrive the only unknown is the
+system."
+
+**Where:** `bench/harness.py`, `bench/throughput.py`, `tests/test_bench_harness.py`,
+`tests/test_bench.py`.
+
+---
+
+## 2026-11-06 - A default that only exists in Python is not a default `DONE`
+
+> **In plain English:** The benchmark puts jobs into the queue table directly. I assumed the
+> table would fill in the boring columns itself - priority, attempt count - because the
+> program's own code never mentions them either. But those blanks are filled in by the
+> program's helper layer, not by the database. Talk to the database directly and nothing fills
+> them in, so it refuses the row. It's like assuming a form auto-fills your address because
+> the website always does, then getting the paper version.
+
+**A bit deeper:** In SQLAlchemy, `mapped_column(default=100)` is a *client-side default*:
+the ORM adds the value when *it* builds the INSERT. A *server default* (`server_default=`) is
+part of the table and applies to any INSERT from anywhere. `jobs.priority`, `attempts` and
+`max_attempts` are `NOT NULL` with client-side defaults only.
+
+**Symptom:** None - caught before the first run.
+
+**How I found it:** Reviewing the harness's raw `INSERT INTO jobs (type, payload, status,
+dedupe_key)`, I checked the migration for which columns had `server_default`. Those three
+didn't.
+
+**Root cause:** Reading the model (`default=100`) as if it described the table.
+
+**Fix:** The harness's INSERT names every `NOT NULL` column. A schema change (adding server
+defaults) would be the other fix, but migrations belong to M2, so it's noted for them rather
+than done here.
+
+**Lesson:** The ORM model describes what the ORM does; the migration describes what the
+database enforces. Anything that bypasses the ORM - a benchmark, a `psql` session, a
+second service - only gets the second.
+
+**Where:** `bench/harness.py::enqueue`, `migrations/versions/0001_initial_schema.py`,
+`tests/test_bench_harness.py::test_enqueue_fills_every_not_null_column_and_replaces_its_own_jobs`.
+
+---
+
+## 2026-11-06 - Metrics: one scoreboard per worker, added up by Prometheus `DONE`
+
+> **In plain English:** To say "eight workers are this much faster than one" I need numbers,
+> not impressions. So every worker keeps a scoreboard - games finished, positions the engine
+> worked out, how often the saved answers were used, how much engine time that saved - and
+> shows it on a small web page. A separate tool, Prometheus, visits every worker's page every
+> few seconds and adds them up. It is like each cashier in a shop keeping their own tally, and
+> the manager collecting all the tallies at closing.
+
+**A bit deeper:** Prometheus is a *pull*-based monitoring system: each process exposes
+`/metrics` over HTTP and Prometheus *scrapes* it. *Counters* only go up (games analyzed),
+*gauges* go up and down (is Redis in use right now), and *histograms* sort measurements into
+buckets so you can ask for percentiles (how long a job takes). *Labels* split one metric into
+series, e.g. cache lookups by `result` and `layer`.
+
+**What changed:** `src/chess_coach/metrics.py` defines every metric for M2/M3: games analyzed
+(by outcome), positions evaluated, engine seconds, cache lookups by result/layer, engine
+seconds saved, cache writes, Redis errors, corrupt values, eval conflicts, a Redis-up gauge,
+job claim latency and job duration histograms, jobs retried and dead-lettered. The cache
+records its own; the rest are defined now and wired into M2's worker after it merges.
+`start_metrics_server()` serves `/metrics` on `METRICS_PORT + worker_index`.
+
+**Why the details are the way they are:**
+- *One endpoint per process, not prometheus-client's multiprocess mode.* That mode exists
+  for forking web servers that share one port. These workers are independent processes, so
+  each is its own scrape target and PromQL sums them:
+  `sum(rate(chess_coach_games_analyzed_total[5m]))`.
+- *`METRICS_PORT=0` (off) by default.* With a fixed default port, the second worker on one
+  machine would crash on startup with "address in use".
+- *Every label value starts at zero.* A series only appears after its first event, so "zero
+  jobs dead" would otherwise look the same as "no data". All known label combinations are
+  created at import.
+- *Hit rate as two labels, not one.* `result=hit|miss` and `layer=redis|postgres|none` give
+  the overall hit rate *and* Redis's share of the hits from one metric.
+- *Engine seconds saved is a counter of the hits' `compute_ms`.* It is what those hits would
+  have cost on the machine that originally computed them, which is the honest definition.
+- *`127.0.0.1` by default.* Metrics are not secret, but nothing should listen on every
+  interface of a laptop by default; containers set `METRICS_ADDR=0.0.0.0`.
+
+**Alternatives rejected:**
+- *StatsD / push gateway*: push-based, one more service, and a crashed worker's last numbers
+  linger as if it were alive.
+- *Logging counters and parsing logs*: works for a benchmark, useless for a live dashboard.
+
+**Talking point:** "Every worker is its own Prometheus target, and the interesting numbers are
+sums across them - games per minute, cache hit rate by layer, engine seconds saved. I
+pre-initialise every label so a dashboard shows a real zero instead of a gap, and metrics are
+off by default so eight workers on one box can't fight over a port."
+
+**Where:** `src/chess_coach/metrics.py`, `src/chess_coach/cache/position_cache.py`,
+`tests/test_metrics.py`, `tests/test_position_cache.py` (Prometheus section).
+
+---
+
+## 2026-11-06 - The contract said two answers would always match. They didn't `DONE`
+
+> **In plain English:** The shared rulebook between the worker and the cache said: "ask the
+> engine about the same position twice and you get the same answer". My cache relied on that.
+> It wasn't true. The engine remembers what it was thinking about a moment ago, and that memory
+> nudges its next answer by a few points. The fix belongs to the side that asks the engine: wipe
+> its memory before each question, so the answer really depends only on the position. My side
+> got a smoke alarm: if two answers for one position ever disagree again, the program writes a
+> warning and counts it, instead of quietly keeping one.
+
+**A bit deeper:** A *contract* is the agreement between two parts of a system about what each
+promises. This one promised that an evaluation is a *pure function* of (position, engine
+version, depth) - same inputs, same output. Stockfish keeps a *hash table* of earlier searches
+and reuses it, and it also sees the *halfmove clock* (moves since the last capture or pawn
+move, which feeds the 50-move draw rule). Both change the score without changing the cache
+key. The cache keeps *first write wins*; what is new is *detection*.
+
+**Symptom:** None in production - there is no production yet. On paper: a cache keyed on
+something that does not fully determine the value.
+
+**How I found it:** I measured it while writing the Postgres store: ten positions at depth 14
+were identical across two cold runs, but with a warm hash table **all ten scores moved, by 1 to
+54 centipawns, and five of the ten best moves changed** (reproducible with
+`uv run python -m bench.engine_determinism`). The reviewer agent then confirmed it
+independently with real Stockfish and found the second cause, the halfmove clock.
+
+**Root cause:** The key leaves out two inputs that the value depends on: the engine's leftover
+state, and the move counters that `normalize_fen` deliberately drops. It's the project's
+recurring bug once more: a cache key missing something its value depends on.
+
+**Fix:** On the producer side (M2): evaluate a history-free board (halfmove clock 0) with a
+cleared hash and one thread, so the value really is a function of the key. On the cache side
+(this change):
+- A losing `put` reads the stored row and compares score, mate distance and best move. If they
+  differ, it logs `cache.eval_conflict` with both verdicts and counts it (`eval_conflicts`;
+  Prometheus in the metrics change). The first write still wins. Averaging or overwriting
+  would hide exactly the problem this is meant to surface.
+- Nodes and timings are not compared - they legitimately differ between machines.
+- The comparison costs one primary-key `SELECT`, and only on a losing write.
+- `mate_in == 0` ("the side to move is checkmated", no best move) now has its own tests through
+  the codec, Postgres and Redis, so 0 can never turn into "no mate" or back. Both layers already
+  handled it - nothing tests truthiness - but a value with a special meaning deserves a test.
+
+**Lesson:** I wrote "Stockfish isn't bit-identical" into the cache's docstring as a reason for
+first-write-wins, and stopped there. The more useful question was "then what is my key
+actually missing?" - which pointed at the producer. When you find out a guarantee is false,
+fix it where it's made, then make any future breach loud where it lands.
+
+**Talking point:** "My cache relied on a contract saying the same position, engine and depth
+always produce the same score. I measured it: with a warm hash table, ten out of ten scores
+moved and half the best moves changed. The fix was on the producer - evaluate from a cleared hash with the
+move counters reset, so the value really is a function of the key. On the cache side I kept
+first-write-wins and added a tripwire: a losing write that disagrees with the stored answer is
+logged and counted. Silent disagreement was the problem, so I made it loud instead of trying
+to paper over it."
+
+**Where:** `src/chess_coach/cache/position_cache.py` (`put`, `_check_agreement`),
+`tests/test_position_cache.py` (the determinism-rule tests and
+`test_mate_in_zero_is_not_confused_with_no_mate`), `tests/test_cache_codec.py`.
+
+---
+
+## 2026-11-05 - One failed Redis call cost ten seconds, and two "identical" clients disagreed `DONE`
+
+> **In plain English:** I wanted to know exactly what happens when the fast store (Redis) is
+> switched off, so I timed it instead of guessing. One question to a missing Redis took almost
+> **ten seconds** to give up - even though I had told it to wait only a quarter of a second.
+> The library was quietly trying ten more times before admitting failure, like a phone that
+> automatically redials a dead number ten times before telling you nobody is there. Stranger
+> still, the library's two ways of creating a connection behave differently: one redials ten
+> times, the other never redials. My code used the safe one by luck. Now it says so on
+> purpose.
+
+**A bit deeper:** A *timeout* is how long to wait for a reply; a *retry policy* is how many
+times to try again, with what pauses (*backoff*) in between. In redis-py 8.1,
+`redis.Redis(host=...)` comes with 10 retries and exponential backoff by default, while
+`redis.Redis.from_url(...)` comes with none. Separately, on Windows, connecting to a local port
+that nothing is listening on does not fail instantly the way it does on Linux - it waits for
+the full timeout - and `localhost` is tried twice (once as the IPv6 address, once as IPv4).
+
+**Symptom:** A measurement script against a closed port ran for minutes instead of seconds.
+
+**How I found it:** I measured one `GET` against a closed port in every combination (median of
+5, Windows 10, redis-py 8.1.0):
+
+| Client | 0.25 s timeout | 2 s timeout |
+| --- | ---: | ---: |
+| `Redis(host="localhost")`, library default | 9,639 ms | 48,455 ms |
+| `Redis(host="127.0.0.1")`, library default | 6,687 ms | 26,384 ms |
+| `localhost`, retries off | 527 ms | 4,020 ms |
+| `127.0.0.1`, retries off | 261 ms | 2,008 ms |
+
+Then I printed each client's retry object: 10 retries for the constructor, 0 for `from_url`.
+
+**Root cause:** Three things stacking up: a library default of ten retries that only one
+constructor applies; Windows timing out instead of refusing; and `localhost` resolving to two
+addresses. The timeout I set was a per-attempt number, not a total.
+
+**Fix:** `cache_redis_client()` pins the policy explicitly - `Retry(NoBackoff(), 0)`, 0.25 s
+timeout - instead of inheriting whichever default the constructor happens to have. A real
+"unreachable Redis" test builds its client through the same function.
+
+**Lesson:** The timeout you configure is per attempt; the time a failure actually costs is
+attempts x timeout x addresses, plus backoff. Measure the failure path. And never rely on a
+library default for something that matters - here two constructors in one library disagreed.
+
+**Where:** `src/chess_coach/cache/__init__.py::cache_redis_client`,
+`tests/test_position_cache.py::test_an_unreachable_redis_server_is_survivable`.
+
+---
+
+## 2026-11-05 - When Redis is down, analysis carries on from Postgres `DONE`
+
+> **In plain English:** Redis is only a shortcut, so if it breaks, the program should simply
+> stop using the shortcut and keep working. But "try the shortcut, notice it's broken, take the
+> long way" costs time on every single question. So after the first failure the program stops
+> trying Redis at all for 30 seconds, then checks once whether it is back. It is like a road
+> closure: once you hit it, you take the detour for a while rather than driving up to the
+> barrier every time.
+
+**A bit deeper:** This is a *circuit breaker*. A Redis connection error or timeout *opens* it:
+for 30 seconds the cache goes straight to Postgres. After that the next call tries Redis once;
+success *closes* the breaker again. Writes made in the meantime go to Postgres only and are
+copied back into Redis the next time they are read. Postgres errors are not caught - without
+Postgres there is no queue and no work, so failing the job is correct.
+
+**What changed:** `PositionCache` catches Redis errors around both pipelines and trips the
+breaker; `cache_redis_client()` builds a fail-fast client; two settings,
+`POSITION_CACHE_REDIS_TIMEOUT_SEC` (0.25) and `POSITION_CACHE_REDIS_RETRY_SEC` (30).
+
+**Why, with the measured cost:** one failed command costs 261 ms against `127.0.0.1` and
+527 ms against `localhost` on this machine, even with retries off (entry above). A game is one
+batched read plus one write per new position - about 80 Redis calls. Without the breaker that
+is roughly 20-40 extra seconds per game while Redis is down. With it, the outage costs one
+timeout per 30 seconds per worker.
+
+- *A write rejected by a live Redis is different.* Out of memory under `noeviction` returns an
+  error for that one command while reads still work, so it is counted and logged but does not
+  open the breaker.
+- *One log line per state change*, not one per failed call: `cache.redis_unavailable` when the
+  breaker opens, `cache.redis_recovered` when it closes.
+
+**Alternatives rejected:**
+- *Let the error fail the job*: the queue retries it, Redis is still down, and every game
+  dead-letters - a cache outage turns into a total outage.
+- *Catch and retry inside every call*: correct, and costs a timeout per call (above).
+- *Health-check Redis in a background thread*: more moving parts in a sync worker for the same
+  result; the next real call is the health check.
+
+**Talking point:** "Redis is a cache, so losing it should cost speed, not correctness. I timed
+a dead Redis first - 260 to 530 milliseconds per call even with retries off, and almost ten
+seconds with the library's default retries. At eighty calls a game that's a big slowdown, so
+there's a small circuit breaker: the first failure sends the cache to Postgres for thirty
+seconds, then it tries Redis once. There's a test with a real client pointed at a closed port,
+so the exceptions are the ones redis-py really raises."
+
+**Where:** `src/chess_coach/cache/position_cache.py` (`_redis_failed`, `_redis_usable`),
+`src/chess_coach/cache/__init__.py`, `tests/test_position_cache.py` ("Redis unavailable").
+
+---
+
+## 2026-11-05 - The test clean-up deleted nothing, because of square brackets `DONE`
+
+> **In plain English:** Every test that uses Redis gets its own private label for the data it
+> creates, so that afterwards it can sweep up exactly its own mess and nobody else's. The
+> sweeping used a "find everything starting with my label" search. But some of my tests have
+> names with square brackets in them, and in that kind of search square brackets are a special
+> symbol, not ordinary letters. So the search found nothing, the sweep deleted nothing, and
+> every run left junk behind. Nothing failed - I only noticed because I went and looked.
+
+**A bit deeper:** Redis's `SCAN MATCH` takes a *glob pattern*, where `*`, `?` and `[...]` are
+wildcards. pytest names a *parametrized* test (one test run with several inputs) like
+`test_x[sf_18-12]`, and the shared test fixture builds each test's key prefix from that name.
+In a glob, `[sf_18-12]` means "one character from this set", so `prefix*` no longer matches
+the prefix itself.
+
+**Symptom:** None in the test results. After a green run, Redis database 3 held 24 keys
+starting `test:test_another_engine_or_depth_is_a_miss_in_both_layers[...]`.
+
+**How I found it:** Reviewing my diff, I checked that my own `purge_redis` escaped glob
+characters - and then asked whether the shared fixture's cleanup did. It didn't. Then I
+counted the keys to confirm.
+
+**Root cause:** `tests/conftest.py::redis_client` cleans up with `scan_iter(match=prefix +
+"*")`, prefix unescaped, prefix containing the test name.
+
+**Fix:** `conftest.py` is shared, not mine to change, so my test module has an autouse fixture
+that swaps in a prefix with the glob characters replaced and cleans that up itself. After the
+fix: 0 keys left after a full run. The one-line fix for `conftest.py` (escape the prefix, or
+build it from a hash of the node id) is reported to the owner. I deleted the 24 leaked keys
+by name in my own database - never `FLUSHDB`, which would hit other agents' keys.
+
+**Lesson:** Clean-up code needs a test too; "the test passed" says nothing about what it left
+behind. And any string that goes into a pattern language - glob, regex, SQL `LIKE` - has to be
+escaped, including ones you built yourself from "safe" names.
+
+**Where:** `tests/test_position_cache.py::glob_safe_prefix`;
+`src/chess_coach/cache/position_cache.py::_glob_escape` (the same bug, avoided in
+`purge_redis`).
+
+---
+
+## 2026-11-05 - Redis in front of Postgres, and Redis may only ever copy Postgres `DONE`
+
+> **In plain English:** The main database is reliable but each question to it takes a moment.
+> Redis is a much faster store that keeps everything in memory, so the most-used answers are
+> kept there too, like keeping the books you use every day on your desk instead of walking to
+> the library shelf. The important rule: the desk copy is only ever a photocopy of what is on
+> the shelf. Answers go on the shelf first, and only the person whose answer actually got
+> shelved may put a copy on the desk. So the desk can be missing a book, but it can never have
+> a *different* book from the shelf. And books you have not opened in a week get cleared off
+> the desk, while the ones you use every day stay.
+
+**A bit deeper:** Redis is the *hot layer* of a two-level cache; Postgres is the *source of
+truth*. Reads try Redis, then Postgres, and copy a Postgres hit back into Redis (*backfill*).
+Writes go to Postgres first; only the writer whose insert won copies its value to Redis. Each
+Redis entry has a *TTL* (time to live) that is reset whenever the entry is read, a *sliding
+expiry*, so frequently used entries stay and one-off ones age out.
+
+**What changed:** `PositionCache` now takes an optional Redis client. `get_many` pipelines the
+Redis reads, sends what Redis lacked to Postgres in one query, and pipelines the backfill.
+`build_eval_cache()` picks the configuration from `POSITION_CACHE` (`full` / `postgres` /
+`off`). New settings in their own block in `config.py` and `.env.example`.
+
+**Why the details are the way they are:**
+- *Postgres first, and only the winner writes Redis.* Two workers can compute different scores
+  for one position (measured: a warm hash table moved 10/10 scores and 5/10 best moves). If
+  both wrote Redis, Redis could end up with the loser's value while Postgres kept the winner's.
+  Writing Redis first has the same flaw. With this order, every value Redis has ever held is
+  one Postgres committed, so the two can disagree only by Redis *missing* an entry - and a
+  missing entry costs one Postgres read.
+- *Sliding TTL via `GETEX`.* Opening positions recur across thousands of games; most
+  middlegame positions occur once. Refreshing the TTL on read keeps the first kind and lets the
+  second expire, so Redis holds the working set rather than the history. `GETEX` reads and
+  refreshes in one command, so it costs no extra round trip. Default 7 days; `0` disables.
+- *Keys:* `<prefix><engine_version>:<depth>:<sha256 hex>`. Hex so they are readable in
+  `redis-cli`; a versioned prefix (`chess_coach:pos:v1:`) so the whole Redis copy can be
+  orphaned at once without touching Postgres.
+- *A bad Redis value is a miss.* Undecodable, wrong type, or for a different search: counted,
+  logged, and overwritten by the backfill.
+- *Three round trips per game, not 160.* Measured by counting pipelines and SQL statements in
+  a test: a 60-position batch with 20 in Redis, 20 only in Postgres and 20 new is exactly two
+  Redis pipelines and one `SELECT`.
+- *`purge_redis()`.* The one way Redis could outlive Postgres is someone deleting `positions`
+  rows by hand; this deletes the matching Redis entries, scoped by engine and depth.
+
+**Alternatives rejected:**
+- *Redis only*: Redis is memory, so a restart or eviction would throw away hours of engine
+  time. Postgres keeps every evaluation forever, which the reports need anyway.
+- *Postgres only*: kept as a configuration (`POSITION_CACHE=postgres`) precisely so the
+  benchmark can measure what Redis adds, rather than assuming it.
+- *No TTL, rely on Redis eviction*: the local Redis runs with `maxmemory 0` and `noeviction`
+  (checked with `CONFIG GET`), so without a TTL it would grow forever.
+- *Write-through to Redis on every put, winner or not*: the disagreement bug above.
+
+**Talking point:** "The rule I designed around is that Redis may only ever hold a copy of
+something Postgres has committed. Writes go to Postgres first with `ON CONFLICT DO NOTHING
+RETURNING`, and only the writer that actually won copies to Redis. That means Redis can be
+missing an entry, which costs one database read, but it can never hold a different answer
+from the database - so I never have to decide which one is right."
+
+**Where:** `src/chess_coach/cache/position_cache.py`, `src/chess_coach/cache/__init__.py`,
+`tests/test_position_cache.py`.
+
+---
+
+## 2026-11-05 - My decoder was stricter than my encoder `DONE`
+
+> **In plain English:** Saved answers go into the fast store in a compact written form, and a
+> reader checks each one carefully before trusting it. My checker was *too* picky: it insisted
+> the "best move" was 4 to 6 letters long, but the program is allowed to save other values. An
+> answer like that would have been saved fine and then rejected every single time it was
+> read - like a library that accepts a book donation and then refuses to ever lend it out.
+> Nothing would have crashed. That one answer would just never come from the fast store, and
+> the only clue would be a slightly worse speed number.
+
+**A bit deeper:** The *encoder* turns an evaluation into bytes for Redis and the *decoder*
+turns bytes back into an evaluation. The decoder rejects anything suspicious and reports it
+as a cache miss, which is the safe failure. But a decoder must accept *everything the encoder
+can produce from valid data*, or valid data becomes a permanent miss. The rule in one line:
+`decode(encode(x)) == x` for every legal `x`.
+
+**Symptom:** None yet - it was caught before any test or real data hit it.
+
+**How I found it:** Reviewing my own diff before pushing, asking "what valid input does this
+check refuse?" of every validation line. `Evaluation` does not restrict `best_move` at all;
+the `positions` column allows up to 6 characters; my decoder demanded 4 to 6.
+
+**Root cause:** I wrote the check from what a UCI move *usually* looks like ("e2e4", "e7e8q"),
+not from what the system actually permits. The two disagreed at the edges - an empty string,
+or anything shorter than four characters.
+
+**Fix:** The decoder is now exactly as strict as the database column and no stricter: a string
+of at most 6 characters, or null. A round-trip test includes the UCI null move `0000`.
+
+**Lesson:** A validator on the read side of a cache has to match the write side's real
+domain, not my mental picture of the data. Too loose serves garbage; too strict silently
+turns good entries into permanent misses - and a cache that quietly misses looks exactly like
+"caching doesn't help much", which is the failure `positions.py` warns about.
+
+**Where:** `src/chess_coach/cache/codec.py` (`decode`), `tests/test_cache_codec.py`.
+
+---
+
+## 2026-11-05 - I "knew" a Redis hash costs more memory. I measured: it doesn't `DONE`
+
+> **In plain English:** I wrote down a reason for a choice - "this way of storing things in
+> Redis uses several times less memory" - without checking it, because it is the kind of thing
+> everyone says. Before publishing it I measured. The difference was under 10%. My choice was
+> still right, but for a different reason, and an interviewer who knew Redis well would have
+> caught the wrong one immediately.
+
+**A bit deeper:** Redis can store a value as one *string*, or as a *hash* (a small dictionary
+of named fields). Old advice says hashes cost far more memory. Modern Redis stores small hashes
+in a compact packed format (*listpack*), so that advice is out of date for a seven-field hash.
+
+**Symptom:** A claim in a docstring with no number behind it.
+
+**How I found it:** The project's rule is "measured numbers only", so I ran `MEMORY USAGE` on
+one real-shaped entry stored both ways (Redis 7.4, seven-day TTL on both).
+
+**Root cause:** Repeating received wisdom instead of measuring. Result: **184 bytes as a
+string, 200 as a hash.**
+
+**Fix:** The docstring and the codec entry now give the real reason for a string: one `GETEX`
+both reads it and refreshes its expiry, and one `SET` replaces it whole. The 184 bytes is also
+the number that sizes Redis later: about 40 MB if all ~220,000 of my positions were resident at
+once.
+
+**Lesson:** "It's well known that..." is a sentence to measure, not to write.
+
+**Where:** `src/chess_coach/cache/codec.py` (module docstring).
+
+---
+
+## 2026-11-05 - Each cached answer says which question it answers `DONE`
+
+> **In plain English:** The fast store (Redis) keeps copies of the engine's answers, each
+> filed under a label that names the position, the engine version and how deeply it thought.
+> I also write the engine version and depth *inside* each saved answer, and check them when I
+> read it back. It is like writing the question at the top of your answer sheet as well as on
+> the folder: if the sheet ever ends up in the wrong folder, you notice instead of handing in
+> the wrong answer.
+
+**A bit deeper:** Redis stores *key -> value* pairs. The key already includes engine version
+and depth. Repeating them in the value is *defence in depth*: if a bug ever built the wrong
+key, the mismatch would be caught on read and treated as a miss, rather than serving an
+evaluation from a different search as if it were right. The format is a short JSON list with
+a *version number* first, so a future format change cannot be misread as the old one.
+
+**What changed:** `src/chess_coach/cache/codec.py`: `encode` and a strict `decode` that raises
+`CorruptValue` for anything that is not exactly the expected shape.
+
+**The format:** `[1,"sf_18",16,23,null,"e2e4",1234567,412]` - format version, engine version,
+depth, centipawns, mate distance, best move, nodes, engine milliseconds.
+
+**Why:**
+- *The value names its own search.* Serving a depth-12 answer to a depth-16 question is the
+  one failure this project's cache design exists to rule out, and it fails silently. Costs
+  about 12 bytes per entry.
+- *Strict, and a bad value is a miss, never an error.* Redis is a cache; Postgres has the real
+  answer. A corrupt entry must not fail a game's analysis.
+- *Booleans are rejected as integers.* In Python `True` is an `int`, so a value with `true`
+  in it would otherwise decode as a score of 1.
+
+**Alternatives rejected:**
+- *A Redis hash per position* (`HSET` fields): about the same memory (measured: 200 bytes
+  against the string's 184), but reading it and refreshing its expiry is two commands
+  (`HGETALL` + `EXPIRE`) where a string needs one `GETEX`, and a string is replaced whole by
+  one `SET`. See the entry above for how I first got the memory part wrong.
+- *A packed binary struct*: a few bytes smaller, unreadable in `redis-cli` when debugging.
+- *msgpack*: a new dependency for a few bytes.
+- *Pickle*: unpickling data from a shared store executes code; never for a cache.
+
+**Talking point:** "My cache key already has the engine version and depth in it, but the
+cached value repeats them, and the reader refuses a value that answers a different question.
+It costs twelve bytes and turns a whole class of key-building bugs from 'wrong answer served
+silently' into 'cache miss, counted and logged'."
+
+**Where:** `src/chess_coach/cache/codec.py`, `tests/test_cache_codec.py`.
+
+---
+
+## 2026-11-05 - My test asked the database for the wrong shape of answer `DONE`
+
+> **In plain English:** I wrote a test that saves a chess position and then reads it back to
+> check it was stored right. The saving worked. The *test* broke, because I asked for the
+> answer in one format and the database library handed it back in another - like asking a
+> librarian for "the book" and getting a photocopy of each page instead. Nothing was wrong
+> with the program; my check was written for the wrong kind of answer. I fixed the check,
+> not the program.
+
+**A bit deeper:** The project talks to the database through a library (SQLAlchemy) that has
+two levels. The high level, the *ORM*, gives you back Python objects ("a Position"). The low
+level, *Core*, gives you back plain rows of columns. My test used the low-level connection but
+wrote the query the high-level way, so the row it got back had columns called `fen` and
+`eval_cp`, not one column called `Position`.
+
+**Symptom:** `AttributeError: Could not locate column in row for column 'Position'` in the
+test helper, right after a `put` that had worked.
+
+**How I found it:** The traceback pointed at the test's own `row.Position.fen`, not at the
+cache code, and the cache's own read path (which selects named columns) passed.
+
+**Root cause:** `connection.execute(select(Position))` is a Core execution. It expands the
+entity into its columns and returns a plain `Row`; only `Session.execute` wraps rows in ORM
+objects.
+
+**Fix:** The helper reads `row.fen`, `row.eval_cp` directly.
+
+**Lesson:** When a test fails, first ask whether the test or the code is wrong. Here the
+production path was already doing the right thing - it selects explicit columns precisely so
+it never depends on which layer it runs in.
+
+**Where:** `tests/test_position_cache.py::pg_row`.
+
+---
+
+## 2026-11-05 - The cache's Postgres half: first write wins, and writes don't wait for the job `DONE`
+
+> **In plain English:** Working out what the chess engine thinks of one position takes real
+> time, so the answer is saved and reused. This piece is the saving and looking-up, in the
+> main database. Two rules matter. First, if two workers work out the same position at the
+> same moment, the first one to save wins and the second quietly does nothing, so everyone
+> later reads the same answer. Second, each answer is saved the moment it exists, not at the
+> end of the whole game - like writing each answer in the shared notebook as you go, rather
+> than at the end of the exam, so a classmate who needs it now can use it now.
+
+**A bit deeper:** The table is keyed on three things: the position, the engine version and
+the search depth, so an answer from a shallow search can never be handed to someone asking
+for a deep one. Saving uses an *upsert with "do nothing" on conflict*: the database's own
+uniqueness rule decides who was first, which is safe even when several processes write at
+the same instant, and the database reports back whether this write was the one that landed.
+Each save is its own *transaction* (an all-or-nothing unit of work) that commits immediately.
+
+**What changed:** `PositionCache` in `src/chess_coach/cache/`, implementing the `EvalCache`
+contract from `positions.py`: `get`, `put`, and a batch `get_many`.
+
+**Why the details are the way they are:**
+
+- *`INSERT ... ON CONFLICT DO NOTHING RETURNING`.* One statement, and the `RETURNING` row is
+  present only if this writer won. That one bit is what the Redis layer (next PR) needs: only
+  the winner may copy its value anywhere else.
+- *First write wins, rather than last.* Stockfish at a fixed depth is reproducible only from
+  the same starting state. I measured it: 10 positions at depth 14 gave identical results on
+  two runs with the hash table cleared before each search, but when the engine had searched
+  other positions first (as a worker always has), **all 10 scores differed**, by 1 to 54
+  centipawns, and **5 of the 10 best moves changed** (`bench/engine_determinism.py`; this line
+  first said "2 to 27, same best move" - see the correction entry). So two workers can disagree
+  about one position. Either answer is fine; two answers for one key are not.
+- *Its own transaction, not the job's.* An evaluation is a pure function of (position,
+  engine, depth). If the game's job fails on ply 70, the 69 evaluations before it are still
+  correct, and other workers should be able to use them now, not when the job finishes.
+- *`get_many`.* The worker replays the whole PGN before evaluating anything, so it knows all
+  ~80 positions up front. One `WHERE fen_hash IN (...)` query instead of 80, chunked at 1,000
+  keys so a pathological batch never becomes one enormous statement.
+- *`put` checks the FEN against the key.* It re-derives `fen_hash(normalize_fen(...))` from
+  the FEN it was given and refuses a mismatch, so a caller that passed `board.fen()` (with move
+  counters) or the wrong ply's FEN fails loudly instead of storing a misleading row. It uses
+  the contract's own functions, so there is still exactly one hashing scheme.
+- *Stats count distinct positions.* A threefold repetition inside one batch is one lookup, not
+  three, so the hit rate is not inflated by repetitions.
+
+**Alternatives rejected:**
+- *Last write wins (`DO UPDATE`)*: every concurrent evaluation would rewrite the row, and the
+  value a reader saw could change under it.
+- *Write evaluations in the job's transaction*: a failed job would throw away valid work, and
+  concurrent workers could not see each other's results until a whole game finished.
+- *`SELECT` then `INSERT`*: two round trips and a race between them; the constraint already
+  answers "was I first?" atomically.
+
+**Talking point:** "Two workers can evaluate the same position at the same time, and I
+measured that Stockfish at a fixed depth gives a slightly different score once its hash table
+is warm - ten out of ten scores moved, and half the best moves. So the cache needs exactly one
+winner. I let the primary key decide: `INSERT ... ON CONFLICT DO NOTHING RETURNING` tells each
+writer whether it won, in one statement. That one bit matters later, because only the winner
+is allowed to copy its value into Redis."
+
+**Where:** `src/chess_coach/cache/position_cache.py`, `tests/test_position_cache.py` (real
+Postgres, including eight threads racing on the same 25 positions).
+
+---
+
 <!-- end of M3 entries -->
 
 ---
@@ -2445,8 +1726,10 @@ things break, and a dashboard has nothing to gain from being first."
 
 > **In plain English:** The chess engine has a setting for how much scratch memory it may
 > use while thinking. I had assumed that only changes how *fast* it thinks, not *what* it
-> concludes. I measured it anyway, and it does change the answer - rarely and slightly (one
-> position in six, by a fiftieth of a pawn), but it does. The saved answers were filed under
+> concludes. I measured it anyway, and it does change the answer. My quick check found one
+> small difference in six positions. The project's tester then checked 34 positions and found
+> 14 that differed - and in one of them the engine even picked a different best move. The
+> saved answers were filed under
 > a label that named the engine and how deep it thinks, not the memory size. So changing the
 > setting would have mixed two slightly different sets of answers under one label. The label
 > now includes the memory size. And a second setting I had only *warned* about - letting the
@@ -2459,10 +1742,22 @@ is the *hash size*: a smaller table evicts entries during the search and can tak
 different path. The fix extends the *engine version* part of the key, rather than adding a
 column, so the positions table, the cache protocol and every caller stay as they are.
 
-**Symptom / how it was found:** not a production failure - a measurement taken while building
-the engine wrapper. At depth 16 on six positions from one game, Hash = 16 MB gave `-45` where
-64, 128 and 256 MB all gave `-43`; the other five positions agreed. I logged it as an open
-question rather than acting on it; the decision was to fold it into the key.
+**Symptom / how it was found:** not a production failure - measurements, two of them.
+
+- *Mine, while building the engine wrapper:* depth 16, six positions from one game, hash
+  cleared per position, one thread. Hash = 16 MB gave `-45` where 64, 128 and 256 MB all gave
+  `-43`; the other five agreed. I logged it as an open question; the decision was to fold it
+  into the key.
+- *The tester's, afterwards, on a bigger sample:* the same settings (cleared hash, Threads=1,
+  depth 16) on 34 positions. 16 MB vs 128 MB disagreed on **14 of 34**, by up to **9 cp**, and
+  in one position **the best move changed** (`h2h3` vs `c1e3`). Threads=2 was not reproducible
+  from one run to the next.
+
+My six-position sample understated it badly: "one in six by 2 cp" became "four in ten, up to
+9 cp, and a different best move". The changed best move is the part that matters most. A move
+that matches the engine's best move is always graded `best`, so a player who played `c1e3`
+would get `best` under one hash size and be graded on arithmetic under the other - the same
+move, in the same position, at the same depth, with a different label.
 
 **Root cause:** the same one as five times before in this project - a stored value depending
 on an input its key does not name. (The others: engine version and depth in `positions`; the
@@ -2483,17 +1778,19 @@ instead of silently reusing the old ones - which is the point.
   benchmark, and then fails silently.
 - *Add a `hash_mb` column to the key*: correct, but a schema and protocol change across M2 and
   M3 for what the version string already expresses.
-- *Ignore a 2 cp difference*: it would never change a classification today, but "never
-  matters" is a claim about every future position, and the fix is one string.
+- *Ignore it as noise*: that was tempting at 2 cp. At up to 9 cp, and with a best move
+  changing, it can change a classification - and the fix is one string.
 
 **Lesson:** the third time it was caught by reasoning, this time by a measurement taken just
 to check an assumption ("hash size only affects speed"). Measuring the boring assumption is
-cheap; finding a mixed cache later is not.
+cheap; finding a mixed cache later is not. And a second lesson from the tester's re-run: a
+six-sample measurement is enough to show an effect exists, not to say how big it is.
 
 **Talking point:** "Six times now the bug has been the same: a stored value depends on an
 input its key doesn't name. The latest one I found by checking an assumption I was fairly
-sure of - that the engine's hash size only changes speed. It changed one score in six by 2
-centipawns. Tiny, but it means two hash sizes would share cache entries that disagree, so the
+sure of - that the engine's hash size only changes speed. My quick check found a 2 centipawn
+difference; a bigger re-test found 14 of 34 positions differing by up to 9 cp and one best
+move changing - and the best move decides whether a player's move is graded 'best'. So the
 hash size is now part of the engine version. And multi-threading went from a warning to an
 error, because thread timing is an input no key can capture."
 
@@ -3497,6 +2794,51 @@ shared bucket and every worker backs off together."
 `tests/test_chesscom_client.py`.
 
 <!-- end of M1 entries -->
+
+---
+
+<!-- PROCESS ENTRIES BELOW (how the work is merged and reviewed). Newest first. -->
+
+## 2026-11-12 - Merging a stack of PRs too fast merged them into each other, not into main `DONE`
+
+> **In plain English:** Big features here are split into a chain of small changes, each one
+> built on top of the one before, so each is easy to check. When the checker approved a whole
+> chain, I merged them one after another as fast as a script could go. GitHub only re-points
+> the next change at the main copy of the code a moment *after* the one below it lands. My
+> script didn't wait for that moment, so most of the changes were merged into the change
+> below them instead of into the main copy. On top of that, the script printed "Merged" for
+> every one, even the ones GitHub refused. Nothing was lost, but the main copy was
+> missing most of the work I thought was in it, for several days.
+
+**A bit deeper:** In a *stacked* set of pull requests, PR 2's target branch is PR 1's branch.
+When PR 1 merges and its branch is auto-deleted, GitHub retargets PR 2 onto `main`. That
+retarget is asynchronous. Merging PR 2 before it happens merges it into PR 1's (now dead)
+branch, and the commits only reach `main` if some later PR carries them there. The loop also
+reported success by printing after `gh pr merge`, not by checking the command's exit code.
+
+**How it was found:** after a session restart, `git log origin/main` showed only 6 of the 18
+approved merges. `gh pr list --state merged --json baseRefName` showed the rest had
+`baseRefName` set to the branch of the PR below them in the stack, e.g. `m2/4..m2/7` merged into
+`m2/3-engine-wrapper`, and `ui/6` and `ui/7` into `ui/5-progress-page` (`ui/8` went into
+`ui/7-polish`, which then carried it into `ui/5` nine seconds later).
+
+**The fix:** merging the three PRs that were still open at the bottom of each sub-stack (#19,
+#25, #43) carried everything into `main`, because each of those branches had absorbed the ones
+merged into it. A commit-by-commit check (`git merge-base --is-ancestor`) confirmed every
+reviewed commit is now on `main`; the only thing missing is one empty merge commit whose
+content arrived through the next PR. From now on: merge one PR, check the exit code and
+`gh pr view --json state`, wait until the next PR shows `base=main` and `CLEAN`, then merge it.
+
+**Talking point:** "My merge script had two bugs, and both are about trusting output instead of
+checking state. It didn't wait for GitHub to retarget each stacked PR onto main, so PRs merged
+into each other. And it printed 'Merged' unconditionally, so I believed it. I found it by
+comparing what I thought had merged with `git log` on main. The recovery was cheap because
+merge commits keep history intact - nothing had to be redone - but the lesson is that a
+success message you print yourself proves nothing."
+
+**Where:** repository history (`git log origin/main --merges`); PRs #19, #25, #43.
+
+<!-- end of process entries -->
 
 ---
 
