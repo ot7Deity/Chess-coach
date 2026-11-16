@@ -40,14 +40,49 @@ class Settings(BaseSettings):
     # --- Engine -------------------------------------------------------------
     stockfish_path: Path = Path("vendor/stockfish/stockfish.exe")
     engine_depth: int = Field(default=16, ge=1, le=30)
-    engine_threads: int = Field(default=1, ge=1)
+    # 1 is not just a default. With more than one search thread Stockfish is
+    # non-deterministic - measured: the same position at depth 16 came back
+    # -186 and -213 on two runs with Threads=2 - and a non-deterministic value
+    # cannot be cached under (position, engine, depth). Scale with workers.
+    # Enforced: the only accepted value is 1.
+    engine_threads: int = Field(default=1, ge=1, le=1)
+    # Part of the engine version the cache is keyed on ('sf_18-h128'): the
+    # hash size changes results slightly, so changing it starts a new cache.
     engine_hash_mb: int = Field(default=128, ge=1)
-    engine_timeout_sec: float = 30.0
+    # Per position. A search that runs past this is treated as a hung engine:
+    # the process is killed and restarted, and the job is retried.
+    engine_timeout_sec: float = Field(default=30.0, gt=0)
+
+    # --- Position cache / metrics -------------------------------------------
+    # Which layers the analysis worker's EvalCache uses: 'full' is Redis in
+    # front of Postgres, 'postgres' skips Redis, 'off' is NullCache (the
+    # "without cache" side of the engine-seconds-saved benchmark).
+    position_cache: str = Field(default="full", pattern="^(full|postgres|off)$")
+    # Bump the version segment to orphan every Redis entry at once (Postgres is
+    # unaffected; Redis refills from it).
+    position_cache_key_prefix: str = "chess_coach:pos:v1:"
+    # Sliding expiry, refreshed on every hit. 0 disables expiry.
+    position_cache_ttl_sec: int = Field(default=7 * 24 * 3600, ge=0)
+    # Redis answers in well under a millisecond; anything near this is an outage.
+    position_cache_redis_timeout_sec: float = Field(default=0.25, gt=0)
+    # After a Redis failure, go Postgres-only for this long before retrying.
+    position_cache_redis_retry_sec: float = Field(default=30.0, ge=0)
+    # Prometheus endpoint. 0 disables it. Several workers on one host each take
+    # metrics_port + their worker index.
+    metrics_port: int = Field(default=0, ge=0, le=65535)
+    metrics_addr: str = "127.0.0.1"
 
     # --- Workers ------------------------------------------------------------
-    worker_poll_interval_sec: float = 1.0
+    worker_poll_interval_sec: float = Field(default=1.0, gt=0)
     job_max_attempts: int = Field(default=5, ge=1)
-    job_lock_timeout_sec: int = Field(default=300, ge=1)
+    # A running job whose worker has not heartbeated for this long is presumed
+    # dead and handed back to the queue. Workers heartbeat every third of it,
+    # so a live worker on a long game is never reaped.
+    job_lock_timeout_sec: float = Field(default=300, gt=0)
+    # Retry backoff after a failed attempt: base * 2^(attempt-1), capped, with
+    # equal jitter. Pushed into jobs.run_after.
+    job_retry_base_sec: float = Field(default=30.0, gt=0)
+    job_retry_cap_sec: float = Field(default=1800.0, gt=0)
 
     # --- Misc ---------------------------------------------------------------
     log_level: str = "INFO"
