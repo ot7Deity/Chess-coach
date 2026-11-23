@@ -8,6 +8,11 @@ const nextConfig: NextConfig = {
   // The floating dev-tools badge sits on top of the page in every development
   // screenshot; errors still surface in the terminal and the browser console.
   devIndicators: false,
+  experimental: {
+    // Next's agent upgrade reminder: only stop `next dev` for security
+    // advisories, not for every new release.
+    agentUpgrade: "security",
+  },
   // The Docker image sets NEXT_OUTPUT=standalone: Next traces exactly the files
   // the server needs into .next/standalone, so the runtime image carries no
   // node_modules tree. Left off elsewhere so `npm start` keeps working locally.
